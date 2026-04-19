@@ -1,0 +1,74 @@
+"""Tests for pydantic models in bot.models."""
+
+import pytest
+from pydantic import ValidationError
+
+from bot.models import Config, MiFile, Note, User
+
+
+def test_config_valid(make_config):
+    cfg = make_config()
+    assert cfg.domain == "example.test"
+    assert cfg.max_retries == 2
+    assert cfg.vision is True
+    assert cfg.max_context == 1
+    assert cfg.http_timeout_seconds == 30.0
+
+
+def test_config_missing_required_field():
+    with pytest.raises(ValidationError):
+        Config(domain="example.test")  # type: ignore[call-arg]
+
+
+def test_config_max_tokens_must_be_positive(make_config):
+    with pytest.raises(ValidationError):
+        make_config(max_tokens=0)
+
+
+def test_config_auto_post_requires_auto_prompt(make_config):
+    with pytest.raises(ValidationError) as exc:
+        make_config(auto_post_interval=60)
+    assert "system_prompt_auto" in str(exc.value)
+
+
+def test_config_auto_post_with_prompt_ok(make_config):
+    cfg = make_config(auto_post_interval=60, system_prompt_auto="post something")
+    assert cfg.auto_post_interval == 60
+    assert cfg.system_prompt_auto == "post something"
+
+
+def test_config_auto_reply_interval_must_be_positive(make_config):
+    with pytest.raises(ValidationError):
+        make_config(auto_reply_interval=0)
+
+
+def test_user_extra_fields_allowed():
+    u = User(id="1", username="alice", unknown_field="ok")  # type: ignore[call-arg]
+    assert u.username == "alice"
+
+
+def test_note_nested_reply(make_user):
+    inner_user = make_user(id="2", username="bob")
+    inner = Note(id="inner", text="hi", userId=inner_user.id, user=inner_user)
+    outer_user = make_user()
+    outer = Note(
+        id="outer",
+        text="reply",
+        userId=outer_user.id,
+        user=outer_user,
+        reply=inner,
+    )
+    assert outer.reply is not None
+    assert outer.reply.user.username == "bob"
+
+
+def test_note_visibility_literal_validation(make_user):
+    user = make_user()
+    with pytest.raises(ValidationError):
+        Note(id="n", text="t", userId=user.id, user=user, visibility="bogus")  # type: ignore[arg-type]
+
+
+def test_mifile_optional_fields():
+    f = MiFile(id="f", type="image/png")
+    assert f.url is None
+    assert f.thumbnailUrl is None

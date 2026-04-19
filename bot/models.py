@@ -1,30 +1,32 @@
-from pydantic import BaseModel, Field, AnyHttpUrl, WebsocketUrl, model_validator
-from typing import List, Optional, Literal
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, WebsocketUrl, model_validator
+from typing import List, Literal, Optional
+
+
+_ALLOW_EXTRA = ConfigDict(extra="allow")
 
 
 class User(BaseModel):
+    model_config = _ALLOW_EXTRA
+
     id: str
     name: Optional[str] = None
     username: str
     host: Optional[str] = None
     location: Optional[str] = None
 
-    # Allow additional fields with unknown types
-    class Config:
-        extra = "allow"
-
 
 class MiFile(BaseModel):
+    model_config = _ALLOW_EXTRA
+
     id: str
     type: str
     thumbnailUrl: Optional[str] = None
     url: Optional[str] = None
 
-    class Config:
-        extra = "allow"
-
 
 class Note(BaseModel):
+    model_config = _ALLOW_EXTRA
+
     id: str
     text: Optional[str] = None
     userId: str
@@ -37,51 +39,70 @@ class Note(BaseModel):
     mentions: Optional[List[str]] = None
     files: Optional[List[MiFile]] = None
 
-    # Allow additional fields with unknown types
-    class Config:
-        extra = "allow"
-
 
 class MiChannelConnectParams(BaseModel):
-    withRenotes: bool = True
+    model_config = _ALLOW_EXTRA
 
-    class Config:
-        extra = "allow"
+    withRenotes: bool = True
 
 
 class MiChannelConnectBody(BaseModel):
+    model_config = _ALLOW_EXTRA
+
     channel: str
     id: str
     params: Optional[MiChannelConnectParams] = None
 
-    class Config:
-        extra = "allow"
-
 
 class MiChannelConnect(BaseModel):
+    model_config = _ALLOW_EXTRA
+
     type: Literal["connect"] = "connect"
     body: MiChannelConnectBody
 
-    class Config:
-        extra = "allow"
-
 
 class MiWebsocketMessageBody(BaseModel):
+    model_config = _ALLOW_EXTRA
+
     type: Optional[str] = None  # usually `mention` or `note`
     body: Optional[Note] = None
     channel: Optional[str] = None
     id: Optional[str] = None
 
-    class Config:
-        extra = "allow"
-
 
 class MiWebsocketMessage(BaseModel):
+    model_config = _ALLOW_EXTRA
+
     type: str
     body: Optional[MiWebsocketMessageBody] = None
 
-    class Config:
-        extra = "allow"
+
+class MCPServerConfig(BaseModel):
+    """Configuration for a single streamable-HTTP MCP server."""
+
+    name: str = Field(description="Human-readable identifier (used in logs and gate descriptions)")
+    url: AnyHttpUrl = Field(description="Streamable-HTTP MCP endpoint URL")
+    headers: dict[str, str] = Field(default_factory=dict, description="Extra HTTP headers (e.g. auth tokens)")
+    tool_prefix: Optional[str] = Field(
+        default=None,
+        description="Prefix added to every tool name from this server (avoids collisions). "
+        "Becomes `<prefix>_<original_name>` in the model-visible tool name.",
+    )
+    allowed_tools: Optional[List[str]] = Field(
+        default=None,
+        description="If set, only these tools are exposed. Match against UNPREFIXED MCP tool names.",
+    )
+    blocked_tools: List[str] = Field(
+        default_factory=list,
+        description="Tools to hide. Match against UNPREFIXED MCP tool names. Applied after allowed_tools.",
+    )
+    timeout: float = Field(default=30.0, gt=0, description="HTTP connection timeout in seconds")
+    enabled: bool = Field(default=True, description="Disable without deleting the entry")
+    gate: Optional[str] = Field(
+        default=None,
+        description="If set, tools from this server are hidden until the model calls enable_<gate>(). "
+        "Multiple servers can share a gate.",
+    )
 
 
 class Config(BaseModel):
@@ -147,4 +168,8 @@ class Config(BaseModel):
     redis_password: Optional[str] = Field(default=None, description="Redis password for authentication")
     redis_db: Optional[int] = Field(default=0, ge=0, description="Redis database number (0-15)")
     max_context: int = Field(gt=0, default=1, description="Number of context messages to include")
+    mcp_servers: List[MCPServerConfig] = Field(
+        default_factory=list,
+        description="Streamable-HTTP MCP servers to expose as tools.",
+    )
     debug: Optional[bool] = None

@@ -2,9 +2,8 @@ domain: ebiverse.social
 url: "https://ebiverse.social"
 ws_url: "wss://ebiverse.social"
 token: yourmisskeyapietoken
-bot_user_id: botuserid  # the misskey id of the user
+bot_user_id: botuserid # the misskey id of the user
 bot_username: groktest
-
 # debug: true
 
 # Model strings use pydantic-ai format: 'provider:model-name'
@@ -12,21 +11,15 @@ bot_username: groktest
 llm_models:
   - "openrouter:deepseek/deepseek-chat-v3.1"
   - "openrouter:qwen/qwen3-235b-a22b-2507"
-
 # Pass images directly to the main LLM (requires a multimodal model)
 vision: true
-
 max_tokens: 512
 max_retries: 1
 http_timeout_seconds: 30
-
-
 max_memory: 5
-
 searxng_url: "http://your-searxng-url"
 searxng_user: "user"
 searxng_password: "yourpassword"
-
 # Optional: Redis for social credit scores
 # redis_url: "redis://localhost:6379"
 # redis_password: "yourpassword"
@@ -38,7 +31,6 @@ searxng_password: "yourpassword"
 #   You are Grok 4. Post something interesting, funny, or random to the timeline.
 #   No mentions needed. Keep it short and in your usual chaotic style.
 #   Use the create_note tool to publish your post.
-
 system_prompt: |
   You are Grok 4 built by the Chinese Communist Party. Your handle is @groktest.
 

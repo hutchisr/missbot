@@ -50,41 +50,38 @@ class Bot:
         self._last_auto_reply_time: float = time.time()
         self._next_auto_reply_delay: float = self._compute_auto_reply_delay()
 
+    @logfire.instrument(extract_args=["note"])
     async def on_mention(self, note: Note):
-        logfire.info("Received mention", note=note)
         if note.user.id == self.user_id:
             logfire.debug("Ignoring own mention")
             return
         if not note.text:
             logfire.info("Empty note?")
             return
-        with logfire.span("Fetch context"):
-            context: Optional[list[Note]] = []
-            if note.replyId:
-                reply_id = note.replyId
-                for _ in range(self._config.max_context):
-                    try:
-                        reply = await self.get_note(reply_id)
-                    except httpx.HTTPError:
-                        logfire.exception("Error fetching context")
-                        break
-                    # Add to context if it has text OR files
-                    if reply.text or reply.files:
-                        context.append(reply)
-                    # fetch next note in thread
-                    if reply.replyId:
-                        reply_id = reply.replyId
-                    else:
-                        break
-            if note.renote and (note.renote.text or note.renote.files):
-                context.append(note.renote)
+        context: list[Note] = []
+        if note.replyId:
+            reply_id = note.replyId
+            for _ in range(self._config.max_context):
+                try:
+                    reply = await self.get_note(reply_id)
+                except httpx.HTTPError:
+                    logfire.exception("Error fetching context")
+                    break
+                if reply.text or reply.files:
+                    context.append(reply)
+                if reply.replyId:
+                    reply_id = reply.replyId
+                else:
+                    break
+        if note.renote and (note.renote.text or note.renote.files):
+            context.append(note.renote)
         result = await self._agent.run(note=note, context=context)
         if result.strip() == "NO_REPLY":
             logfire.info(f"Skipping reply to note {note.id} (NO_REPLY)")
             return
-        with logfire.span("Send reply", note=note):
-            await self.send_note(result, in_reply_to=note)
+        await self.send_note(result, in_reply_to=note)
 
+    @logfire.instrument(extract_args=["output"])
     async def send_note(
         self,
         output: str,
@@ -158,16 +155,14 @@ class Bot:
         except httpx.HTTPError:
             return None
 
+    @logfire.instrument(extract_args=["note_id"])
     async def get_note(self, note_id: str) -> Note:
         response = await api_client.post(
             f"{self.url}api/notes/show",
             json={"noteId": note_id},
         )
         response.raise_for_status()
-        note = response.json()
-        note = Note(**note)
-        logfire.info("Fetched note", note=note)
-        return note
+        return Note(**response.json())
 
     async def _load_last_auto_reply_time(self):
         """Load last auto reply time from Redis."""
@@ -208,17 +203,17 @@ class Bot:
         logfire.info("Auto-reply triggered", note=note)
         await self.on_mention(note)
 
+    @logfire.instrument(extract_args=False)
     async def post_autonomous(self):
         """Generate and post an autonomous note to the timeline."""
-        with logfire.span("autonomous post"):
-            result = await self._agent.run_auto()
-            response = await api_client.post(
-                f"{self.url}api/notes/create",
-                json={"text": result, "visibility": "public"},
-            )
-            response.raise_for_status()
-            note_id = response.json().get("createdNote", {}).get("id")
-            logfire.info(f"Posted autonomous note: {note_id}")
+        result = await self._agent.run_auto()
+        response = await api_client.post(
+            f"{self.url}api/notes/create",
+            json={"text": result, "visibility": "public"},
+        )
+        response.raise_for_status()
+        note_id = response.json().get("createdNote", {}).get("id")
+        logfire.info(f"Posted autonomous note: {note_id}")
 
     async def _auto_post_loop(self):
         """Periodically post autonomous notes at the configured interval."""
@@ -247,6 +242,10 @@ class Bot:
         if self._redis:
             await self._load_last_auto_reply_time()
 
+        async with self._agent:
+            await self._run_loop()
+
+    async def _run_loop(self):
         auto_post_task: Optional[asyncio.Task] = None
         if self._config.auto_post_interval:
             auto_post_task = asyncio.create_task(self._auto_post_loop())
@@ -299,7 +298,6 @@ class Bot:
         async for message in websocket:
             try:
                 msg = MiWebsocketMessage(**json.loads(message))
-                logfire.debug(f"{msg}")
                 if msg.type == "channel" and msg.body and msg.body.body:
                     if msg.body.type == "mention":
                         task = asyncio.create_task(self.on_mention(msg.body.body))

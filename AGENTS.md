@@ -20,7 +20,7 @@ docker build -t grok . && docker run -v /path/to/config.yaml:/config.yaml grok
 
 # Kubernetes
 mise run build      # Build and push Docker image
-mise run upgrade    # Apply K8s manifests and restart
+mise run deploy     # Apply K8s manifests and restart
 ```
 
 **Important:** Always use `uv run` or `.venv/bin/python` — never bare `python`.
@@ -33,6 +33,7 @@ mise run upgrade    # Apply K8s manifests and restart
 | `bot/ai.py` | `ChatAgent` class — Pydantic AI agent with `FallbackModel`, vision support |
 | `bot/models.py` | Pydantic models: `Config`, `Note`, `User`, `MiFile`, WS message types |
 | `bot/tools.py` | `build_tools()` factory — datetime, web search, create_note, search_users/notes, social credit tools |
+| `bot/mcp.py` | `build_mcp_toolsets()` + `gate_names()` — streamable-HTTP MCP servers with allow/block and gate filtering |
 | `bot/api.py` | HTTP client utilities |
 | `bot/cli.py` | CLI entry point and argument parsing |
 
@@ -52,7 +53,22 @@ Optional fields:
 - `redis_url`, `redis_password`, `redis_db`: Redis for social credit system
 - `max_context`: parent notes to include (default 1)
 - `http_timeout_seconds`: HTTP timeout (default 30.0)
+- `mcp_servers`: list of streamable-HTTP MCP servers (see below)
 - `channel`, `debug`
+
+### MCP servers
+Each entry in `mcp_servers` takes:
+- `name` (required): human-readable id
+- `url` (required): streamable-HTTP endpoint
+- `headers`: dict of extra HTTP headers (e.g. `Authorization: Bearer ...`)
+- `tool_prefix`: prepended to every tool name (e.g. `tavily` → `tavily_search`)
+- `allowed_tools`: list; if set, only these are exposed (match **unprefixed** MCP names)
+- `blocked_tools`: list of unprefixed names to hide
+- `timeout`: connect timeout seconds (default 30)
+- `enabled`: toggle off without deleting (default true)
+- `gate`: if set, server's tools are hidden until the model calls `enable_<gate>()`. Multiple servers can share a gate.
+
+Gating is progressive disclosure driven by the model itself: each unique `gate` value generates one `enable_<gate>` meta-tool. When the model calls it, that gate's tools become visible on the next model turn within the same run. Auto-agent (autonomous posts) does not get MCP toolsets.
 
 ## Key Patterns
 
@@ -90,6 +106,8 @@ When `system_prompt_auto` and `auto_post_interval` are configured, `ChatAgent.ru
 - `create_note` — create Misskey posts with visibility/mention control
 - `search_users`, `search_notes` — Misskey search APIs
 - Social credit tools (when Redis configured): `get_social_credit`, `adjust_social_credit`, `get_social_credit_history`, `get_social_credit_leaderboard`
+- `enable_<gate>` — one per unique `gate` value in `mcp_servers`; model calls it to unlock gated MCP tools
+- MCP tools — from each configured `mcp_servers` entry, name-prefixed per `tool_prefix`
 
 ## Verification
 

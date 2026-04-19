@@ -1,13 +1,19 @@
-[tasks]
-bot = "uv run python -m bot -c config.local.yaml"
-build = """
+[tasks.bot]
+run = "uv run python -m bot -c config.local.yaml"
+
+[tasks.test]
+run = "uv run pytest"
+
+[tasks.build]
+run = """
 docker buildx build --pull --push \
 --platform linux/amd64 \
 -t lax.vultrcr.com/mercury/korg:latest \
 -t lax.vultrcr.com/mercury/korg:{{ exec(command='uv version --short') }} .
 """
 
-upgrade = """
+[tasks.deploy]
+run = """
 kubectl apply -k k8s --server-side && \
 kubectl -n misskey rollout restart deployment grok
 """

@@ -1,10 +1,12 @@
 import asyncio
+import logging
 import signal
 from typing import Optional
 
 import click
 import logfire
 import yaml
+from logfire.integrations.logging import LogfireLoggingHandler
 from redis.asyncio import Redis
 
 from .bot import Bot
@@ -35,6 +37,21 @@ async def main_async(config):
         ),
     )
     logfire.instrument_pydantic_ai()
+    logfire.instrument_httpx()
+    logfire.instrument_redis()
+    logging.basicConfig(
+        level=logging.DEBUG if debug_enabled else logging.INFO,
+        handlers=[LogfireLoggingHandler()],
+    )
+    # httpx/httpcore/redis are covered by logfire.instrument_* spans, so their
+    # stdlib logs (at any level) duplicate span data — mute them entirely.
+    for _name in ("httpx", "httpcore", "redis"):
+        logging.getLogger(_name).setLevel(logging.CRITICAL + 1)
+    # websockets and mcp have no logfire instrumentation; keep INFO so
+    # connect/negotiate events are visible, but drop DEBUG (websockets.protocol
+    # ships bytearray Frame data that crashes logfire's console exporter).
+    for _name in ("websockets", "mcp.client.streamable_http"):
+        logging.getLogger(_name).setLevel(logging.INFO)
 
     # Configure global HTTP client with config settings
     api_client.configure(config)
@@ -56,14 +73,11 @@ async def main_async(config):
     )
 
     def shutdown_handler():
-        with logfire.span("Shutting down"):
-            bot.shutdown()
-            logfire.info("Shut down bot")
-            loop.create_task(api_client.close())
-            logfire.info("Closed API client")
-            if redis_client:
-                loop.create_task(redis_client.aclose())
-                logfire.info("Closed Redis client")
+        logfire.info("Shutting down")
+        bot.shutdown()
+        loop.create_task(api_client.close())
+        if redis_client:
+            loop.create_task(redis_client.aclose())
 
     loop.add_signal_handler(signal.SIGTERM, shutdown_handler)
     loop.add_signal_handler(signal.SIGINT, shutdown_handler)

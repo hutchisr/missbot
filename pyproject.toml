@@ -7,19 +7,39 @@ requires-python = ">=3.13"
 dependencies = [
     "click>=8.3.1",
     "httpx>=0.28.0",
-    "logfire>=4.19.0",
+    "logfire[httpx,redis]>=4.19.0",
     "pydantic-ai>=1.44.0",
     "pyyaml>=6.0.3",
     "redis[hiredis]>=5.0.0",
+    "tenacity>=9.1.2",
     "websockets>=13.0.0,<15.1.0",
 ]
 
 [dependency-groups]
 dev = [
+    "anyio>=4.0.0",
+    "fakeredis>=2.20.0",
     "ipykernel>=7.1.0",
     "pyright>=1.1.407",
+    "pytest>=9.0.3",
+    "pytest-cov>=5.0.0",
     "ruff>=0.15.6",
 ]
 
 [tool.ruff]
 line-length = 120
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--cov=bot", "--cov-report=term-missing"]
+
+[tool.logfire]
+ignore_no_config = true
+
+[tool.coverage.run]
+source = ["bot"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false

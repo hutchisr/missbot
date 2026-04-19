@@ -33,28 +33,29 @@ def build_tools(config: Config, redis_client: Optional[Redis] = None) -> list[Ca
 
     if config.searxng_url:
 
+        @logfire.instrument()
         def search_web(query: str) -> Optional[str]:
             """Search the web for information."""
-            with logfire.span("search web", query=query):
-                auth: Optional[httpx.BasicAuth] = None
-                if config.searxng_user and config.searxng_password:
-                    auth = httpx.BasicAuth(config.searxng_user, config.searxng_password)
-                transport = httpx.HTTPTransport(retries=config.max_retries)
-                with httpx.Client(auth=auth, transport=transport) as client:
-                    try:
-                        response = client.post(
-                            f"{config.searxng_url}search",
-                            params={"q": query, "format": "json"},
-                        )
-                        response.raise_for_status()
-                        data = response.json()
-                        return "\n---\n".join([result.get("content") for result in data.get("results", [])[:5]])
-                    except httpx.HTTPError:
-                        logfire.exception("HTTP Error during web search")
-                        return None
+            auth: Optional[httpx.BasicAuth] = None
+            if config.searxng_user and config.searxng_password:
+                auth = httpx.BasicAuth(config.searxng_user, config.searxng_password)
+            transport = httpx.HTTPTransport(retries=config.max_retries)
+            with httpx.Client(auth=auth, transport=transport) as client:
+                try:
+                    response = client.post(
+                        f"{config.searxng_url}search",
+                        params={"q": query, "format": "json"},
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    return "\n---\n".join([result.get("content") for result in data.get("results", [])[:5]])
+                except httpx.HTTPError:
+                    logfire.exception("HTTP Error during web search")
+                    return None
 
         tools.append(search_web)
 
+    @logfire.instrument(extract_args=["visibility", "local_only"])
     def create_note(
         text: str,
         visibility: str = "public",
@@ -69,70 +70,66 @@ def build_tools(config: Config, redis_client: Optional[Redis] = None) -> list[Ca
             local_only: If True, only deliver to local instance
             mentions: Optional list of usernames/handles to mention (with or without @)
         """
-        with logfire.span(
-            "create note",
-            visibility=visibility,
-            local_only=local_only,
-        ):
-            if not text.strip():
-                return "Note text is empty."
+        if not text.strip():
+            return "Note text is empty."
 
-            if visibility not in {"public", "home", "followers", "specified"}:
-                return "Invalid visibility. Use public, home, followers, or specified."
+        if visibility not in {"public", "home", "followers", "specified"}:
+            return "Invalid visibility. Use public, home, followers, or specified."
 
-            # Normalize mentions and prefix to text if missing
-            mention_prefix = ""
-            if mentions:
-                normalized: list[str] = []
-                seen = set()
-                for m in mentions:
-                    if not m:
-                        continue
-                    handle = m.strip()
-                    if not handle:
-                        continue
-                    if not handle.startswith("@"):
-                        handle = f"@{handle}"
-                    key = handle.lower()
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    normalized.append(handle)
-                if normalized:
-                    # Only prefix handles that are not already present in text
-                    text_lower = text.lower()
-                    to_prefix = [h for h in normalized if h.lower() not in text_lower]
-                    if to_prefix:
-                        mention_prefix = " ".join(to_prefix) + " "
+        # Normalize mentions and prefix to text if missing
+        mention_prefix = ""
+        if mentions:
+            normalized: list[str] = []
+            seen = set()
+            for m in mentions:
+                if not m:
+                    continue
+                handle = m.strip()
+                if not handle:
+                    continue
+                if not handle.startswith("@"):
+                    handle = f"@{handle}"
+                key = handle.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                normalized.append(handle)
+            if normalized:
+                # Only prefix handles that are not already present in text
+                text_lower = text.lower()
+                to_prefix = [h for h in normalized if h.lower() not in text_lower]
+                if to_prefix:
+                    mention_prefix = " ".join(to_prefix) + " "
 
-            transport = httpx.HTTPTransport(retries=config.max_retries)
-            with httpx.Client(transport=transport) as client:
-                try:
-                    payload = {
-                        "text": f"{mention_prefix}{text}",
-                        "visibility": visibility,
-                        "localOnly": local_only,
-                    }
-                    response = client.post(
-                        f"{config.url}api/notes/create",
-                        json=payload,
-                        headers={"Authorization": f"Bearer {config.token}"},
-                    )
-                    response.raise_for_status()
-                    created = response.json().get("createdNote", {})
-                    note_id = created.get("id")
-                    return f"Created note {note_id}." if note_id else "Note created."
-                except httpx.HTTPStatusError as e:
-                    if e.response.status_code == 400:
-                        text_len = len(f"{mention_prefix}{text}")
-                        logfire.warning(f"Note creation failed: 400 Bad Request (text length: {text_len})")
-                        return f"Error: Note rejected (400 Bad Request). The text is likely too long ({text_len} chars). Please shorten it significantly and try again."
-                    logfire.exception("HTTP Status Error during note creation")
-                    return f"Error creating note: {e.response.status_code}"
-                except httpx.HTTPError:
-                    logfire.exception("HTTP Error during note creation")
-                    return None
+        transport = httpx.HTTPTransport(retries=config.max_retries)
+        with httpx.Client(transport=transport) as client:
+            try:
+                payload = {
+                    "text": f"{mention_prefix}{text}",
+                    "visibility": visibility,
+                    "localOnly": local_only,
+                }
+                response = client.post(
+                    f"{config.url}api/notes/create",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {config.token}"},
+                )
+                response.raise_for_status()
+                created = response.json().get("createdNote", {})
+                note_id = created.get("id")
+                return f"Created note {note_id}." if note_id else "Note created."
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 400:
+                    text_len = len(f"{mention_prefix}{text}")
+                    logfire.warning(f"Note creation failed: 400 Bad Request (text length: {text_len})")
+                    return f"Error: Note rejected (400 Bad Request). The text is likely too long ({text_len} chars). Please shorten it significantly and try again."
+                logfire.exception("HTTP Status Error during note creation")
+                return f"Error creating note: {e.response.status_code}"
+            except httpx.HTTPError:
+                logfire.exception("HTTP Error during note creation")
+                return None
 
+    @logfire.instrument()
     def search_users(query: str, limit: int = 10, offset: int = 0) -> Optional[str]:
         """Search for users on this Misskey instance by username or display name.
 
@@ -141,36 +138,36 @@ def build_tools(config: Config, redis_client: Optional[Redis] = None) -> list[Ca
             limit: Maximum number of results to return (1-50, default 10)
             offset: Number of results to skip for pagination (default 0)
         """
-        with logfire.span("search users", query=query, limit=limit, offset=offset):
-            limit = max(1, min(50, limit))  # Clamp to 1-50
-            transport = httpx.HTTPTransport(retries=config.max_retries)
-            with httpx.Client(
-                transport=transport,
-                timeout=httpx.Timeout(config.http_timeout_seconds),
-            ) as client:
-                try:
-                    response = client.post(
-                        f"{config.url}api/users/search",
-                        json={"query": query, "limit": limit, "offset": offset},
-                        headers={"Authorization": f"Bearer {config.token}"},
-                    )
-                    response.raise_for_status()
-                    users = response.json()
-                    if not users:
-                        return "No users found."
-                    results = []
-                    for user in users:
-                        username = user.get("username", "unknown")
-                        host = user.get("host")
-                        name = user.get("name") or username
-                        bio = user.get("description") or ""
-                        handle = f"@{username}" + (f"@{host}" if host else "")
-                        results.append(f"{name} ({handle}): {bio[:100]}")
-                    return "\n---\n".join(results)
-                except httpx.HTTPError:
-                    logfire.exception("HTTP Error during user search")
-                    return None
+        limit = max(1, min(50, limit))  # Clamp to 1-50
+        transport = httpx.HTTPTransport(retries=config.max_retries)
+        with httpx.Client(
+            transport=transport,
+            timeout=httpx.Timeout(config.http_timeout_seconds),
+        ) as client:
+            try:
+                response = client.post(
+                    f"{config.url}api/users/search",
+                    json={"query": query, "limit": limit, "offset": offset},
+                    headers={"Authorization": f"Bearer {config.token}"},
+                )
+                response.raise_for_status()
+                users = response.json()
+                if not users:
+                    return "No users found."
+                results = []
+                for user in users:
+                    username = user.get("username", "unknown")
+                    host = user.get("host")
+                    name = user.get("name") or username
+                    bio = user.get("description") or ""
+                    handle = f"@{username}" + (f"@{host}" if host else "")
+                    results.append(f"{name} ({handle}): {bio[:100]}")
+                return "\n---\n".join(results)
+            except httpx.HTTPError:
+                logfire.exception("HTTP Error during user search")
+                return None
 
+    @logfire.instrument()
     def search_notes(query: str, limit: int = 10, offset: int = 0) -> Optional[str]:
         """Search for notes/posts on this Misskey instance.
 
@@ -179,35 +176,34 @@ def build_tools(config: Config, redis_client: Optional[Redis] = None) -> list[Ca
             limit: Maximum number of results to return (1-50, default 10)
             offset: Number of results to skip for pagination (default 0)
         """
-        with logfire.span("search notes", query=query, limit=limit, offset=offset):
-            limit = max(1, min(50, limit))  # Clamp to 1-50
-            transport = httpx.HTTPTransport(retries=config.max_retries)
-            with httpx.Client(
-                transport=transport,
-                timeout=httpx.Timeout(config.http_timeout_seconds),
-            ) as client:
-                try:
-                    response = client.post(
-                        f"{config.url}api/notes/search",
-                        json={"query": query, "limit": limit, "offset": offset},
-                        headers={"Authorization": f"Bearer {config.token}"},
-                    )
-                    response.raise_for_status()
-                    notes = response.json()
-                    if not notes:
-                        return "No notes found."
-                    results = []
-                    for note in notes:
-                        user = note.get("user", {})
-                        username = user.get("username", "unknown")
-                        host = user.get("host")
-                        handle = f"@{username}" + (f"@{host}" if host else "")
-                        text = note.get("text") or "(no text)"
-                        results.append(f"{handle}: {text[:200]}")
-                    return "\n---\n".join(results)
-                except httpx.HTTPError:
-                    logfire.exception("HTTP Error during note search")
-                    return None
+        limit = max(1, min(50, limit))  # Clamp to 1-50
+        transport = httpx.HTTPTransport(retries=config.max_retries)
+        with httpx.Client(
+            transport=transport,
+            timeout=httpx.Timeout(config.http_timeout_seconds),
+        ) as client:
+            try:
+                response = client.post(
+                    f"{config.url}api/notes/search",
+                    json={"query": query, "limit": limit, "offset": offset},
+                    headers={"Authorization": f"Bearer {config.token}"},
+                )
+                response.raise_for_status()
+                notes = response.json()
+                if not notes:
+                    return "No notes found."
+                results = []
+                for note in notes:
+                    user = note.get("user", {})
+                    username = user.get("username", "unknown")
+                    host = user.get("host")
+                    handle = f"@{username}" + (f"@{host}" if host else "")
+                    text = note.get("text") or "(no text)"
+                    results.append(f"{handle}: {text[:200]}")
+                return "\n---\n".join(results)
+            except httpx.HTTPError:
+                logfire.exception("HTTP Error during note search")
+                return None
 
     tools.extend([search_users, search_notes])
 
@@ -223,6 +219,7 @@ def build_tools(config: Config, redis_client: Optional[Redis] = None) -> list[Ca
                 username = username[1:]
             return username
 
+        @logfire.instrument()
         async def get_social_credit(username: str) -> str:
             """Get a user's social credit score.
 
@@ -230,16 +227,16 @@ def build_tools(config: Config, redis_client: Optional[Redis] = None) -> list[Ca
                 username: The username to look up (e.g. 'alice' for local, 'bob@remote.host' for remote).
             """
             username = _normalize_username(username)
-            with logfire.span("get social credit", username=username):
-                try:
-                    score = await _redis.get(f"score:{username}")  # type: ignore[misc]
-                    if score is None:
-                        return f"User @{username} has no social credit score yet (defaults to 0)."
-                    return f"User @{username} has {score} social credit points."
-                except Exception:
-                    logfire.exception("Error getting social credit score")
-                    return "Error retrieving social credit score."
+            try:
+                score = await _redis.get(f"score:{username}")  # type: ignore[misc]
+                if score is None:
+                    return f"User @{username} has no social credit score yet (defaults to 0)."
+                return f"User @{username} has {score} social credit points."
+            except Exception:
+                logfire.exception("Error getting social credit score")
+                return "Error retrieving social credit score."
 
+        @logfire.instrument(extract_args=["username", "amount", "reason"])
         async def adjust_social_credit(ctx: RunContext[object], username: str, amount: int, reason: str) -> str:
             """Adjust a user's social credit score.
 
@@ -257,40 +254,37 @@ def build_tools(config: Config, redis_client: Optional[Redis] = None) -> list[Ca
                 if username in adjusted:
                     return f"Already adjusted @{username}'s social credit in this interaction. Only one adjustment per user per message is allowed."
                 adjusted.add(username)
-            with logfire.span(
-                "adjust social credit",
-                username=username,
-                amount=amount,
-                reason=reason,
-            ):
-                try:
-                    if not reason or not reason.strip():
-                        return "Error: reason is required for social credit adjustments."
+            try:
+                if not reason or not reason.strip():
+                    return "Error: reason is required for social credit adjustments."
 
-                    # Increment score
-                    new_score = await _redis.incrby(f"score:{username}", amount)  # type: ignore[misc]
+                # Increment score
+                new_score = await _redis.incrby(f"score:{username}", amount)  # type: ignore[misc]
 
-                    # Log change to history
-                    history_entry = json.dumps(
-                        {
-                            "amount": amount,
-                            "reason": reason,
-                            "timestamp": datetime.now().isoformat(),
-                        }
-                    )
-                    history_key = f"history:{username}"
-                    await _redis.lpush(history_key, history_entry)  # type: ignore[misc]
-                    await _redis.expire(history_key, 30 * 86400)  # type: ignore[misc]  # 30-day TTL
+                # Log change to history
+                history_entry = json.dumps(
+                    {
+                        "amount": amount,
+                        "reason": reason,
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                )
+                history_key = f"history:{username}"
+                await _redis.lpush(history_key, history_entry)  # type: ignore[misc]
+                await _redis.expire(history_key, 30 * 86400)  # type: ignore[misc]  # 30-day TTL
 
-                    # Update leaderboard (sorted set)
-                    await _redis.zadd("global:leaderboard", {username: float(new_score)})  # type: ignore[misc]
+                # Update leaderboard (sorted set)
+                await _redis.zadd("global:leaderboard", {username: float(new_score)})  # type: ignore[misc]
 
-                    sign = "+" if amount >= 0 else ""
-                    return f"Adjusted @{username}'s social credit by {sign}{amount}. New score: {new_score}. Reason: {reason}"
-                except Exception:
-                    logfire.exception("Error adjusting social credit score")
-                    return "Error adjusting social credit score."
+                sign = "+" if amount >= 0 else ""
+                return (
+                    f"Adjusted @{username}'s social credit by {sign}{amount}. New score: {new_score}. Reason: {reason}"
+                )
+            except Exception:
+                logfire.exception("Error adjusting social credit score")
+                return "Error adjusting social credit score."
 
+        @logfire.instrument()
         async def get_social_credit_history(username: str, limit: int = 10) -> str:
             """Get the history of social credit score changes for a user.
 
@@ -299,63 +293,58 @@ def build_tools(config: Config, redis_client: Optional[Redis] = None) -> list[Ca
                 limit: Maximum number of history entries to return (default 10).
             """
             username = _normalize_username(username)
-            with logfire.span(
-                "get social credit history",
-                username=username,
-                limit=limit,
-            ):
-                try:
-                    limit = max(1, min(50, limit))  # Clamp to 1-50
+            try:
+                limit = max(1, min(50, limit))  # Clamp to 1-50
 
-                    # Get recent history entries
-                    entries = await _redis.lrange(f"history:{username}", 0, limit - 1)  # type: ignore[misc]
+                # Get recent history entries
+                entries = await _redis.lrange(f"history:{username}", 0, limit - 1)  # type: ignore[misc]
 
-                    if not entries:
-                        return f"No social credit history found for @{username}."
+                if not entries:
+                    return f"No social credit history found for @{username}."
 
-                    results = []
-                    for entry in entries:
-                        data = json.loads(entry)
-                        amount = data.get("amount", 0)
-                        reason = data.get("reason", "No reason")
-                        timestamp = data.get("timestamp", "Unknown time")
-                        sign = "+" if amount >= 0 else ""
-                        results.append(f"{timestamp}: {sign}{amount} - {reason}")
+                results = []
+                for entry in entries:
+                    data = json.loads(entry)
+                    amount = data.get("amount", 0)
+                    reason = data.get("reason", "No reason")
+                    timestamp = data.get("timestamp", "Unknown time")
+                    sign = "+" if amount >= 0 else ""
+                    results.append(f"{timestamp}: {sign}{amount} - {reason}")
 
-                    return f"Social credit history for @{username}:\n" + "\n".join(results)
-                except Exception:
-                    logfire.exception("Error getting social credit history")
-                    return "Error retrieving social credit history."
+                return f"Social credit history for @{username}:\n" + "\n".join(results)
+            except Exception:
+                logfire.exception("Error getting social credit history")
+                return "Error retrieving social credit history."
 
+        @logfire.instrument()
         async def get_social_credit_leaderboard(limit: int = 10) -> str:
             """Get the top users by social credit score.
 
             Args:
                 limit: Number of top users to return (default 10, max 50).
             """
-            with logfire.span("get social credit leaderboard", limit=limit):
-                try:
-                    limit = max(1, min(50, limit))
+            try:
+                limit = max(1, min(50, limit))
 
-                    # Get top scores (descending order)
-                    top_users = await _redis.zrevrange(  # type: ignore[misc]
-                        "global:leaderboard",
-                        0,
-                        limit - 1,
-                        withscores=True,
-                    )
+                # Get top scores (descending order)
+                top_users = await _redis.zrevrange(  # type: ignore[misc]
+                    "global:leaderboard",
+                    0,
+                    limit - 1,
+                    withscores=True,
+                )
 
-                    if not top_users:
-                        return "No social credit scores recorded yet."
+                if not top_users:
+                    return "No social credit scores recorded yet."
 
-                    results = []
-                    for rank, (username, score) in enumerate(top_users, 1):
-                        results.append(f"{rank}. @{username}: {int(score)} points")
+                results = []
+                for rank, (username, score) in enumerate(top_users, 1):
+                    results.append(f"{rank}. @{username}: {int(score)} points")
 
-                    return "Social Credit Leaderboard:\n" + "\n".join(results)
-                except Exception:
-                    logfire.exception("Error getting social credit leaderboard")
-                    return "Error retrieving leaderboard."
+                return "Social Credit Leaderboard:\n" + "\n".join(results)
+            except Exception:
+                logfire.exception("Error getting social credit leaderboard")
+                return "Error retrieving leaderboard."
 
         tools.extend(
             [
