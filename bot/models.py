@@ -36,6 +36,8 @@ class Note(BaseModel):
     reply: Optional["Note"] = None
     renote: Optional["Note"] = None
     visibility: Optional[Literal["public", "home", "followers", "specified"]] = None
+    visibleUserIds: Optional[List[str]] = None
+    localOnly: Optional[bool] = None
     mentions: Optional[List[str]] = None
     files: Optional[List[MiFile]] = None
 

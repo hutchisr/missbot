@@ -32,7 +32,7 @@ mise run deploy     # Apply K8s manifests and restart
 | `bot/bot.py` | WebSocket client, mention handling, context building, reply sending |
 | `bot/ai.py` | `ChatAgent` class — Pydantic AI agent with `FallbackModel`, vision support |
 | `bot/models.py` | Pydantic models: `Config`, `Note`, `User`, `MiFile`, WS message types |
-| `bot/tools.py` | `build_tools()` factory — datetime, web search, create_note, search_users/notes, social credit tools |
+| `bot/tools.py` | `build_tools()` factory — datetime, web search, search_users/notes, social credit tools |
 | `bot/mcp.py` | `build_mcp_toolsets()` + `gate_names()` — streamable-HTTP MCP servers with allow/block and gate filtering |
 | `bot/api.py` | HTTP client utilities |
 | `bot/cli.py` | CLI entry point and argument parsing |
@@ -103,7 +103,6 @@ When `system_prompt_auto` and `auto_post_interval` are configured, `ChatAgent.ru
 ## Available Tools (runtime)
 - `current_datetime_tool` — always available
 - `search_web` — when `searxng_url` configured
-- `create_note` — create Misskey posts with visibility/mention control
 - `search_users`, `search_notes` — Misskey search APIs
 - Social credit tools (when Redis configured): `get_social_credit`, `adjust_social_credit`, `get_social_credit_history`, `get_social_credit_leaderboard`
 - `enable_<gate>` — one per unique `gate` value in `mcp_servers`; model calls it to unlock gated MCP tools

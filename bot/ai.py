@@ -69,7 +69,13 @@ def _image_urls_for(note: Note, vision: bool) -> list[ImageUrl]:
     """Extract ImageUrl objects for a note's image attachments."""
     if not vision or not note.files:
         return []
-    return [ImageUrl(url=f.thumbnailUrl) for f in note.files if f.thumbnailUrl and f.type.startswith("image/")]
+
+    images: list[ImageUrl] = []
+    for file in note.files:
+        image_url = file.thumbnailUrl or file.url
+        if image_url and file.type.startswith("image/"):
+            images.append(ImageUrl(url=image_url))
+    return images
 
 
 def _build_user_content(note: Note, vision: bool) -> str | list[str | ImageUrl]:
@@ -172,11 +178,11 @@ class ChatAgent:
     @logfire.instrument(extract_args=["note"])
     async def run(self, note: Note, context: Optional[list[Note]] = None) -> str:
         """Process a note and generate a reply."""
-        if not note.text:
-            raise ValueError("Note text is empty")
-
         bot_user_id = self._config.bot_user_id
         vision = self._config.vision
+        current_images = _image_urls_for(note, vision)
+        if not note.text and not current_images:
+            raise ValueError("Note has no text or supported images")
 
         # Build message history from context notes (oldest first)
         message_history: list[ModelMessage] = []
@@ -193,8 +199,7 @@ class ChatAgent:
         current_parts: list[str | ImageUrl] = []
         if note.user.location:
             current_parts.append(f"User location: {note.user.location}")
-        current_parts.append(f"{_user_handle(note.user)}: {note.text}")
-        current_images = _image_urls_for(note, vision)
+        current_parts.append(f"{_user_handle(note.user)}: {note.text or ''}")
         if current_images:
             current_parts.extend(current_images)
 

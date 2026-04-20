@@ -12,7 +12,7 @@ from websockets.asyncio.client import connect
 import httpx
 import logfire
 
-from .ai import ChatAgent
+from .ai import ChatAgent, _image_urls_for
 from .models import (
     Config,
     MiChannelConnect,
@@ -55,8 +55,8 @@ class Bot:
         if note.user.id == self.user_id:
             logfire.debug("Ignoring own mention")
             return
-        if not note.text:
-            logfire.info("Empty note?")
+        if not self._note_has_prompt_content(note):
+            logfire.info("Skipping note without text or supported images", note_id=note.id)
             return
         context: list[Note] = []
         if note.replyId:
@@ -88,17 +88,48 @@ class Bot:
         in_reply_to: Optional[Note] = None,
     ):
         mentions = await self._build_mentions_from_note(in_reply_to)
+        text = self._strip_leading_mentions(output)
+        if mentions:
+            text = f"{' '.join(mentions)}\n{text}"
 
-        payload = {
-            "text": f"{' '.join(mentions)}\n{self._strip_leading_mentions(output)}",
-            "visibility": "public",
+        payload: dict[str, object] = {
+            "text": text,
+            "visibility": self._reply_visibility(in_reply_to),
         }
         if in_reply_to and in_reply_to.id:
             payload["replyId"] = in_reply_to.id
+        if in_reply_to and in_reply_to.localOnly is not None:
+            payload["localOnly"] = in_reply_to.localOnly
+        visible_user_ids = self._reply_visible_user_ids(in_reply_to)
+        if visible_user_ids:
+            payload["visibleUserIds"] = visible_user_ids
 
         response = await api_client.post(f"{self.url}api/notes/create", json=payload)
         response.raise_for_status()
         logfire.info("Sent note", id=response.json().get("createdNote").get("id"))
+
+    def _note_has_prompt_content(self, note: Note) -> bool:
+        if note.text:
+            return True
+        return bool(_image_urls_for(note, self._config.vision))
+
+    def _reply_visibility(self, note: Optional[Note]) -> str:
+        if note and note.visibility:
+            return note.visibility
+        return "public"
+
+    def _reply_visible_user_ids(self, note: Optional[Note]) -> list[str]:
+        if not note or note.visibility != "specified":
+            return []
+
+        recipients: list[str] = []
+        if note.visibleUserIds:
+            recipients.extend(note.visibleUserIds)
+        if note.user.id:
+            recipients.append(note.user.id)
+
+        # The bot is the author of the reply, not a recipient.
+        return self._unique_ordered([user_id for user_id in recipients if user_id and user_id != self.user_id])
 
     async def _build_mentions_from_note(self, note: Optional[Note]) -> list[str]:
         if not note or not note.user:
@@ -187,7 +218,7 @@ class Bot:
 
     async def on_auto_reply(self, note: Note):
         """Automatically reply to a timeline note if enough time has passed."""
-        if not note.text and not note.files:
+        if not self._note_has_prompt_content(note):
             return
 
         now = time.time()
