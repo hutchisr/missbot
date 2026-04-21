@@ -1,4 +1,3 @@
-import asyncio
 from collections import deque
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -21,7 +20,7 @@ from redis.asyncio import Redis
 
 from .mcp import build_mcp_toolsets, gate_names
 from .models import Config, Note, User
-from .tools import build_tools
+from .tools import build_tools, normalize_username
 
 
 @dataclass
@@ -31,31 +30,37 @@ class _ProviderReportedPrice:
     total_price: Decimal
 
 
-_original_cost = ModelResponse.cost
+_original_cost = getattr(ModelResponse, "cost", None)
 
 
 def _cost_prefer_provider(self: ModelResponse):
     # OpenRouter returns the actual routed price in provider_details['cost'];
     # prefer it over genai-prices' static lookup, which lacks many OR models
     # (e.g. qwen3-235b, claude-sonnet-4-5) and silently drops operation.cost.
-    details = self.provider_details or {}
-    reported = details.get("cost")
-    if reported is not None:
-        total = Decimal(str(reported))
-        input_tokens = self.usage.input_tokens or 0
-        output_tokens = self.usage.output_tokens or 0
-        denom = input_tokens + output_tokens
-        if denom > 0:
-            input_price = total * Decimal(input_tokens) / Decimal(denom)
-            output_price = total - input_price
-        else:
-            input_price = Decimal(0)
-            output_price = total
-        return _ProviderReportedPrice(input_price, output_price, total)
+    try:
+        details = self.provider_details or {}
+        reported = details.get("cost")
+        if reported is not None:
+            total = Decimal(str(reported))
+            input_tokens = self.usage.input_tokens or 0
+            output_tokens = self.usage.output_tokens or 0
+            denom = input_tokens + output_tokens
+            if denom > 0:
+                input_price = total * Decimal(input_tokens) / Decimal(denom)
+                output_price = total - input_price
+            else:
+                input_price = Decimal(0)
+                output_price = total
+            return _ProviderReportedPrice(input_price, output_price, total)
+    except Exception:
+        logfire.exception("Provider-cost override failed; falling back to upstream")
+    if _original_cost is None:
+        raise AttributeError("ModelResponse.cost is unavailable on this pydantic_ai version")
     return _original_cost(self)
 
 
-ModelResponse.cost = _cost_prefer_provider  # type: ignore[method-assign]
+if _original_cost is not None:
+    ModelResponse.cost = _cost_prefer_provider  # type: ignore[method-assign]
 
 
 def _user_handle(user: User) -> str:
@@ -137,6 +142,10 @@ class ChatAgent:
             tools.append(_make_enable_gate_tool(gate, servers))
         mcp_toolsets = build_mcp_toolsets(config)
 
+        # Auto agent runs without AgentDeps, so skip tools that touch ctx.deps
+        # (social-credit tools and enable_<gate> meta-tools).
+        auto_tools = build_tools(config, redis_client=None)
+
         async def _inject_social_credit(ctx: RunContext[AgentDeps]) -> str:
             parts: list[str] = []
             parts.append(f"Current user: @{ctx.deps.username}")
@@ -163,7 +172,7 @@ class ChatAgent:
                 model,
                 output_type=str,
                 instructions=[config.system_prompt_auto],
-                tools=tools,
+                tools=auto_tools,
                 retries=3,
             )
 
@@ -242,10 +251,7 @@ class ChatAgent:
         """Fetch the user's social credit score from Redis."""
         if not self._redis:
             return None
-        # Normalize: lowercase, strip @
-        key = username.strip().lower()
-        if key.startswith("@"):
-            key = key[1:]
+        key = normalize_username(username)
         try:
             raw = await self._redis.get(f"score:{key}")
             if raw is None:
@@ -254,20 +260,3 @@ class ChatAgent:
         except Exception:
             logfire.exception("Error pre-fetching social credit score")
             return None
-
-    def run_sync(self, *args, **kwargs) -> str:
-        """Sync wrapper for run - for compatibility with notebooks."""
-
-        def _run_async():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                return loop.run_until_complete(self.run(*args, **kwargs))
-            finally:
-                loop.close()
-
-        from concurrent.futures import ThreadPoolExecutor
-
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_run_async)
-            return future.result()

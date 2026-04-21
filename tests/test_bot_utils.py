@@ -1,6 +1,5 @@
 """Tests for Bot helper methods that don't need a live WebSocket."""
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -11,16 +10,9 @@ from bot.models import MiFile
 
 
 @pytest.fixture
-def event_loop():
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
-
-
-@pytest.fixture
-def bot(config, event_loop):
+def bot(config):
     """Build a Bot without spinning up the websocket."""
-    return Bot(config=config, loop=event_loop)
+    return Bot(config=config)
 
 
 def test_format_handle_local(bot, make_user):
@@ -49,6 +41,11 @@ def test_strip_leading_mentions_no_op(bot):
     assert bot._strip_leading_mentions("hello @alice") == "hello @alice"
 
 
+def test_strip_leading_mentions_lone_mention(bot):
+    assert bot._strip_leading_mentions("@alice") == ""
+    assert bot._strip_leading_mentions("@alice@remote.example") == ""
+
+
 def test_note_has_prompt_content_false_without_text_or_images(bot, make_note):
     note = make_note(text=None, files=None)
     assert bot._note_has_prompt_content(note) is False
@@ -70,15 +67,15 @@ def test_reply_visible_user_ids_filters_bot_and_dedupes(bot, make_note, make_use
     assert bot._reply_visible_user_ids(note) == ["user-3", author.id]
 
 
-def test_compute_auto_reply_delay_no_jitter(make_config, event_loop):
+def test_compute_auto_reply_delay_no_jitter(make_config):
     cfg = make_config(auto_reply_interval=300, auto_reply_jitter=0)
-    bot = Bot(cfg, loop=event_loop)
+    bot = Bot(cfg)
     assert bot._compute_auto_reply_delay() == 300
 
 
-def test_compute_auto_reply_delay_with_jitter(make_config, event_loop):
+def test_compute_auto_reply_delay_with_jitter(make_config):
     cfg = make_config(auto_reply_interval=300, auto_reply_jitter=30)
-    bot = Bot(cfg, loop=event_loop)
+    bot = Bot(cfg)
     delay = bot._compute_auto_reply_delay()
     assert 270 <= delay <= 330
 
@@ -231,9 +228,9 @@ async def test_on_mention_processes_image_only_note(bot, make_note):
 
 
 @pytest.mark.anyio
-async def test_on_auto_reply_updates_timestamp_and_triggers_reply(make_config, event_loop, fake_redis, make_note):
+async def test_on_auto_reply_updates_timestamp_and_triggers_reply(make_config, fake_redis, make_note):
     cfg = make_config(auto_reply_interval=5, auto_reply_jitter=0)
-    bot = Bot(config=cfg, redis_client=fake_redis, loop=event_loop)
+    bot = Bot(config=cfg, redis_client=fake_redis)
     note = make_note()
     bot._last_auto_reply_time = 0
     bot._next_auto_reply_delay = 5

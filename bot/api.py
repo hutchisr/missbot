@@ -116,11 +116,14 @@ class ApiClient:
     def __getattr__(self, name):
         return getattr(self.__client, name)
 
+    # Dunder methods bypass __getattr__, so define explicitly to keep the
+    # wrapper usable as a drop-in for httpx.AsyncClient. Lifecycle is managed
+    # via configure()/close(), so these are no-ops that preserve `self`.
     async def __aenter__(self):
-        return await self.__client.__aenter__()
+        return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        return await self.__client.__aexit__(exc_type, exc_val, exc_tb)
+        return None
 
 
 # Create the instance

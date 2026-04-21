@@ -147,20 +147,32 @@ def test_configure_closes_existing_client_without_running_loop(config):
 
 
 @pytest.mark.anyio
-async def test_api_client_delegates_context_manager_and_close():
+async def test_api_client_delegates_attrs_and_close():
     client = ApiClient()
     underlying = MagicMock(spec=httpx.AsyncClient)
     underlying.is_closed = False
     underlying.aclose = AsyncMock()
-    underlying.__aenter__ = AsyncMock(return_value="entered")
-    underlying.__aexit__ = AsyncMock(return_value=False)
     underlying.post = MagicMock()
     setattr(client, "_ApiClient__async_client", underlying)
 
     assert cast(Any, client).post is underlying.post
-    assert await client.__aenter__() == "entered"
-    assert await client.__aexit__(None, None, None) is False
 
     await client.close()
 
     underlying.aclose.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_api_client_context_manager_returns_self_without_touching_underlying():
+    client = ApiClient()
+    underlying = MagicMock(spec=httpx.AsyncClient)
+    underlying.__aenter__ = AsyncMock()
+    underlying.__aexit__ = AsyncMock()
+    setattr(client, "_ApiClient__async_client", underlying)
+
+    async with client as c:
+        assert c is client
+
+    # Lifecycle is owned by configure()/close(); the context manager is a no-op.
+    underlying.__aenter__.assert_not_awaited()
+    underlying.__aexit__.assert_not_awaited()

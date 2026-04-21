@@ -33,14 +33,12 @@ class Bot:
         self,
         config: Config,
         redis_client: Optional[Redis] = None,
-        loop: Optional[asyncio.AbstractEventLoop] = None,
     ):
         self.url = config.url
         self.ws_url = config.ws_url
         self.api_key = config.token
         self.username = config.bot_username
         self.user_id = config.bot_user_id
-        self.loop = asyncio.get_event_loop() if loop is None else loop
         self.ws: Optional[ClientConnection] = None
 
         self._config = config
@@ -49,6 +47,9 @@ class Bot:
         self._shutdown_event = asyncio.Event()
         self._last_auto_reply_time: float = time.time()
         self._next_auto_reply_delay: float = self._compute_auto_reply_delay()
+        # Strong refs for fire-and-forget handler tasks; asyncio holds only weakrefs,
+        # so without this the tasks can be GC'd mid-run.
+        self._background_tasks: set[asyncio.Task] = set()
 
     @logfire.instrument(extract_args=["note"])
     async def on_mention(self, note: Note):
@@ -281,49 +282,68 @@ class Bot:
         if self._config.auto_post_interval:
             auto_post_task = asyncio.create_task(self._auto_post_loop())
 
-        async for websocket in connect(f"{self.ws_url}/streaming?i={self.api_key}"):
-            try:
-                await websocket.send(
-                    MiChannelConnect(body=MiChannelConnectBody(channel="main", id="1")).model_dump_json(
-                        exclude_none=True
-                    )
-                )
-                if self._config.auto_reply_enabled:
-                    await websocket.send(
-                        MiChannelConnect(
-                            body=MiChannelConnectBody(
-                                channel="globalTimeline",
-                                id="2",
-                                params=MiChannelConnectParams(),
-                            )
-                        ).model_dump_json(exclude_none=True)
-                    )
-                    logfire.info("Connected to websocket (main + globalTimeline)")
-                else:
-                    logfire.info("Connected to websocket (main)")
-
+        try:
+            async for websocket in connect(f"{self.ws_url}/streaming?i={self.api_key}"):
                 shutdown_task = asyncio.create_task(self._shutdown_event.wait())
                 message_task = asyncio.create_task(self._handle_messages(websocket))
+                try:
+                    await websocket.send(
+                        MiChannelConnect(body=MiChannelConnectBody(channel="main", id="1")).model_dump_json(
+                            exclude_none=True
+                        )
+                    )
+                    if self._config.auto_reply_enabled:
+                        await websocket.send(
+                            MiChannelConnect(
+                                body=MiChannelConnectBody(
+                                    channel="globalTimeline",
+                                    id="2",
+                                    params=MiChannelConnectParams(),
+                                )
+                            ).model_dump_json(exclude_none=True)
+                        )
+                        logfire.info("Connected to websocket (main + globalTimeline)")
+                    else:
+                        logfire.info("Connected to websocket (main)")
 
-                done, _ = await asyncio.wait(
-                    [shutdown_task, message_task],
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
+                    done, _ = await asyncio.wait(
+                        [shutdown_task, message_task],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
 
-                if shutdown_task in done:
-                    logfire.info("Shutdown requested, closing connection")
-                    await websocket.close()
-                    if auto_post_task:
-                        auto_post_task.cancel()
-                    return
+                    if shutdown_task in done:
+                        logfire.info("Shutdown requested, closing connection")
+                        await websocket.close()
+                        return
 
-            except ConnectionClosed:
-                if self._shutdown_event.is_set():
-                    if auto_post_task:
-                        auto_post_task.cancel()
-                    return
-                logfire.warning("WebSocket connection closed, reconnecting...")
-                continue
+                    # Message task finished first — surface non-reconnect errors.
+                    exc = message_task.exception()
+                    if exc is not None and not isinstance(exc, ConnectionClosed):
+                        raise exc
+                    logfire.warning("WebSocket connection closed, reconnecting...")
+
+                except ConnectionClosed:
+                    if self._shutdown_event.is_set():
+                        return
+                    logfire.warning("WebSocket connection closed, reconnecting...")
+                finally:
+                    await self._cancel_and_wait(shutdown_task, message_task)
+        finally:
+            if auto_post_task:
+                await self._cancel_and_wait(auto_post_task)
+
+    @staticmethod
+    async def _cancel_and_wait(*tasks: asyncio.Task):
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except (asyncio.CancelledError, ConnectionClosed):
+                pass
+            except Exception:
+                logfire.exception("Background task finished with exception")
 
     async def _handle_messages(self, websocket: ClientConnection):
         async for message in websocket:
@@ -331,11 +351,9 @@ class Bot:
                 msg = MiWebsocketMessage(**json.loads(message))
                 if msg.type == "channel" and msg.body and msg.body.body:
                     if msg.body.type == "mention":
-                        task = asyncio.create_task(self.on_mention(msg.body.body))
-                        task.add_done_callback(self._task_done_callback)
+                        self._spawn_background_task(self.on_mention(msg.body.body))
                     elif msg.body.type == "note" and self._config.auto_reply_enabled:
-                        task = asyncio.create_task(self.on_auto_reply(msg.body.body))
-                        task.add_done_callback(self._task_done_callback)
+                        self._spawn_background_task(self.on_auto_reply(msg.body.body))
             except ValidationError as e:
                 logfire.debug(f"Validation error: {e}. Message doesn't match expected format, ignoring.")
                 pass
@@ -344,6 +362,14 @@ class Bot:
                 raise
             except Exception:
                 logfire.exception("Error processing message")
+
+    def _spawn_background_task(self, coro) -> asyncio.Task:
+        """Create a tracked background task (holds a strong ref, logs failures)."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        task.add_done_callback(self._task_done_callback)
+        return task
 
     def _task_done_callback(self, task: asyncio.Task):
         """Handle completed tasks - log exceptions and discard."""
@@ -375,4 +401,4 @@ class Bot:
         return result
 
     def _strip_leading_mentions(self, text: str) -> str:
-        return re.sub(r"^(?:@[\w\-]+(?:@[\w\-\.]+)?\s+)+", "", text)
+        return re.sub(r"^(?:@[\w\-]+(?:@[\w\-\.]+)?(?:\s+|$))+", "", text)

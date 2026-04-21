@@ -2,7 +2,7 @@
 
 import json
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
@@ -16,6 +16,14 @@ from .models import Config
 def current_datetime() -> str:
     """Gets current date and time."""
     return str(datetime.now())
+
+
+def normalize_username(username: str) -> str:
+    """Normalize a handle to lowercase and drop a leading '@'."""
+    username = username.strip().lower()
+    if username.startswith("@"):
+        username = username[1:]
+    return username
 
 
 def build_tools(config: Config, redis_client: Optional[Redis] = None) -> list[Callable[..., object]]:
@@ -48,7 +56,8 @@ def build_tools(config: Config, redis_client: Optional[Redis] = None) -> list[Ca
                     )
                     response.raise_for_status()
                     data = response.json()
-                    return "\n---\n".join([result.get("content") for result in data.get("results", [])[:5]])
+                    contents = [r.get("content") for r in data.get("results", [])[:5] if r.get("content")]
+                    return "\n---\n".join(contents)
                 except httpx.HTTPError:
                     logfire.exception("HTTP Error during web search")
                     return None
@@ -138,13 +147,6 @@ def build_tools(config: Config, redis_client: Optional[Redis] = None) -> list[Ca
         # Capture redis_client in closure with type assertion
         _redis: Redis = redis_client
 
-        def _normalize_username(username: str) -> str:
-            """Normalize username to lowercase, strip @ prefix."""
-            username = username.strip().lower()
-            if username.startswith("@"):
-                username = username[1:]
-            return username
-
         @logfire.instrument()
         async def get_social_credit(username: str) -> str:
             """Get a user's social credit score.
@@ -152,12 +154,12 @@ def build_tools(config: Config, redis_client: Optional[Redis] = None) -> list[Ca
             Args:
                 username: The username to look up (e.g. 'alice' for local, 'bob@remote.host' for remote).
             """
-            username = _normalize_username(username)
+            username = normalize_username(username)
             try:
                 score = await _redis.get(f"score:{username}")  # type: ignore[misc]
                 if score is None:
                     return f"User @{username} has no social credit score yet (defaults to 0)."
-                return f"User @{username} has {score} social credit points."
+                return f"User @{username} has {int(score)} social credit points."
             except Exception:
                 logfire.exception("Error getting social credit score")
                 return "Error retrieving social credit score."
@@ -172,7 +174,7 @@ def build_tools(config: Config, redis_client: Optional[Redis] = None) -> list[Ca
                 amount: The amount to add (positive) or subtract (negative).
                 reason: A brief explanation for the adjustment (required).
             """
-            username = _normalize_username(username)
+            username = normalize_username(username)
 
             # Prevent multiple adjustments per user per run
             adjusted = getattr(ctx.deps, "adjusted_credit_users", None)
@@ -184,23 +186,23 @@ def build_tools(config: Config, redis_client: Optional[Redis] = None) -> list[Ca
                 if not reason or not reason.strip():
                     return "Error: reason is required for social credit adjustments."
 
-                # Increment score
                 new_score = await _redis.incrby(f"score:{username}", amount)  # type: ignore[misc]
 
-                # Log change to history
                 history_entry = json.dumps(
                     {
                         "amount": amount,
                         "reason": reason,
-                        "timestamp": datetime.now().isoformat(),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
                     }
                 )
                 history_key = f"history:{username}"
-                await _redis.lpush(history_key, history_entry)  # type: ignore[misc]
-                await _redis.expire(history_key, 30 * 86400)  # type: ignore[misc]  # 30-day TTL
-
-                # Update leaderboard (sorted set)
-                await _redis.zadd("global:leaderboard", {username: float(new_score)})  # type: ignore[misc]
+                # Pipeline history + leaderboard updates so they can't partially apply.
+                # The incrby above is separate since zadd needs its returned score.
+                pipe = _redis.pipeline(transaction=True)
+                pipe.lpush(history_key, history_entry)
+                pipe.expire(history_key, 30 * 86400)  # 30-day TTL
+                pipe.zadd("global:leaderboard", {username: float(new_score)})
+                await pipe.execute()
 
                 sign = "+" if amount >= 0 else ""
                 return (
@@ -218,7 +220,7 @@ def build_tools(config: Config, redis_client: Optional[Redis] = None) -> list[Ca
                 username: The username to look up (e.g. 'alice' for local, 'bob@remote.host' for remote).
                 limit: Maximum number of history entries to return (default 10).
             """
-            username = _normalize_username(username)
+            username = normalize_username(username)
             try:
                 limit = max(1, min(50, limit))  # Clamp to 1-50
 
@@ -252,11 +254,11 @@ def build_tools(config: Config, redis_client: Optional[Redis] = None) -> list[Ca
             try:
                 limit = max(1, min(50, limit))
 
-                # Get top scores (descending order)
-                top_users = await _redis.zrevrange(  # type: ignore[misc]
+                top_users = await _redis.zrange(  # type: ignore[misc]
                     "global:leaderboard",
                     0,
                     limit - 1,
+                    desc=True,
                     withscores=True,
                 )
 

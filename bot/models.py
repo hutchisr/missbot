@@ -151,13 +151,6 @@ class Config(BaseModel):
         description="Random jitter in seconds added/subtracted from auto_reply_interval",
     )
     max_retries: int = Field(gt=0)
-
-    @model_validator(mode="after")
-    def check_auto_post_config(self) -> "Config":
-        if self.auto_post_interval and not self.system_prompt_auto:
-            raise ValueError("system_prompt_auto is required when auto_post_interval is set")
-        return self
-
     http_timeout_seconds: float = Field(
         default=30.0,
         gt=0,
@@ -175,3 +168,9 @@ class Config(BaseModel):
         description="Streamable-HTTP MCP servers to expose as tools.",
     )
     debug: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def check_auto_post_config(self) -> "Config":
+        if self.auto_post_interval and not self.system_prompt_auto:
+            raise ValueError("system_prompt_auto is required when auto_post_interval is set")
+        return self
