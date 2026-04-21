@@ -2,21 +2,21 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   labels:
-    app.kubernetes.io/name: grok
+    app.kubernetes.io/name: missbot
   annotations:
     reloader.stakater.com/auto: "true"
-  name: grok
+  name: missbot
   namespace: misskey
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: grok
+      app.kubernetes.io/name: missbot
   strategy: {}
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: grok
+        app.kubernetes.io/name: missbot
     spec:
       shareProcessNamespace: true
       containers:
@@ -25,12 +25,12 @@ spec:
           name: bot
           env:
             - name: LOGFIRE_SERVICE_NAME
-              value: grok
+              value: missbot
             - name: LOGFIRE_ENVIRONMENT
               value: k8s
           envFrom:
             - secretRef:
-                name: grok-secrets
+                name: missbot-secrets
           volumeMounts:
             - name: config-volume
               mountPath: /config.yaml
@@ -47,7 +47,7 @@ spec:
       volumes:
         - name: config-volume
           configMap:
-            name: grok-config
+            name: missbot-config
 status: {}
 ---
 apiVersion: v1

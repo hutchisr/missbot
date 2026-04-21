@@ -15,7 +15,7 @@ docker buildx build --pull --push \
 [tasks.deploy]
 run = """
 kubectl apply -k k8s --server-side && \
-kubectl -n misskey rollout restart deployment grok
+kubectl -n misskey rollout restart deployment missbot
 """
 
 [env]

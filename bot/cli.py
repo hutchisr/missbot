@@ -38,7 +38,7 @@ async def main_async(config):
     )
     logfire.instrument_pydantic_ai()
     logfire.instrument_httpx()
-    logfire.instrument_redis()
+    logfire.instrument_redis(capture_statement=True)
     logging.basicConfig(
         level=logging.DEBUG if debug_enabled else logging.INFO,
         handlers=[LogfireLoggingHandler()],

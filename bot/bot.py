@@ -106,6 +106,14 @@ class Bot:
             payload["visibleUserIds"] = visible_user_ids
 
         response = await api_client.post(f"{self.url}api/notes/create", json=payload)
+        if response.is_error:
+            logfire.error(
+                "notes/create failed",
+                status=response.status_code,
+                response_body=response.text,
+                request_payload=payload,
+                reply_target=in_reply_to.id if in_reply_to else None,
+            )
         response.raise_for_status()
         logfire.info("Sent note", id=response.json().get("createdNote").get("id"))
 

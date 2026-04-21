@@ -1,4 +1,4 @@
-# Grok Bot
+# Missbot
 
 Misskey/Fediverse chatbot using Pydantic AI with LLM fallback, WebSocket streaming, and optional Redis-backed social credit system.
 
@@ -16,7 +16,7 @@ uv run ruff check bot/
 uv run ruff format --check bot/
 
 # Docker
-docker build -t grok . && docker run -v /path/to/config.yaml:/config.yaml grok
+docker build -t missbot . && docker run -v /path/to/config.yaml:/config.yaml missbot
 
 # Kubernetes
 mise run build      # Build and push Docker image

@@ -6,19 +6,19 @@ resources:
 generatorOptions:
   disableNameSuffixHash: true
 configMapGenerator:
-  - name: grok-config
+  - name: missbot-config
     namespace: misskey
     files:
       - config.yaml=config.yaml
       - optimized.json=optimized.json
     options:
       labels:
-        app.kubernetes.io/name: grok
+        app.kubernetes.io/name: missbot
 secretGenerator:
-  - name: grok-secrets
+  - name: missbot-secrets
     namespace: misskey
     envs:
       - secrets.txt
     options:
       labels:
-        app.kubernetes.io/name: grok
+        app.kubernetes.io/name: missbot

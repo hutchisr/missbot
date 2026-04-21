@@ -63,7 +63,7 @@ async def test_main_async_configures_services_and_runs_bot(config):
     assert configure_mock.call_args.kwargs["min_level"] == "info"
     instrument_ai_mock.assert_called_once_with()
     instrument_httpx_mock.assert_called_once_with()
-    instrument_redis_mock.assert_called_once_with()
+    instrument_redis_mock.assert_called_once_with(capture_statement=True)
     basic_config_mock.assert_called_once_with(level=logging.INFO, handlers=["handler"])
     for name in ("httpx", "httpcore", "redis"):
         loggers[name].setLevel.assert_called_once_with(logging.CRITICAL + 1)

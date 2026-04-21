@@ -1,6 +1,6 @@
-# Grok
+# Missbot
 
-Grok is a Python-based Misskey/Fediverse chatbot that responds to mentions using LLMs and optional web search.
+Missbot is a Python-based Misskey/Fediverse chatbot that responds to mentions using LLMs and optional web search.
 
 ## Features
 

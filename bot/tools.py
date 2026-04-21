@@ -1,4 +1,4 @@
-"""Tool utilities for the Grok bot."""
+"""Tool utilities for Missbot."""
 
 import json
 from collections.abc import Callable
