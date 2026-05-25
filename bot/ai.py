@@ -1,3 +1,4 @@
+import asyncio
 import os
 from collections import deque
 from dataclasses import dataclass, field
@@ -24,7 +25,8 @@ from redis.asyncio import Redis
 
 from .mcp import build_mcp_toolsets, gate_names
 from .models import Config, CustomOpenAIModel, Note, User
-from .tools import build_tools, normalize_username
+from .scoring import MessageQuality, SCORING_INSTRUCTIONS, build_scoring_prompt, delta_for
+from .tools import apply_social_credit, build_tools, normalize_username
 
 
 @dataclass
@@ -201,11 +203,12 @@ class ChatAgent:
             else:
                 parts.append("Current user's social credit score: 0 (no score recorded yet)")
             if ctx.deps.social_credit_unrestricted:
-                parts.append("You may adjust the social credit of any user.")
+                parts.append("You may manually adjust any user's social credit with the adjust_social_credit tool.")
             else:
                 parts.append(
-                    f"You may only adjust the social credit of @{ctx.deps.username} "
-                    "(the author of the note you're replying to). Adjustments targeting anyone else are refused."
+                    "Regular users' social credit is adjusted automatically based on their "
+                    "messages; you cannot adjust scores yourself, and the adjust_social_credit "
+                    "tool will refuse. Do not promise, threaten, or claim to change anyone's score."
                 )
             return "\n".join(parts)
 
@@ -228,6 +231,22 @@ class ChatAgent:
                 instructions=[config.system_prompt_auto],
                 tools=auto_tools,
                 retries=3,
+            )
+
+        # Isolated, tool-less classifier for automatic message scoring. It treats
+        # the message as untrusted data and can only emit a fixed category, which
+        # is mapped to a bounded delta in code — see bot/scoring.py. Classification
+        # is a simple labeling task, so it can use a cheaper, separate model chain
+        # (config.score_models); falls back to the main reply model when unset.
+        self._score_agent: Optional[Agent[None, MessageQuality]] = None
+        self._score_model: Optional[Union[str, Model]] = None
+        if redis_client is not None and config.social_credit_auto_score:
+            self._score_model = _chain(config.score_models) if config.score_models else model
+            self._score_agent = Agent(
+                self._score_model,
+                output_type=MessageQuality,
+                instructions=[SCORING_INSTRUCTIONS],
+                retries=2,
             )
 
     async def __aenter__(self) -> "ChatAgent":
@@ -302,8 +321,57 @@ class ChatAgent:
         }
         if run_model is not None:
             run_kwargs["model"] = run_model
-        result = await self._agent.run(prompt, **run_kwargs)
+        # Score the author's message in parallel with generating the reply so it
+        # adds no user-facing latency. _maybe_score_message swallows its own
+        # errors, so it can never fail the reply.
+        result, _ = await asyncio.gather(
+            self._agent.run(prompt, **run_kwargs),
+            self._maybe_score_message(note, unrestricted),
+        )
         return result.output
+
+    async def _maybe_score_message(self, note: Note, unrestricted: bool) -> None:
+        """Classify a non-privileged author's message and apply a bounded delta.
+
+        Uses the isolated classifier (no tools, constrained output) so the score is
+        decided by code, not by anything the user can put in their message. Rate
+        limited per user. Never raises — scoring must not break the reply path.
+        """
+        if self._score_agent is None or self._redis is None or unrestricted:
+            return
+        text = (note.text or "").strip()
+        if not text:
+            return
+        username = normalize_username(_user_handle(note.user))
+        try:
+            cooldown_key = f"score_cooldown:{username}"
+            # Skip the classifier call entirely while the user is on cooldown.
+            if await self._redis.exists(cooldown_key):
+                logfire.debug("Auto-score skipped (cooldown)", username=username)
+                return
+
+            scored = await self._score_agent.run(
+                build_scoring_prompt(text),
+                model_settings={"timeout": 60.0},
+            )
+            delta = delta_for(scored.output)
+            if delta == 0:
+                return
+
+            # Atomically claim the cooldown window; bail if a concurrent run won it.
+            claimed = await self._redis.set(cooldown_key, "1", nx=True, ex=self._config.social_credit_score_cooldown)
+            if not claimed:
+                return
+            new_score = await apply_social_credit(self._redis, username, delta, f"automatic: {scored.output} message")
+            logfire.info(
+                "Auto-scored message",
+                username=username,
+                quality=scored.output,
+                delta=delta,
+                new_score=new_score,
+            )
+        except Exception:
+            logfire.exception("Error during automatic message scoring")
 
     @logfire.instrument(extract_args=False, record_return=True)
     async def run_auto(self) -> str:

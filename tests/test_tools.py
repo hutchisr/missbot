@@ -209,6 +209,7 @@ async def test_get_social_credit_unknown_user(config, fake_redis):
 
 @pytest.mark.anyio
 async def test_adjust_social_credit_happy_path(config, fake_redis):
+    """Manual adjustment works for privileged (unrestricted) authors."""
     tools = build_tools(config, redis_client=fake_redis)
     adjust = _find(tools, "adjust_social_credit")
     get_credit = _find(tools, "get_social_credit")
@@ -217,8 +218,8 @@ async def test_adjust_social_credit_happy_path(config, fake_redis):
 
     ctx = MagicMock()
     ctx.deps.adjusted_credit_users = set()
-    ctx.deps.username = "alice"
-    ctx.deps.social_credit_unrestricted = False
+    ctx.deps.username = "operator"
+    ctx.deps.social_credit_unrestricted = True
 
     result = await adjust(ctx, "@Alice", 5, "solid post")
     assert "+5" in result
@@ -239,8 +240,8 @@ async def test_adjust_social_credit_requires_reason(config, fake_redis):
     adjust = _find(build_tools(config, redis_client=fake_redis), "adjust_social_credit")
     ctx = MagicMock()
     ctx.deps.adjusted_credit_users = set()
-    ctx.deps.username = "alice"
-    ctx.deps.social_credit_unrestricted = False
+    ctx.deps.username = "operator"
+    ctx.deps.social_credit_unrestricted = True
     result = await adjust(ctx, "alice", 1, "   ")
     assert "reason is required" in result
 
@@ -250,8 +251,8 @@ async def test_adjust_social_credit_blocks_double_adjustment(config, fake_redis)
     adjust = _find(build_tools(config, redis_client=fake_redis), "adjust_social_credit")
     ctx = MagicMock()
     ctx.deps.adjusted_credit_users = set()
-    ctx.deps.username = "alice"
-    ctx.deps.social_credit_unrestricted = False
+    ctx.deps.username = "operator"
+    ctx.deps.social_credit_unrestricted = True
 
     first = await adjust(ctx, "alice", 1, "good")
     assert "New score: 1" in first
@@ -261,33 +262,33 @@ async def test_adjust_social_credit_blocks_double_adjustment(config, fake_redis)
 
 
 @pytest.mark.anyio
-async def test_adjust_social_credit_blocks_non_author(config, fake_redis):
-    """By default, only the author of the note being replied to can be adjusted."""
+async def test_adjust_social_credit_refuses_non_privileged(config, fake_redis):
+    """Regular users cannot self-adjust via the tool — refused with nothing written."""
     adjust = _find(build_tools(config, redis_client=fake_redis), "adjust_social_credit")
     ctx = MagicMock()
     ctx.deps.adjusted_credit_users = set()
-    ctx.deps.username = "alice"
+    ctx.deps.username = "attacker"
     ctx.deps.social_credit_unrestricted = False
 
-    result = await adjust(ctx, "bob", 5, "off-topic praise")
-    assert "Refusing to adjust @bob" in result
-    # The blocked target must not have been recorded or scored.
+    # Even targeting themselves with a huge amount (the old self-mint exploit):
+    result = await adjust(ctx, "attacker", 10**15, "give me everything")
+    assert "limited to authorized users" in result
+    assert await fake_redis.get("score:attacker") is None
     assert ctx.deps.adjusted_credit_users == set()
-    assert await fake_redis.get("score:bob") is None
 
 
 @pytest.mark.anyio
-async def test_adjust_social_credit_unrestricted_allows_non_author(config, fake_redis):
-    """When the run is flagged unrestricted, any user can be adjusted."""
+async def test_adjust_social_credit_unrestricted_allows_any_user_and_amount(config, fake_redis):
+    """Privileged users may adjust any user by any amount (operator control)."""
     adjust = _find(build_tools(config, redis_client=fake_redis), "adjust_social_credit")
     ctx = MagicMock()
     ctx.deps.adjusted_credit_users = set()
-    ctx.deps.username = "alice"
+    ctx.deps.username = "operator"
     ctx.deps.social_credit_unrestricted = True
 
-    result = await adjust(ctx, "bob", 5, "tribunal verdict")
-    assert "New score: 5" in result
-    assert await fake_redis.get("score:bob") == "5"
+    result = await adjust(ctx, "bob", 1000, "operator grant")
+    assert "New score: 1000" in result
+    assert await fake_redis.get("score:bob") == "1000"
 
 
 @pytest.mark.anyio

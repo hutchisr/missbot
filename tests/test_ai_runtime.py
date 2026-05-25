@@ -130,3 +130,114 @@ async def test_run_restricted_for_non_privileged_author(make_config, make_note, 
         await agent.run(note)
 
     assert run_mock.await_args.kwargs["deps"].social_credit_unrestricted is False
+
+
+# ---------------------------------------------------------------------------
+# Automatic, injection-resistant message scoring
+# ---------------------------------------------------------------------------
+
+
+def test_score_agent_built_only_with_redis_and_enabled(make_config, fake_redis):
+    assert ChatAgent(make_config())._score_agent is None  # no redis
+    assert ChatAgent(make_config(), redis_client=fake_redis)._score_agent is not None
+    disabled = ChatAgent(make_config(social_credit_auto_score=False), redis_client=fake_redis)
+    assert disabled._score_agent is None
+
+
+def test_score_model_defaults_to_main_model(make_config, fake_redis):
+    # With no score_models, the classifier reuses the main reply model chain.
+    agent = ChatAgent(make_config(), redis_client=fake_redis)
+    assert agent._score_model == "openrouter:test/model"
+
+
+def test_score_model_uses_separate_chain_when_configured(make_config, fake_redis):
+    cfg = make_config(score_models=["openrouter:cheap/classifier"])
+    agent = ChatAgent(cfg, redis_client=fake_redis)
+    assert agent._score_model == "openrouter:cheap/classifier"
+    assert agent._score_agent is not None
+
+
+@pytest.mark.anyio
+async def test_run_auto_scores_non_privileged_message(make_config, make_note, fake_redis):
+    agent = ChatAgent(make_config(), redis_client=fake_redis)
+    note = make_note(text="what a lovely day")  # author = alice
+
+    with (
+        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
+        patch.object(agent._score_agent, "run", AsyncMock(return_value=SimpleNamespace(output="good"))) as score_mock,
+    ):
+        out = await agent.run(note)
+
+    assert out == "reply"
+    assert score_mock.await_count == 1
+    # "good" -> +5 (see QUALITY_DELTAS); applied to the author and cooldown claimed.
+    assert await fake_redis.get("score:alice") == "5"
+    assert await fake_redis.exists("score_cooldown:alice")
+
+
+@pytest.mark.anyio
+async def test_run_scoring_respects_cooldown(make_config, make_note, fake_redis):
+    agent = ChatAgent(make_config(), redis_client=fake_redis)
+    await fake_redis.set("score_cooldown:alice", "1")  # already on cooldown
+    note = make_note(text="another banger")
+
+    with (
+        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
+        patch.object(agent._score_agent, "run", AsyncMock(return_value=SimpleNamespace(output="good"))) as score_mock,
+    ):
+        await agent.run(note)
+
+    # Classifier is not even consulted while on cooldown, and no score is applied.
+    assert score_mock.await_count == 0
+    assert await fake_redis.get("score:alice") is None
+
+
+@pytest.mark.anyio
+async def test_run_scoring_skips_neutral_without_consuming_cooldown(make_config, make_note, fake_redis):
+    agent = ChatAgent(make_config(), redis_client=fake_redis)
+    note = make_note(text="ok")
+
+    with (
+        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
+        patch.object(agent._score_agent, "run", AsyncMock(return_value=SimpleNamespace(output="neutral"))),
+    ):
+        await agent.run(note)
+
+    # Neutral => delta 0 => nothing written and cooldown NOT claimed (free retry).
+    assert await fake_redis.get("score:alice") is None
+    assert not await fake_redis.exists("score_cooldown:alice")
+
+
+@pytest.mark.anyio
+async def test_run_skips_scoring_for_privileged_author(make_config, make_note, make_user, fake_redis):
+    cfg = make_config(social_credit_unrestricted_user_ids=["user-1"])
+    agent = ChatAgent(cfg, redis_client=fake_redis)
+    note = make_note(text="trust me", user=make_user(id="user-1", username="operator"))
+
+    with (
+        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
+        patch.object(
+            agent._score_agent, "run", AsyncMock(return_value=SimpleNamespace(output="exceptional"))
+        ) as score_mock,
+    ):
+        await agent.run(note)
+
+    # Privileged authors are scored manually, never auto-scored.
+    assert score_mock.await_count == 0
+    assert await fake_redis.get("score:operator") is None
+
+
+@pytest.mark.anyio
+async def test_run_scoring_failure_does_not_break_reply(make_config, make_note, fake_redis):
+    agent = ChatAgent(make_config(), redis_client=fake_redis)
+    note = make_note(text="hi")
+
+    with (
+        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
+        patch.object(agent._score_agent, "run", AsyncMock(side_effect=RuntimeError("classifier down"))),
+    ):
+        out = await agent.run(note)
+
+    # Scoring swallows its own errors; the reply still comes back.
+    assert out == "reply"
+    assert await fake_redis.get("score:alice") is None

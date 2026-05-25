@@ -33,9 +33,17 @@ searxng_password: "yourpassword"
 # redis_url: "redis://localhost:6379"
 # redis_password: "yourpassword"
 # redis_db: 0
-# By default the bot can only adjust the social credit of the author of the note
-# it's replying to. List privileged user ids here to lift that limit: when the
-# author of the note is one of these users, the bot may adjust any user's score.
+# Ordinary users' scores are moved ONLY by an automatic, injection-resistant
+# classifier: the bot rates the tone/quality of their message and code maps the
+# category to a small delta (-2..+2). The manual adjust tool is refused for them.
+# social_credit_auto_score: true          # enable automatic message scoring (needs Redis)
+# social_credit_score_cooldown: 10         # min seconds between automatic score changes per user
+# The classifier is a simple labeling task — point it at a cheaper/smaller model
+# than the reply model(s). Same forms as llm_models; defaults to llm_models.
+# score_models:
+#   - "openrouter:meta-llama/llama-3.1-8b-instruct"
+# Privileged user ids may instead adjust ANY user by ANY amount via the manual
+# tool (e.g. operators / moderators). Match against the Misskey user id.
 # social_credit_unrestricted_user_ids:
 #   - "9abc1234operatoruserid"
 

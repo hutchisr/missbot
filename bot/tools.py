@@ -26,6 +26,32 @@ def normalize_username(username: str) -> str:
     return username
 
 
+async def apply_social_credit(redis: Redis, username: str, amount: int, reason: str) -> int:
+    """Apply a score delta for ``username`` and record history + leaderboard.
+
+    ``username`` must already be normalized. Returns the new score. Shared by the
+    manual tool and the automatic message scorer so both record identically.
+    """
+    new_score = await redis.incrby(f"score:{username}", amount)  # type: ignore[misc]
+
+    history_entry = json.dumps(
+        {
+            "amount": amount,
+            "reason": reason,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    history_key = f"history:{username}"
+    # Pipeline history + leaderboard updates so they can't partially apply.
+    # The incrby above is separate since zadd needs its returned score.
+    pipe = redis.pipeline(transaction=True)
+    pipe.lpush(history_key, history_entry)
+    pipe.expire(history_key, 30 * 86400)  # 30-day TTL
+    pipe.zadd("global:leaderboard", {username: float(new_score)})
+    await pipe.execute()
+    return new_score
+
+
 def build_tools(config: Config, redis_client: Optional[Redis] = None) -> list[Callable[..., object]]:
     """Create tool functions for the given config.
 
@@ -166,10 +192,13 @@ def build_tools(config: Config, redis_client: Optional[Redis] = None) -> list[Ca
 
         @logfire.instrument(extract_args=["username", "amount", "reason"])
         async def adjust_social_credit(ctx: RunContext[object], username: str, amount: int, reason: str) -> str:
-            """Adjust a user's social credit score.
+            """Manually adjust a user's social credit score. Authorized users only.
 
-            Only the author of the note being replied to may be adjusted, unless that
-            author is a privileged user (then any user is allowed).
+            Regular users' scores are adjusted automatically based on the content of
+            their own messages, so this tool refuses for non-privileged interactions.
+            It works only when the author of the note being replied to is a privileged
+            user (Config.social_credit_unrestricted_user_ids); then any user may be
+            adjusted by any amount.
 
             Args:
                 ctx: The run context (injected automatically).
@@ -177,18 +206,18 @@ def build_tools(config: Config, redis_client: Optional[Redis] = None) -> list[Ca
                 amount: The amount to add (positive) or subtract (negative).
                 reason: A brief explanation for the adjustment (required).
             """
-            username = normalize_username(username)
-
-            # Restrict adjustments to the author of the note being replied to,
-            # unless this run was flagged unrestricted (the author is a privileged
-            # user, see Config.social_credit_unrestricted_user_ids).
+            # Only privileged authors may drive manual adjustments. Regular users
+            # cannot self-adjust here — their score moves only via the automatic,
+            # injection-resistant message scorer.
             if not getattr(ctx.deps, "social_credit_unrestricted", False):
-                allowed = getattr(ctx.deps, "username", None)
-                if allowed is not None and username != normalize_username(allowed):
-                    return (
-                        f"Can only adjust @{normalize_username(allowed)}'s social credit "
-                        f"(the author of the note being replied to). Refusing to adjust @{username}."
-                    )
+                return (
+                    "Manual social credit adjustment is limited to authorized users. "
+                    "Regular users' scores change automatically based on their messages."
+                )
+
+            username = normalize_username(username)
+            if not reason or not reason.strip():
+                return "Error: reason is required for social credit adjustments."
 
             # Prevent multiple adjustments per user per run
             adjusted = getattr(ctx.deps, "adjusted_credit_users", None)
@@ -197,27 +226,7 @@ def build_tools(config: Config, redis_client: Optional[Redis] = None) -> list[Ca
                     return f"Already adjusted @{username}'s social credit in this interaction. Only one adjustment per user per message is allowed."
                 adjusted.add(username)
             try:
-                if not reason or not reason.strip():
-                    return "Error: reason is required for social credit adjustments."
-
-                new_score = await _redis.incrby(f"score:{username}", amount)  # type: ignore[misc]
-
-                history_entry = json.dumps(
-                    {
-                        "amount": amount,
-                        "reason": reason,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    }
-                )
-                history_key = f"history:{username}"
-                # Pipeline history + leaderboard updates so they can't partially apply.
-                # The incrby above is separate since zadd needs its returned score.
-                pipe = _redis.pipeline(transaction=True)
-                pipe.lpush(history_key, history_entry)
-                pipe.expire(history_key, 30 * 86400)  # 30-day TTL
-                pipe.zadd("global:leaderboard", {username: float(new_score)})
-                await pipe.execute()
-
+                new_score = await apply_social_credit(_redis, username, amount, reason)
                 sign = "+" if amount >= 0 else ""
                 return (
                     f"Adjusted @{username}'s social credit by {sign}{amount}. New score: {new_score}. Reason: {reason}"

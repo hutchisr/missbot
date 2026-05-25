@@ -202,6 +202,25 @@ class Config(BaseModel):
         "When the author of the note being replied to has one of these user ids, the bot may adjust "
         "any user's score; otherwise it can only adjust that author.",
     )
+    social_credit_auto_score: bool = Field(
+        default=True,
+        description="Automatically score a non-privileged author's message via an isolated, "
+        "injection-resistant classifier (only effective when Redis is configured). The category "
+        "the classifier returns is mapped to a small fixed delta in code, so users cannot dictate "
+        "their own score. Set false to disable automatic scoring entirely.",
+    )
+    social_credit_score_cooldown: int = Field(
+        default=10,
+        gt=0,
+        description="Minimum seconds between automatic social credit changes for a given user. "
+        "Bounds how fast a user can farm score even if every message is rated positively.",
+    )
+    score_models: List[Union[str, CustomOpenAIModel]] = Field(
+        default_factory=list,
+        description="Models for the social-credit message classifier (same forms as llm_models). "
+        "Defaults to llm_models when empty. Classification is a simple labeling task, so a smaller / "
+        "cheaper model is usually fine.",
+    )
     max_context: int = Field(gt=0, default=1, description="Number of context messages to include")
     mcp_servers: List[MCPServerConfig] = Field(
         default_factory=list,
