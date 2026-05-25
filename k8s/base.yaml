@@ -35,9 +35,6 @@ spec:
             - name: config-volume
               mountPath: /config.yaml
               subPath: config.yaml
-            - name: config-volume
-              mountPath: /optimized.json
-              subPath: optimized.json
           resources:
             requests:
               memory: "16Mi"
