@@ -15,7 +15,7 @@ async def test_run_accepts_image_only_note(config, make_note):
     agent = ChatAgent(config)
     note = make_note(
         text=None,
-        files=[MiFile(id="f1", type="image/png", thumbnailUrl="https://x/1.png")],
+        files=[MiFile(id="f1", type="image/png", thumbnailUrl="https://media.example/1.png")],
     )
 
     with (
@@ -46,7 +46,7 @@ async def test_run_routes_image_prompt_to_vision_model(make_config, make_note):
 
     note = make_note(
         text=None,
-        files=[MiFile(id="f1", type="image/png", thumbnailUrl="https://x/1.png")],
+        files=[MiFile(id="f1", type="image/png", thumbnailUrl="https://media.example/1.png")],
     )
 
     with (
@@ -87,7 +87,7 @@ async def test_run_drops_images_when_no_vision_model(make_config, make_note):
 
     note = make_note(
         text="look",
-        files=[MiFile(id="f1", type="image/png", thumbnailUrl="https://x/1.png")],
+        files=[MiFile(id="f1", type="image/png", thumbnailUrl="https://media.example/1.png")],
     )
 
     with (

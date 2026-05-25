@@ -25,6 +25,7 @@ from redis.asyncio import Redis
 
 from .mcp import build_mcp_toolsets, gate_names
 from .models import Config, CustomOpenAIModel, Note, User
+from .net import is_safe_media_url
 from .scoring import MessageQuality, SCORING_INSTRUCTIONS, build_scoring_prompt, delta_for
 from .tools import apply_social_credit, build_tools, normalize_username
 
@@ -111,8 +112,13 @@ def _image_urls_for(note: Note, vision: bool) -> list[ImageUrl]:
     images: list[ImageUrl] = []
     for file in note.files:
         image_url = file.thumbnailUrl or file.url
-        if image_url and file.type.startswith("image/"):
-            images.append(ImageUrl(url=image_url))
+        if not image_url or not file.type.startswith("image/"):
+            continue
+        # SSRF guard: the URL is attacker-controlled on federated notes.
+        if not is_safe_media_url(image_url):
+            logfire.warning("Dropping image with unsafe URL", url=image_url, file_id=file.id)
+            continue
+        images.append(ImageUrl(url=image_url))
     return images
 
 

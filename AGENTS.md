@@ -34,6 +34,7 @@ mise run deploy     # Apply K8s manifests and restart
 | `bot/models.py` | Pydantic models: `Config`, `Note`, `User`, `MiFile`, WS message types |
 | `bot/tools.py` | `build_tools()` factory — datetime, web search, search_users/notes, social credit tools; `apply_social_credit()` helper |
 | `bot/scoring.py` | Injection-resistant message classifier: `MessageQuality`, code-side `QUALITY_DELTAS`, hardened prompt builder |
+| `bot/net.py` | `is_safe_media_url()` — SSRF guard for attacker-supplied image URLs (blocks private/reserved IPs and internal hosts) |
 | `bot/mcp.py` | `build_mcp_toolsets()` + `gate_names()` — streamable-HTTP MCP servers with allow/block and gate filtering |
 | `bot/api.py` | HTTP client utilities |
 | `bot/cli.py` | CLI entry point and argument parsing |
@@ -100,7 +101,7 @@ For tools needing `RunContext`, use the signature `async def my_tool(ctx: RunCon
 ### Message flow
 1. WebSocket mention received → `Bot` ignores own mentions
 2. Reply chain traversed (up to `max_context`) to build `message_history`
-3. Images passed inline via `ImageUrl` when `vision=true`
+3. Images passed inline via `ImageUrl` when `vision=true` — each URL is SSRF-checked with `bot/net.py:is_safe_media_url` first (attacker-controlled on federated notes); unsafe ones are dropped
 4. `ChatAgent.run()` calls Pydantic AI agent with fallback model
 5. Reply sent via Misskey API with proper mention formatting
 

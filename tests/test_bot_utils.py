@@ -214,7 +214,7 @@ async def test_get_note_returns_parsed_note(bot, make_note):
 async def test_on_mention_processes_image_only_note(bot, make_note):
     note = make_note(
         text=None,
-        files=[MiFile(id="f1", type="image/png", thumbnailUrl="https://x/1.png")],
+        files=[MiFile(id="f1", type="image/png", thumbnailUrl="https://media.example/1.png")],
     )
 
     with (
