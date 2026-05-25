@@ -33,7 +33,7 @@ mise run deploy     # Apply K8s manifests and restart
 | `bot/ai.py` | `ChatAgent` class — Pydantic AI agent with `FallbackModel`, vision support |
 | `bot/models.py` | Pydantic models: `Config`, `Note`, `User`, `MiFile`, WS message types |
 | `bot/tools.py` | `build_tools()` factory — datetime, web search, search_users/notes, social credit tools; `apply_social_credit()` helper |
-| `bot/scoring.py` | Injection-resistant message classifier: `MessageQuality`, code-side `QUALITY_DELTAS`, hardened prompt builder |
+| `bot/scoring.py` | Injection-resistant message classifier: `build_scoring_spec()` turns `Config.social_credit_categories` into the constrained output type + delta map + hardened instructions; `build_scoring_prompt()` fences untrusted input |
 | `bot/memory.py` | `MemoryStore` — Postgres/pgvector global long-term memory: embeds facts, cosine search, dedup, provenance. Only built when `memory_enabled` |
 | `bot/net.py` | `is_safe_media_url()` — SSRF guard for attacker-supplied image URLs (blocks private/reserved IPs and internal hosts) |
 | `bot/mcp.py` | `build_mcp_toolsets()` + `gate_names()` — streamable-HTTP MCP servers with allow/block and gate filtering |
@@ -57,6 +57,7 @@ Optional fields:
 - `social_credit_auto_score` (default `true`): score every author's message via an isolated, tool-less classifier whose category is mapped to a fixed delta (−10…+10) in code — users can't dictate their own score (privileged users are scored too; the flag only gates the manual adjust tool)
 - `social_credit_score_cooldown` (default `10`): min seconds between automatic score changes per user (bounds farming)
 - `score_models`: model chain for the classifier (same forms as `llm_models`); defaults to `llm_models`. Use a cheaper/smaller model — classification is a simple labeling task
+- `social_credit_categories`: list of sentiment buckets the classifier may assign, each `{name, delta, description}`. The model only picks a `name` (constrained output); code applies the matching `delta`, so configurability never lets the model choose the number. Defaults to the built-in toxic(−10)/rude(−5)/neutral(0)/good(+5)/exceptional(+10) set. Names must be unique (case-insensitive); `description` is shown to the classifier
 - `social_credit_unrestricted_user_ids`: list of user ids; when the note's author is one of these, the bot may manually adjust any user's score by any amount via `adjust_social_credit` (which is refused for everyone else)
 - `max_context`: parent notes to include (default 1)
 - `max_reply_mentions`: cap on total mentions (incl. the author) echoed into a reply (default 5); prevents mention-amplification/harassment relaying
@@ -97,7 +98,7 @@ Gating is progressive disclosure driven by the model itself: each unique `gate` 
 ### Agent setup (`bot/ai.py`)
 - `AgentDeps` is a **dataclass** (not BaseModel) with `username`, `source_note_id`, `social_credit_score`, `adjusted_credit_users`, `social_credit_unrestricted`, `enabled_gates`. `source_note_id` is recorded as provenance on `remember_fact` writes
 - `adjust_social_credit` is privileged-only: it works only when `deps.social_credit_unrestricted` is set (`ChatAgent.run` sets it when the note's author id is in `social_credit_unrestricted_user_ids`); for everyone else it refuses
-- Every author's score moves via `ChatAgent._maybe_score_message` (privileged users included): a separate tool-less classifier (`bot/scoring.py`, model from `score_models` or the reply model) runs concurrently with the reply, returns a `MessageQuality` category that's mapped to a fixed delta in code, applied through `apply_social_credit` and rate-limited by a Redis `score_cooldown:<user>` key. This is the prompt-injection mitigation — the model never picks the number
+- Every author's score moves via `ChatAgent._maybe_score_message` (privileged users included): a separate tool-less classifier (`bot/scoring.py`, model from `score_models` or the reply model) runs concurrently with the reply, returns one of the configured `social_credit_categories` (default toxic/rude/neutral/good/exceptional) that's mapped to its fixed delta in code, applied through `apply_social_credit` and rate-limited by a Redis `score_cooldown:<user>` key. `ChatAgent.__init__` builds a `ScoringSpec` (constrained output type + delta map + instructions) from the configured categories via `build_scoring_spec`. This is the prompt-injection mitigation — the model only picks a category name, never the number
 - Agent uses `output_type=str` (plain string output, not structured)
 - Tools are built via `build_tools()` in `bot/tools.py` and passed to `Agent(..., tools=tools)`
 - `FallbackModel` wraps multiple `llm_models` for automatic failover

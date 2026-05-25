@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from bot.models import Config, CustomOpenAIModel, MiFile, Note, User
+from bot.models import Config, CustomOpenAIModel, MiFile, Note, ScoreCategory, User
 
 
 def test_config_valid(make_config):
@@ -138,3 +138,45 @@ def test_memory_enabled_with_required_fields_ok(make_config):
     )
     assert cfg.memory_enabled is True
     assert cfg.embedding_model == "perplexity/pplx-embed-v1-0.6b"
+
+
+def test_score_categories_default(make_config):
+    cfg = make_config()
+    names = [c.name for c in cfg.social_credit_categories]
+    assert names == ["toxic", "rude", "neutral", "good", "exceptional"]
+    deltas = {c.name: c.delta for c in cfg.social_credit_categories}
+    assert deltas["good"] == 5
+    assert deltas["toxic"] == -10
+    assert deltas["neutral"] == 0
+
+
+def test_score_categories_custom(make_config):
+    cfg = make_config(
+        social_credit_categories=[
+            {"name": "bad", "delta": -3, "description": "not nice"},
+            {"name": "ok", "delta": 0, "description": "fine"},
+            {"name": "great", "delta": 7, "description": "lovely"},
+        ]
+    )
+    assert [c.name for c in cfg.social_credit_categories] == ["bad", "ok", "great"]
+    assert cfg.social_credit_categories[2].delta == 7
+
+
+def test_score_categories_reject_duplicate_names(make_config):
+    with pytest.raises(ValidationError):
+        make_config(
+            social_credit_categories=[
+                {"name": "good", "delta": 1, "description": "a"},
+                {"name": "Good", "delta": 2, "description": "b"},  # case-insensitive clash
+            ]
+        )
+
+
+def test_score_categories_reject_empty_list(make_config):
+    with pytest.raises(ValidationError):
+        make_config(social_credit_categories=[])
+
+
+def test_score_category_rejects_blank_name():
+    with pytest.raises(ValidationError):
+        ScoreCategory(name="   ", delta=1, description="x")

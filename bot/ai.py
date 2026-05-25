@@ -27,7 +27,7 @@ from .mcp import build_mcp_toolsets, gate_names
 from .memory import MemoryStore
 from .models import Config, CustomOpenAIModel, Note, User
 from .net import is_safe_media_url
-from .scoring import MessageQuality, SCORING_INSTRUCTIONS, build_scoring_prompt, delta_for
+from .scoring import ScoringSpec, build_scoring_prompt, build_scoring_spec
 from .tools import apply_social_credit, build_tools, normalize_username
 
 
@@ -253,17 +253,21 @@ class ChatAgent:
         # is mapped to a bounded delta in code — see bot/scoring.py. Classification
         # is a simple labeling task, so it can use a cheaper, separate model chain
         # (config.score_models); falls back to the main reply model when unset.
-        self._score_agent: Optional[Agent[None, MessageQuality]] = None
+        self._score_agent: Optional[Agent[None, str]] = None
         self._score_model: Optional[Union[str, Model]] = None
+        self._score_spec: Optional[ScoringSpec] = None
         if redis_client is not None and config.social_credit_auto_score:
             self._score_model = _chain(config.score_models) if config.score_models else model
+            # Categories, deltas, and instructions are derived from config here, so the
+            # operator owns the buckets while code still owns the numbers.
+            self._score_spec = build_scoring_spec(config.social_credit_categories)
             # pydantic-ai accepts a Literal output_type at runtime and constrains the
             # output to those values, but pyright can't match a Literal special form to
             # the Agent() overloads (it widens OutputDataT to str). Runtime is correct.
             self._score_agent = Agent(  # type: ignore[reportCallIssue, reportAttributeAccessIssue]
                 self._score_model,
-                output_type=MessageQuality,  # type: ignore[reportArgumentType]
-                instructions=[SCORING_INSTRUCTIONS],
+                output_type=self._score_spec.output_type,  # type: ignore[reportArgumentType]
+                instructions=[self._score_spec.instructions],
                 retries=2,
             )
 
@@ -393,7 +397,9 @@ class ChatAgent:
                 )
                 return
 
-            delta = delta_for(scored.output)
+            # _score_spec is always set whenever _score_agent is (guarded above).
+            assert self._score_spec is not None
+            delta = self._score_spec.deltas.get(scored.output, 0)
             if delta == 0:
                 return
 

@@ -45,6 +45,16 @@ searxng_password: "yourpassword"
 # than the reply model(s). Same forms as llm_models; defaults to llm_models.
 # score_models:
 #   - "openrouter:meta-llama/llama-3.1-8b-instruct"
+# Sentiment buckets the classifier may assign. The model only picks a category
+# `name` (constrained output); code applies the matching `delta`, so users can
+# never dictate the number. Defaults to the set below if omitted. Names must be
+# unique; `description` guides the classifier.
+# social_credit_categories:
+#   - {name: toxic,       delta: -10, description: "harassment, slurs, threats, hateful content."}
+#   - {name: rude,        delta: -5,  description: "dismissive, hostile, or insulting but not extreme."}
+#   - {name: neutral,     delta: 0,   description: "ordinary message, nothing notable either way."}
+#   - {name: good,        delta: 5,   description: "kind, helpful, thoughtful, or funny in good faith."}
+#   - {name: exceptional, delta: 10,  description: "outstandingly insightful, generous, or constructive."}
 # Privileged user ids may instead adjust ANY user by ANY amount via the manual
 # tool (e.g. operators / moderators). Match against the Misskey user id.
 # social_credit_unrestricted_user_ids:

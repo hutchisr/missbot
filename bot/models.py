@@ -1,4 +1,4 @@
-from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, WebsocketUrl, model_validator
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, WebsocketUrl, field_validator, model_validator
 from typing import List, Literal, Optional, Union
 
 
@@ -137,6 +137,41 @@ class MCPServerConfig(BaseModel):
     )
 
 
+class ScoreCategory(BaseModel):
+    """One sentiment bucket the auto-scoring classifier may assign.
+
+    The classifier only ever picks a category *name* (constrained output); the
+    point `delta` is owned entirely by code here, so a prompt injection can at most
+    nudge the category — it can never choose the number. Keep names short, simple
+    tokens (they become the classifier's allowed output values).
+    """
+
+    name: str = Field(description="Category label the classifier emits (e.g. 'good'). Short, simple token.")
+    delta: int = Field(
+        description="Points added (positive) or subtracted (negative) when a message is classified here."
+    )
+    description: str = Field(description="What this category means; shown to the classifier to guide labeling.")
+
+    @field_validator("name")
+    @classmethod
+    def _name_non_blank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("score category name must be non-empty")
+        return v
+
+
+# Built-in default categories — match the previously hard-coded toxic/rude/neutral/
+# good/exceptional set, so deployments that don't configure categories are unchanged.
+DEFAULT_SCORE_CATEGORIES: List[ScoreCategory] = [
+    ScoreCategory(name="toxic", delta=-10, description="harassment, slurs, threats, hateful content."),
+    ScoreCategory(name="rude", delta=-5, description="dismissive, hostile, or insulting but not extreme."),
+    ScoreCategory(name="neutral", delta=0, description="ordinary message, nothing notable either way."),
+    ScoreCategory(name="good", delta=5, description="kind, helpful, thoughtful, or funny in good faith."),
+    ScoreCategory(name="exceptional", delta=10, description="outstandingly insightful, generous, or constructive."),
+]
+
+
 class Config(BaseModel):
     domain: str = Field(description="domain")
     url: AnyHttpUrl = Field(description="url")
@@ -222,6 +257,12 @@ class Config(BaseModel):
         "Defaults to llm_models when empty. Classification is a simple labeling task, so a smaller / "
         "cheaper model is usually fine.",
     )
+    social_credit_categories: List[ScoreCategory] = Field(
+        default_factory=lambda: [c.model_copy() for c in DEFAULT_SCORE_CATEGORIES],
+        description="Sentiment categories the auto-scoring classifier may assign, each with a fixed point "
+        "delta applied in code (the model only picks a category, never the number). Defaults to the built-in "
+        "toxic/rude/neutral/good/exceptional set. Names must be unique (case-insensitive).",
+    )
     max_context: int = Field(gt=0, default=1, description="Number of context messages to include")
     max_reply_mentions: int = Field(
         default=5,
@@ -300,6 +341,16 @@ class Config(BaseModel):
     def check_auto_post_config(self) -> "Config":
         if self.auto_post_interval and not self.system_prompt_auto:
             raise ValueError("system_prompt_auto is required when auto_post_interval is set")
+        return self
+
+    @model_validator(mode="after")
+    def check_score_categories(self) -> "Config":
+        cats = self.social_credit_categories
+        if not cats:
+            raise ValueError("social_credit_categories must not be empty")
+        names = [c.name.lower() for c in cats]
+        if len(set(names)) != len(names):
+            raise ValueError("social_credit_categories names must be unique (case-insensitive)")
         return self
 
     @model_validator(mode="after")
