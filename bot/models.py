@@ -222,6 +222,12 @@ class Config(BaseModel):
         "cheaper model is usually fine.",
     )
     max_context: int = Field(gt=0, default=1, description="Number of context messages to include")
+    max_reply_mentions: int = Field(
+        default=5,
+        gt=0,
+        description="Maximum total mentions (including the author being replied to) the bot puts in "
+        "a reply. Caps mention-amplification / harassment relaying via notes that tag many users.",
+    )
     mcp_servers: List[MCPServerConfig] = Field(
         default_factory=list,
         description="Streamable-HTTP MCP servers to expose as tools.",

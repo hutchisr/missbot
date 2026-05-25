@@ -161,9 +161,16 @@ class Bot:
         if not note or not note.user:
             return []
 
+        # Always mention the author (the reply target); cap the echoed mentions so
+        # a note that tags many users can't turn the bot into a mass-notification /
+        # harassment relay. The bound also limits handle-resolution API calls on
+        # attacker-crafted notes (we stop once enough slots are filled).
+        limit = self._config.max_reply_mentions
         mentions: list[str] = []
         if note.mentions:
             for mention in note.mentions:
+                if len(mentions) >= limit - 1:  # reserve one slot for the author
+                    break
                 normalized = await self._normalize_note_mention(mention)
                 if not normalized:
                     continue

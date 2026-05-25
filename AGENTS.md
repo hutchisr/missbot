@@ -53,11 +53,12 @@ Optional fields:
 - `system_prompt_auto` + `auto_post_interval`: autonomous posting (interval in seconds)
 - `searxng_url`, `searxng_user`, `searxng_password`: web search via SearXNG
 - `redis_url`, `redis_password`, `redis_db`: Redis for social credit system
-- `social_credit_auto_score` (default `true`): score a non-privileged author's message via an isolated, tool-less classifier whose category is mapped to a fixed delta (−2…+2) in code — users can't dictate their own score
+- `social_credit_auto_score` (default `true`): score a non-privileged author's message via an isolated, tool-less classifier whose category is mapped to a fixed delta (−10…+10) in code — users can't dictate their own score
 - `social_credit_score_cooldown` (default `10`): min seconds between automatic score changes per user (bounds farming)
 - `score_models`: model chain for the classifier (same forms as `llm_models`); defaults to `llm_models`. Use a cheaper/smaller model — classification is a simple labeling task
 - `social_credit_unrestricted_user_ids`: list of user ids; when the note's author is one of these, the bot may manually adjust any user's score by any amount via `adjust_social_credit` (which is refused for everyone else)
 - `max_context`: parent notes to include (default 1)
+- `max_reply_mentions`: cap on total mentions (incl. the author) echoed into a reply (default 5); prevents mention-amplification/harassment relaying
 - `http_timeout_seconds`: HTTP timeout (default 30.0)
 - `mcp_servers`: list of streamable-HTTP MCP servers (see below)
 - `channel`, `debug`

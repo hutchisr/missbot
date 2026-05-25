@@ -23,6 +23,9 @@ llm_models:
 # Pass images directly to the main LLM (requires a multimodal model)
 vision: true
 max_tokens: 512
+# Cap on mentions (including the author) the bot echoes into a reply. Stops a note
+# that tags many users from turning the bot into a mass-notification relay.
+# max_reply_mentions: 5
 max_retries: 1
 http_timeout_seconds: 30
 max_memory: 5

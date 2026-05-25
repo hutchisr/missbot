@@ -150,6 +150,29 @@ async def test_build_mentions_returns_empty_when_no_note(bot):
 
 
 @pytest.mark.anyio
+async def test_build_mentions_caps_amplification(make_config, make_note, make_user):
+    """A note tagging many users yields at most max_reply_mentions in the reply."""
+    bot = Bot(config=make_config(max_reply_mentions=3))
+    author = make_user(id="u2", username="troll", host="evil.example")
+    victims = [f"@victim{i}@target.example" for i in range(40)]
+    note = make_note(user=author, mentions=victims)
+
+    mentions = await bot._build_mentions_from_note(note)
+
+    # Capped to 3 total, and the author is always present (reserved slot).
+    assert len(mentions) == 3
+    assert "@troll@evil.example" in mentions
+    assert all(m in {*victims, "@troll@evil.example"} for m in mentions)
+
+
+@pytest.mark.anyio
+async def test_build_mentions_limit_one_keeps_only_author(make_config, make_note, make_user):
+    bot = Bot(config=make_config(max_reply_mentions=1))
+    note = make_note(user=make_user(username="carol"), mentions=["@alice", "@bob"])
+    assert await bot._build_mentions_from_note(note) == ["@carol"]
+
+
+@pytest.mark.anyio
 async def test_send_note_preserves_reply_visibility(bot, make_note):
     note = make_note().model_copy(update={"visibility": "followers"})
     response = MagicMock()
