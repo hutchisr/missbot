@@ -2,23 +2,22 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-  - base.yaml
+- base.yaml
 generatorOptions:
   disableNameSuffixHash: true
 configMapGenerator:
-  - name: missbot-config
-    namespace: misskey
-    files:
-      - config.yaml=config.yaml
-      - optimized.json=optimized.json
-    options:
-      labels:
-        app.kubernetes.io/name: missbot
+- name: missbot-config
+  namespace: misskey
+  files:
+  - config.yaml=config.yaml
+  options:
+    labels:
+      app.kubernetes.io/name: missbot
 secretGenerator:
-  - name: missbot-secrets
-    namespace: misskey
-    envs:
-      - secrets.txt
-    options:
-      labels:
-        app.kubernetes.io/name: missbot
+- name: missbot-secrets
+  namespace: misskey
+  envs:
+  - secrets.txt
+  options:
+    labels:
+      app.kubernetes.io/name: missbot
