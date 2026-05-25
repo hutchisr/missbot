@@ -209,10 +209,11 @@ async def test_run_scoring_skips_neutral_without_consuming_cooldown(make_config,
 
 
 @pytest.mark.anyio
-async def test_run_skips_scoring_for_privileged_author(make_config, make_note, make_user, fake_redis):
+async def test_run_auto_scores_privileged_author_too(make_config, make_note, make_user, fake_redis):
+    """Privileged users are also auto-scored; the flag only gates the manual tool."""
     cfg = make_config(social_credit_unrestricted_user_ids=["user-1"])
     agent = ChatAgent(cfg, redis_client=fake_redis)
-    note = make_note(text="trust me", user=make_user(id="user-1", username="operator"))
+    note = make_note(text="great thread", user=make_user(id="user-1", username="operator"))
 
     with (
         patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
@@ -222,9 +223,9 @@ async def test_run_skips_scoring_for_privileged_author(make_config, make_note, m
     ):
         await agent.run(note)
 
-    # Privileged authors are scored manually, never auto-scored.
-    assert score_mock.await_count == 0
-    assert await fake_redis.get("score:operator") is None
+    assert score_mock.await_count == 1
+    # "exceptional" -> +10 (see QUALITY_DELTAS).
+    assert await fake_redis.get("score:operator") == "10"
 
 
 @pytest.mark.anyio
@@ -241,3 +242,5 @@ async def test_run_scoring_failure_does_not_break_reply(make_config, make_note, 
     # Scoring swallows its own errors; the reply still comes back.
     assert out == "reply"
     assert await fake_redis.get("score:alice") is None
+    # A failed classification must not burn the cooldown — it should retry next message.
+    assert not await fake_redis.exists("score_cooldown:alice")

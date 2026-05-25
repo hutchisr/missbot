@@ -332,34 +332,50 @@ class ChatAgent:
         # errors, so it can never fail the reply.
         result, _ = await asyncio.gather(
             self._agent.run(prompt, **run_kwargs),
-            self._maybe_score_message(note, unrestricted),
+            self._maybe_score_message(note),
         )
         return result.output
 
-    async def _maybe_score_message(self, note: Note, unrestricted: bool) -> None:
-        """Classify a non-privileged author's message and apply a bounded delta.
+    async def _maybe_score_message(self, note: Note) -> None:
+        """Classify the author's message and apply a bounded score delta.
 
-        Uses the isolated classifier (no tools, constrained output) so the score is
-        decided by code, not by anything the user can put in their message. Rate
-        limited per user. Never raises — scoring must not break the reply path.
+        Applies to every author (privileged users included — the privileged flag
+        only gates the manual adjust tool, not automatic scoring). Uses the isolated
+        classifier (no tools, constrained output) so the score is decided by code,
+        not by anything the user can put in their message. Rate limited per user.
+        Never raises — scoring must not break the reply path.
         """
-        if self._score_agent is None or self._redis is None or unrestricted:
+        if self._score_agent is None or self._redis is None:
             return
         text = (note.text or "").strip()
         if not text:
             return
         username = normalize_username(_user_handle(note.user))
+        cooldown_key = f"score_cooldown:{username}"
         try:
-            cooldown_key = f"score_cooldown:{username}"
             # Skip the classifier call entirely while the user is on cooldown.
             if await self._redis.exists(cooldown_key):
                 logfire.debug("Auto-score skipped (cooldown)", username=username)
                 return
 
-            scored = await self._score_agent.run(
-                build_scoring_prompt(text),
-                model_settings={"timeout": 60.0},
-            )
+            # Classify in isolation. Surface failures loudly: a model that can't
+            # emit a valid category would otherwise silently disable all scoring.
+            # We still never re-raise — the reply must not break.
+            try:
+                scored = await self._score_agent.run(
+                    build_scoring_prompt(text),
+                    model_settings={"timeout": 60.0},
+                )
+            except Exception:
+                logfire.exception(
+                    "Message scoring classifier FAILED — no score applied (reply unaffected). "
+                    "The score model likely can't produce structured output; set `score_models` "
+                    "to a model that can.",
+                    username=username,
+                    score_model=getattr(self._score_model, "model_name", None) or str(self._score_model),
+                )
+                return
+
             delta = delta_for(scored.output)
             if delta == 0:
                 return
@@ -377,7 +393,7 @@ class ChatAgent:
                 new_score=new_score,
             )
         except Exception:
-            logfire.exception("Error during automatic message scoring")
+            logfire.exception("Unexpected error applying automatic score (reply unaffected)", username=username)
 
     @logfire.instrument(extract_args=False, record_return=True)
     async def run_auto(self) -> str:

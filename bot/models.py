@@ -204,10 +204,11 @@ class Config(BaseModel):
     )
     social_credit_auto_score: bool = Field(
         default=True,
-        description="Automatically score a non-privileged author's message via an isolated, "
-        "injection-resistant classifier (only effective when Redis is configured). The category "
-        "the classifier returns is mapped to a small fixed delta in code, so users cannot dictate "
-        "their own score. Set false to disable automatic scoring entirely.",
+        description="Automatically score every author's message via an isolated, injection-resistant "
+        "classifier (only effective when Redis is configured). The category the classifier returns is "
+        "mapped to a small fixed delta in code, so users cannot dictate their own score. Applies to "
+        "privileged users too (the privileged flag only gates the manual adjust tool). "
+        "Set false to disable automatic scoring entirely.",
     )
     social_credit_score_cooldown: int = Field(
         default=10,

@@ -53,7 +53,7 @@ Optional fields:
 - `system_prompt_auto` + `auto_post_interval`: autonomous posting (interval in seconds)
 - `searxng_url`, `searxng_user`, `searxng_password`: web search via SearXNG
 - `redis_url`, `redis_password`, `redis_db`: Redis for social credit system
-- `social_credit_auto_score` (default `true`): score a non-privileged author's message via an isolated, tool-less classifier whose category is mapped to a fixed delta (−10…+10) in code — users can't dictate their own score
+- `social_credit_auto_score` (default `true`): score every author's message via an isolated, tool-less classifier whose category is mapped to a fixed delta (−10…+10) in code — users can't dictate their own score (privileged users are scored too; the flag only gates the manual adjust tool)
 - `social_credit_score_cooldown` (default `10`): min seconds between automatic score changes per user (bounds farming)
 - `score_models`: model chain for the classifier (same forms as `llm_models`); defaults to `llm_models`. Use a cheaper/smaller model — classification is a simple labeling task
 - `social_credit_unrestricted_user_ids`: list of user ids; when the note's author is one of these, the bot may manually adjust any user's score by any amount via `adjust_social_credit` (which is refused for everyone else)
@@ -82,7 +82,7 @@ Gating is progressive disclosure driven by the model itself: each unique `gate` 
 ### Agent setup (`bot/ai.py`)
 - `AgentDeps` is a **dataclass** (not BaseModel) with `username`, `social_credit_score`, `adjusted_credit_users`, `social_credit_unrestricted`
 - `adjust_social_credit` is privileged-only: it works only when `deps.social_credit_unrestricted` is set (`ChatAgent.run` sets it when the note's author id is in `social_credit_unrestricted_user_ids`); for everyone else it refuses
-- Ordinary users' scores move via `ChatAgent._maybe_score_message`: a separate tool-less classifier (`bot/scoring.py`, model from `score_models` or the reply model) runs concurrently with the reply, returns a `MessageQuality` category that's mapped to a fixed delta in code, applied through `apply_social_credit` and rate-limited by a Redis `score_cooldown:<user>` key. This is the prompt-injection mitigation — the model never picks the number
+- Every author's score moves via `ChatAgent._maybe_score_message` (privileged users included): a separate tool-less classifier (`bot/scoring.py`, model from `score_models` or the reply model) runs concurrently with the reply, returns a `MessageQuality` category that's mapped to a fixed delta in code, applied through `apply_social_credit` and rate-limited by a Redis `score_cooldown:<user>` key. This is the prompt-injection mitigation — the model never picks the number
 - Agent uses `output_type=str` (plain string output, not structured)
 - Tools are built via `build_tools()` in `bot/tools.py` and passed to `Agent(..., tools=tools)`
 - `FallbackModel` wraps multiple `llm_models` for automatic failover
@@ -113,7 +113,7 @@ When `system_prompt_auto` and `auto_post_interval` are configured, `ChatAgent.ru
 - `current_datetime_tool` — always available
 - `search_web` — when `searxng_url` configured
 - `search_users`, `search_notes` — Misskey search APIs
-- Social credit tools (when Redis configured): `get_social_credit`, `adjust_social_credit` (privileged authors only), `get_social_credit_history`, `get_social_credit_leaderboard`. Ordinary users are scored automatically by the `bot/scoring.py` classifier, not by a tool call
+- Social credit tools (when Redis configured): `get_social_credit`, `adjust_social_credit` (privileged authors only), `get_social_credit_history`, `get_social_credit_leaderboard`. All users (privileged included) are also scored automatically by the `bot/scoring.py` classifier, separate from any tool call
 - `enable_<gate>` — one per unique `gate` value in `mcp_servers`; model calls it to unlock gated MCP tools
 - MCP tools — from each configured `mcp_servers` entry, name-prefixed per `tool_prefix`
 
