@@ -13,10 +13,14 @@ docker buildx build --pull --push \
 """
 
 [tasks.deploy]
+wait_for = ["build"]
 run = """
 kubectl apply -k k8s --server-side && \
 kubectl -n misskey rollout restart deployment missbot
 """
+
+[tasks.update]
+depends = ["build", "deploy"]
 
 [env]
 _.python.venv = ".venv"
