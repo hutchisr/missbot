@@ -27,17 +27,28 @@ def test_image_urls_for_vision_off(make_note):
     assert _image_urls_for(note, vision=False) == []
 
 
-def test_image_urls_for_filters_non_images(make_note):
+def test_image_urls_for_includes_image_and_video_thumbnails(make_note):
     files = [
+        # Image: thumbnail used.
         MiFile(id="f1", type="image/png", thumbnailUrl="https://media.example/1.png"),
-        MiFile(id="f2", type="video/mp4", thumbnailUrl="https://media.example/2.mp4"),
-        MiFile(id="f3", type="image/jpeg", thumbnailUrl=None),
+        # Video: Misskey renders an image thumbnail — use it (NOT the raw video url).
+        MiFile(
+            id="f2",
+            type="video/mp4",
+            thumbnailUrl="https://media.example/2-thumb.jpg",
+            url="https://media.example/2.mp4",
+        ),
+        # Video with no thumbnail: skipped (we must not feed the video file as an image).
+        MiFile(id="f3", type="video/mp4", thumbnailUrl=None, url="https://media.example/3.mp4"),
+        # Non-visual media: skipped.
+        MiFile(id="f4", type="audio/mpeg", thumbnailUrl="https://media.example/4.png"),
+        # Image with no thumbnail or url: skipped.
+        MiFile(id="f5", type="image/jpeg", thumbnailUrl=None),
     ]
     note = make_note(files=files)
     urls = _image_urls_for(note, vision=True)
-    assert len(urls) == 1
-    assert isinstance(urls[0], ImageUrl)
-    assert urls[0].url == "https://media.example/1.png"
+    assert all(isinstance(u, ImageUrl) for u in urls)
+    assert [u.url for u in urls] == ["https://media.example/1.png", "https://media.example/2-thumb.jpg"]
 
 
 def test_image_urls_for_no_files(make_note):

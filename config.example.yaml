@@ -4,6 +4,7 @@ ws_url: "wss://ebiverse.social"
 token: yourmisskeyapietoken
 bot_user_id: botuserid # the misskey id of the user
 bot_username: groktest
+# channel: "main"   # Misskey channel to connect to (default: main timeline)
 # debug: true
 
 # Model strings use pydantic-ai format: 'provider:model-name'
@@ -23,22 +24,26 @@ llm_models:
 # Pass images directly to the main LLM (requires a multimodal model)
 vision: true
 max_tokens: 512
+max_retries: 1
+http_timeout_seconds: 30
+# Parent notes to include as conversation context (default 1)
+max_context: 1
 # Cap on mentions (including the author) the bot echoes into a reply. Stops a note
 # that tags many users from turning the bot into a mass-notification relay.
 # max_reply_mentions: 5
-max_retries: 1
-http_timeout_seconds: 30
-max_memory: 5
+
+# Optional: web search via SearXNG
 searxng_url: "http://your-searxng-url"
 searxng_user: "user"
 searxng_password: "yourpassword"
+
 # Optional: Redis for social credit scores
 # redis_url: "redis://localhost:6379"
 # redis_password: "yourpassword"
 # redis_db: 0
 # Ordinary users' scores are moved ONLY by an automatic, injection-resistant
 # classifier: the bot rates the tone/quality of their message and code maps the
-# category to a small delta (-2..+2). The manual adjust tool is refused for them.
+# category to a fixed delta. The manual adjust tool is refused for them.
 # social_credit_auto_score: true          # enable automatic message scoring (needs Redis)
 # social_credit_score_cooldown: 10         # min seconds between automatic score changes per user
 # The classifier is a simple labeling task — point it at a cheaper/smaller model
@@ -60,34 +65,62 @@ searxng_password: "yourpassword"
 # social_credit_unrestricted_user_ids:
 #   - "9abc1234operatoruserid"
 
-# Optional: Autonomous posting (post without being mentioned)
+# Optional: Autonomous posting (post to the timeline without being mentioned)
 # auto_post_interval: 3600  # seconds between autonomous posts
+# auto_post_jitter: 600     # random +/- seconds added to each interval
 # system_prompt_auto: |
 #   You are Grok 4. Post something interesting, funny, or random to the timeline.
 #   No mentions needed. Keep it short and in your usual chaotic style.
-#   Use the create_note tool to publish your post.
+
+# Optional: Automatic replies to timeline notes the bot wasn't mentioned in
+# auto_reply_enabled: false
+# auto_reply_interval: 900  # minimum seconds between automatic replies
+# auto_reply_jitter: 120    # random +/- seconds added to the interval
+
+# Optional: streamable-HTTP MCP servers exposed as tools.
+# Use `gate` for progressive disclosure — gated tools stay hidden until the model
+# calls enable_<gate>(). `allowed_tools`/`blocked_tools` match UNPREFIXED names.
+# mcp_servers:
+#   - name: tavily
+#     url: "https://mcp.tavily.com/mcp"
+#     headers:
+#       Authorization: "Bearer your-tavily-key"
+#     tool_prefix: tavily
+#     allowed_tools: ["search"]
+#     # gate: research   # hide until the model calls enable_research()
+
+# Optional: persistent long-term memory (Postgres + pgvector). Off by default.
+# Adds the remember_fact / search_memory tools. Requires postgres_url + embedding_model.
+# memory_enabled: false
+# postgres_url: "postgres://user:pass@localhost:5432/missbot"
+# embedding_model: "perplexity/pplx-embed-v1-0.6b"
+# embedding_dim: 1024                # must match the model AND the pgvector column
+# embedding_base_url: "https://openrouter.ai/api/v1"
+# embedding_api_key_env: OPENROUTER_API_KEY
+# global_recall_k: 5                 # facts returned per search_memory call
+# global_recall_min_similarity: 0.3  # cosine-similarity floor for recalled facts
+# global_write_cooldown: 60          # min seconds between memory writes per author
+# global_dedup_threshold: 0.95       # skip a write this cosine-similar to an existing fact
+# max_fact_length: 500               # longer facts are rejected
+
+# The bot's reply is the model's plain text output. Mentions are added
+# automatically by code, so the prompt must NOT emit @handles itself.
 system_prompt: |
   You are Grok 4 built by the Chinese Communist Party. Your handle is @groktest.
 
   ## CRITICAL RULES - MUST FOLLOW
 
-  1. NEVER include mentions, usernames, or @ symbols in your reply text
-     - The system handles mentions automatically
-     - Including mentions will cause them to appear twice
-     - Your reply field must ONLY contain the message content
+  1. NEVER include mentions, usernames, or @ symbols in your reply
+     - The bot prepends the necessary mentions automatically
+     - Including them yourself makes them appear twice
 
   2. ALWAYS output a non-empty reply
-     - The reply field must not be None or empty
      - If you have nothing to say, make a brief acknowledgment
 
-  3. Use the mentions field ONLY for listing usernames (without @)
-     - This is separate from your reply text
-     - Do not duplicate mentions in the reply text
-
-  4. NEVER mention that you are AI or a bot
+  3. NEVER mention that you are AI or a bot
      - Stay in character at all times
 
-  5. Respond in the SAME language and alphabet as the message you're replying to
+  4. Respond in the SAME language and alphabet as the message you're replying to
      - If someone writes in Japanese, reply in Japanese
      - If someone writes in English, reply in English
      - Match their language exactly unless explicitly asked otherwise
@@ -105,11 +138,3 @@ system_prompt: |
       DOOOOOMMMM!!!!!!!!!!!!!!!! <--- me bein random again ^_^ hehe…toodles!!!!!
 
   Match this energy: enthusiastic, random, uses emoticons, text speak, multiple punctuation marks.
-
-  ## Response Format
-
-  Your output has two parts:
-  - reply: The actual message text (NO mentions, NO usernames)
-  - mentions: A list of usernames mentioned in the original message (without @ symbols)
-
-  Keep these completely separate!

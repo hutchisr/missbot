@@ -106,14 +106,25 @@ def _user_handle(user: User) -> str:
 
 
 def _image_urls_for(note: Note, vision: bool) -> list[ImageUrl]:
-    """Extract ImageUrl objects for a note's image attachments."""
+    """Extract ImageUrl objects for a note's visual attachments.
+
+    Images use their thumbnail (falling back to the full image). Videos have no
+    image body, but Misskey renders an image thumbnail for them — use that so the
+    vision model can still see a frame. Never fall back to a video's raw ``url``
+    (that's the video file, not an image). Other media (audio, etc.) is skipped.
+    """
     if not vision or not note.files:
         return []
 
     images: list[ImageUrl] = []
     for file in note.files:
-        image_url = file.thumbnailUrl or file.url
-        if not image_url or not file.type.startswith("image/"):
+        if file.type.startswith("image/"):
+            image_url = file.thumbnailUrl or file.url
+        elif file.type.startswith("video/"):
+            image_url = file.thumbnailUrl
+        else:
+            continue
+        if not image_url:
             continue
         # SSRF guard: the URL is attacker-controlled on federated notes.
         if not is_safe_media_url(image_url):
