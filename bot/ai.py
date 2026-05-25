@@ -1,7 +1,8 @@
+import os
 from collections import deque
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import httpx
 
@@ -14,12 +15,15 @@ from pydantic_ai.messages import (
     TextPart,
     UserPromptPart,
 )
+from pydantic_ai.models import Model
 from pydantic_ai.models.fallback import FallbackModel
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.openai import OpenAIProvider
 import logfire
 from redis.asyncio import Redis
 
 from .mcp import build_mcp_toolsets, gate_names
-from .models import Config, Note, User
+from .models import Config, CustomOpenAIModel, Note, User
 from .tools import build_tools, normalize_username
 
 
@@ -63,6 +67,33 @@ if _original_cost is not None:
     ModelResponse.cost = _cost_prefer_provider  # type: ignore[method-assign]
 
 
+def _resolve_model_spec(spec: Union[str, CustomOpenAIModel]) -> Union[str, Model]:
+    """Convert a config llm_models entry into something Pydantic AI accepts.
+
+    Strings pass through (Pydantic AI parses them as 'provider:model'). Dict
+    entries with `base_url` build an OpenAIChatModel; without `base_url` the
+    `model` field is treated as a pydantic-ai provider string.
+    """
+    if isinstance(spec, str):
+        return spec
+    if spec.base_url is None:
+        return spec.model
+    api_key = spec.api_key
+    if api_key is None and spec.api_key_env:
+        api_key = os.environ.get(spec.api_key_env)
+    return OpenAIChatModel(
+        spec.model,
+        provider=OpenAIProvider(base_url=str(spec.base_url), api_key=api_key),
+    )
+
+
+def _spec_supports_vision(spec: Union[str, CustomOpenAIModel]) -> bool:
+    """Whether a model entry should receive image input. Strings default True."""
+    if isinstance(spec, str):
+        return True
+    return spec.vision
+
+
 def _user_handle(user: User) -> str:
     """Get full handle: username for local, username@host for remote."""
     if user.host:
@@ -102,6 +133,8 @@ class AgentDeps:
     """The user's current social credit score, or None if unavailable."""
     adjusted_credit_users: set[str] = field(default_factory=set)
     """Tracks users whose social credit was already adjusted in this run."""
+    social_credit_unrestricted: bool = False
+    """When True, social credit may be adjusted for any user, not just `username`."""
     enabled_gates: set[str] = field(default_factory=set)
     """Gates opened during this run by `enable_<gate>` meta-tools."""
 
@@ -130,11 +163,25 @@ class ChatAgent:
 
         fallback_on = (ModelAPIError, httpx.TimeoutException)
 
-        # Create fallback model from all configured models
-        if len(config.llm_models) == 1:
-            model = config.llm_models[0]
+        def _chain(specs: list[Union[str, CustomOpenAIModel]]) -> Optional[Union[str, Model]]:
+            resolved = [_resolve_model_spec(s) for s in specs]
+            if not resolved:
+                return None
+            if len(resolved) == 1:
+                return resolved[0]
+            return FallbackModel(*resolved, fallback_on=fallback_on)
+
+        model = _chain(config.llm_models)
+        assert model is not None, "llm_models must not be empty"
+
+        vision_specs = [s for s in config.llm_models if _spec_supports_vision(s)]
+        self._has_vision_model: bool = bool(vision_specs)
+        # Build a separate chain only when the filter actually narrows the list.
+        # If every model is vision-capable, the agent's default model is fine.
+        if not vision_specs or len(vision_specs) == len(config.llm_models):
+            self._vision_model: Optional[Union[str, Model]] = None
         else:
-            model = FallbackModel(*config.llm_models, fallback_on=fallback_on)
+            self._vision_model = _chain(vision_specs)
 
         tools = build_tools(config, redis_client=redis_client)
         gates = gate_names(config)
@@ -153,6 +200,13 @@ class ChatAgent:
                 parts.append(f"Current user's social credit score: {ctx.deps.social_credit_score}")
             else:
                 parts.append("Current user's social credit score: 0 (no score recorded yet)")
+            if ctx.deps.social_credit_unrestricted:
+                parts.append("You may adjust the social credit of any user.")
+            else:
+                parts.append(
+                    f"You may only adjust the social credit of @{ctx.deps.username} "
+                    "(the author of the note you're replying to). Adjustments targeting anyone else are refused."
+                )
             return "\n".join(parts)
 
         self._agent: Agent[AgentDeps, str] = Agent(
@@ -193,7 +247,20 @@ class ChatAgent:
         if not note.text and not current_images:
             raise ValueError("Note has no text or supported images")
 
-        # Build message history from context notes (oldest first)
+        # Pick the model chain. If the prompt has images but no model in the
+        # main chain is vision-capable, drop the images and run text-only —
+        # otherwise the whole fallback fails with "no endpoints support image
+        # input" and the user gets nothing.
+        run_model: Optional[Union[str, Model]] = None
+        if current_images:
+            if not self._has_vision_model:
+                logfire.warning("No vision-capable models configured; dropping images")
+                current_images = []
+            elif self._vision_model is not None:
+                run_model = self._vision_model
+
+        # Mirror the same drop on context-note images so the history matches.
+        effective_vision = vision and self._has_vision_model
         message_history: list[ModelMessage] = []
         if context:
             for c in reversed(context):
@@ -202,7 +269,9 @@ class ChatAgent:
                     message_history.append(ModelResponse(parts=[TextPart(content=c.text or "")]))
                 else:
                     # Other users' messages become user prompts (with any attached images)
-                    message_history.append(ModelRequest(parts=[UserPromptPart(content=_build_user_content(c, vision))]))
+                    message_history.append(
+                        ModelRequest(parts=[UserPromptPart(content=_build_user_content(c, effective_vision))])
+                    )
 
         # Build current user prompt
         current_parts: list[str | ImageUrl] = []
@@ -221,11 +290,19 @@ class ChatAgent:
         # Pre-fetch social credit score for the current user
         handle = _user_handle(note.user)
         score = await self._get_social_credit_score(handle)
-        deps = AgentDeps(username=handle, social_credit_score=score)
+        # Lift the author-only restriction when the note's author is a designated
+        # privileged user (e.g. the operator), configured by user id.
+        unrestricted = note.user.id in self._config.social_credit_unrestricted_user_ids
+        deps = AgentDeps(username=handle, social_credit_score=score, social_credit_unrestricted=unrestricted)
 
-        result = await self._agent.run(
-            prompt, deps=deps, message_history=message_history, model_settings={"timeout": 300.0}
-        )
+        run_kwargs: dict[str, Any] = {
+            "deps": deps,
+            "message_history": message_history,
+            "model_settings": {"timeout": 300.0},
+        }
+        if run_model is not None:
+            run_kwargs["model"] = run_model
+        result = await self._agent.run(prompt, **run_kwargs)
         return result.output
 
     @logfire.instrument(extract_args=False, record_return=True)

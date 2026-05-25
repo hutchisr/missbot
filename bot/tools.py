@@ -168,6 +168,9 @@ def build_tools(config: Config, redis_client: Optional[Redis] = None) -> list[Ca
         async def adjust_social_credit(ctx: RunContext[object], username: str, amount: int, reason: str) -> str:
             """Adjust a user's social credit score.
 
+            Only the author of the note being replied to may be adjusted, unless that
+            author is a privileged user (then any user is allowed).
+
             Args:
                 ctx: The run context (injected automatically).
                 username: The username to adjust (e.g. 'alice' for local, 'bob@remote.host' for remote).
@@ -175,6 +178,17 @@ def build_tools(config: Config, redis_client: Optional[Redis] = None) -> list[Ca
                 reason: A brief explanation for the adjustment (required).
             """
             username = normalize_username(username)
+
+            # Restrict adjustments to the author of the note being replied to,
+            # unless this run was flagged unrestricted (the author is a privileged
+            # user, see Config.social_credit_unrestricted_user_ids).
+            if not getattr(ctx.deps, "social_credit_unrestricted", False):
+                allowed = getattr(ctx.deps, "username", None)
+                if allowed is not None and username != normalize_username(allowed):
+                    return (
+                        f"Can only adjust @{normalize_username(allowed)}'s social credit "
+                        f"(the author of the note being replied to). Refusing to adjust @{username}."
+                    )
 
             # Prevent multiple adjustments per user per run
             adjusted = getattr(ctx.deps, "adjusted_credit_users", None)

@@ -7,10 +7,19 @@ bot_username: groktest
 # debug: true
 
 # Model strings use pydantic-ai format: 'provider:model-name'
-# Set OPENROUTER_API_KEY env var for authentication
+# Set OPENROUTER_API_KEY env var for authentication.
+# For OpenAI-compatible custom endpoints (e.g. self-hosted vLLM, Modal), use a
+# dict with `model` + `base_url` (and optional `api_key` or `api_key_env`).
+# To mark a model as text-only so image-bearing prompts skip it in the fallback
+# chain, use the dict form with `vision: false`.
 llm_models:
   - "openrouter:deepseek/deepseek-chat-v3.1"
   - "openrouter:qwen/qwen3-235b-a22b-2507"
+  # - model: Qwen/Qwen3
+  #   base_url: https://your-app.modal.run/v1
+  #   api_key_env: MODAL_API_KEY  # optional
+  # - model: "openrouter:deepseek/deepseek-chat-v3.1"
+  #   vision: false  # opt this string-form model out of vision routing
 # Pass images directly to the main LLM (requires a multimodal model)
 vision: true
 max_tokens: 512
@@ -24,6 +33,11 @@ searxng_password: "yourpassword"
 # redis_url: "redis://localhost:6379"
 # redis_password: "yourpassword"
 # redis_db: 0
+# By default the bot can only adjust the social credit of the author of the note
+# it's replying to. List privileged user ids here to lift that limit: when the
+# author of the note is one of these users, the bot may adjust any user's score.
+# social_credit_unrestricted_user_ids:
+#   - "9abc1234operatoruserid"
 
 # Optional: Autonomous posting (post without being mentioned)
 # auto_post_interval: 3600  # seconds between autonomous posts

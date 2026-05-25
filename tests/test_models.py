@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from bot.models import Config, MiFile, Note, User
+from bot.models import Config, CustomOpenAIModel, MiFile, Note, User
 
 
 def test_config_valid(make_config):
@@ -72,3 +72,39 @@ def test_mifile_optional_fields():
     f = MiFile(id="f", type="image/png")
     assert f.url is None
     assert f.thumbnailUrl is None
+
+
+def test_config_llm_models_mixes_strings_and_custom_endpoints(make_config):
+    cfg = make_config(
+        llm_models=[
+            "openrouter:test/model",
+            {
+                "model": "Qwen/Qwen3",
+                "base_url": "https://example.modal.run/v1",
+                "api_key_env": "MODAL_API_KEY",
+            },
+        ]
+    )
+    assert cfg.llm_models[0] == "openrouter:test/model"
+    custom = cfg.llm_models[1]
+    assert isinstance(custom, CustomOpenAIModel)
+    assert custom.model == "Qwen/Qwen3"
+    assert str(custom.base_url) == "https://example.modal.run/v1"
+    assert custom.api_key_env == "MODAL_API_KEY"
+    assert custom.api_key is None
+
+
+def test_config_custom_endpoint_without_base_url_passes_through_string(make_config):
+    cfg = make_config(llm_models=[{"model": "openrouter:foo/bar", "vision": False}])
+    entry = cfg.llm_models[0]
+    assert isinstance(entry, CustomOpenAIModel)
+    assert entry.base_url is None
+    assert entry.vision is False
+
+
+def test_custom_openai_model_vision_defaults_true():
+    spec = CustomOpenAIModel(
+        model="Qwen/Qwen3",
+        base_url="https://example.modal.run/v1",  # type: ignore[arg-type]
+    )
+    assert spec.vision is True

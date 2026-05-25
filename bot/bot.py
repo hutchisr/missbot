@@ -27,6 +27,16 @@ from .api import api_client
 
 _REDIS_AUTO_REPLY_KEY = "global:last_auto_reply_time"
 
+# Misskey enforces a 3000-character cap on note text.
+MAX_NOTE_LENGTH = 3000
+_TRUNCATION_SUFFIX = "…"
+
+
+def _truncate_to_limit(text: str, limit: int = MAX_NOTE_LENGTH) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - len(_TRUNCATION_SUFFIX)] + _TRUNCATION_SUFFIX
+
 
 class Bot:
     def __init__(
@@ -91,7 +101,14 @@ class Bot:
         mentions = await self._build_mentions_from_note(in_reply_to)
         text = self._strip_leading_mentions(output)
         if mentions:
-            text = f"{' '.join(mentions)}\n{text}"
+            text = f"{' '.join(mentions)} {text}"
+        if len(text) > MAX_NOTE_LENGTH:
+            logfire.warning(
+                "Reply exceeds Misskey note length cap; truncating",
+                original_length=len(text),
+                limit=MAX_NOTE_LENGTH,
+            )
+            text = _truncate_to_limit(text)
 
         payload: dict[str, object] = {
             "text": text,
@@ -247,6 +264,13 @@ class Bot:
     async def post_autonomous(self):
         """Generate and post an autonomous note to the timeline."""
         result = await self._agent.run_auto()
+        if len(result) > MAX_NOTE_LENGTH:
+            logfire.warning(
+                "Autonomous post exceeds Misskey note length cap; truncating",
+                original_length=len(result),
+                limit=MAX_NOTE_LENGTH,
+            )
+            result = _truncate_to_limit(result)
         response = await api_client.post(
             f"{self.url}api/notes/create",
             json={"text": result, "visibility": "public"},

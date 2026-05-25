@@ -42,7 +42,7 @@ mise run deploy     # Apply K8s manifests and restart
 Required fields:
 - `domain`, `url` (HTTPS), `ws_url` (WebSocket), `token`
 - `bot_user_id`, `bot_username`
-- `llm_models`: list of model strings (e.g. `"openrouter:anthropic/claude-3.5-sonnet"`)
+- `llm_models`: list of model entries — either pydantic-ai strings (e.g. `"openrouter:anthropic/claude-3.5-sonnet"`) or dicts for custom OpenAI-compatible endpoints (`model`, `base_url`, optional `api_key` / `api_key_env`)
 - `system_prompt`, `max_tokens`, `max_retries`
 
 Optional fields:
@@ -51,6 +51,7 @@ Optional fields:
 - `system_prompt_auto` + `auto_post_interval`: autonomous posting (interval in seconds)
 - `searxng_url`, `searxng_user`, `searxng_password`: web search via SearXNG
 - `redis_url`, `redis_password`, `redis_db`: Redis for social credit system
+- `social_credit_unrestricted_user_ids`: list of user ids; when the note's author is one of these, the bot may adjust any user's score instead of only the author it's replying to
 - `max_context`: parent notes to include (default 1)
 - `http_timeout_seconds`: HTTP timeout (default 30.0)
 - `mcp_servers`: list of streamable-HTTP MCP servers (see below)
@@ -73,7 +74,8 @@ Gating is progressive disclosure driven by the model itself: each unique `gate` 
 ## Key Patterns
 
 ### Agent setup (`bot/ai.py`)
-- `AgentDeps` is a **dataclass** (not BaseModel) with `username`, `social_credit_score`, `adjusted_credit_users`
+- `AgentDeps` is a **dataclass** (not BaseModel) with `username`, `social_credit_score`, `adjusted_credit_users`, `social_credit_unrestricted`
+- `adjust_social_credit` may only target `deps.username` (the author of the note being replied to) unless `deps.social_credit_unrestricted` is set — `ChatAgent.run` sets it when the note's author id is in `social_credit_unrestricted_user_ids`
 - Agent uses `output_type=str` (plain string output, not structured)
 - Tools are built via `build_tools()` in `bot/tools.py` and passed to `Agent(..., tools=tools)`
 - `FallbackModel` wraps multiple `llm_models` for automatic failover

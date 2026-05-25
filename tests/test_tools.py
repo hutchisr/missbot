@@ -217,6 +217,8 @@ async def test_adjust_social_credit_happy_path(config, fake_redis):
 
     ctx = MagicMock()
     ctx.deps.adjusted_credit_users = set()
+    ctx.deps.username = "alice"
+    ctx.deps.social_credit_unrestricted = False
 
     result = await adjust(ctx, "@Alice", 5, "solid post")
     assert "+5" in result
@@ -237,6 +239,8 @@ async def test_adjust_social_credit_requires_reason(config, fake_redis):
     adjust = _find(build_tools(config, redis_client=fake_redis), "adjust_social_credit")
     ctx = MagicMock()
     ctx.deps.adjusted_credit_users = set()
+    ctx.deps.username = "alice"
+    ctx.deps.social_credit_unrestricted = False
     result = await adjust(ctx, "alice", 1, "   ")
     assert "reason is required" in result
 
@@ -246,12 +250,44 @@ async def test_adjust_social_credit_blocks_double_adjustment(config, fake_redis)
     adjust = _find(build_tools(config, redis_client=fake_redis), "adjust_social_credit")
     ctx = MagicMock()
     ctx.deps.adjusted_credit_users = set()
+    ctx.deps.username = "alice"
+    ctx.deps.social_credit_unrestricted = False
 
     first = await adjust(ctx, "alice", 1, "good")
     assert "New score: 1" in first
 
     second = await adjust(ctx, "alice", 1, "good")
     assert "Already adjusted" in second
+
+
+@pytest.mark.anyio
+async def test_adjust_social_credit_blocks_non_author(config, fake_redis):
+    """By default, only the author of the note being replied to can be adjusted."""
+    adjust = _find(build_tools(config, redis_client=fake_redis), "adjust_social_credit")
+    ctx = MagicMock()
+    ctx.deps.adjusted_credit_users = set()
+    ctx.deps.username = "alice"
+    ctx.deps.social_credit_unrestricted = False
+
+    result = await adjust(ctx, "bob", 5, "off-topic praise")
+    assert "Refusing to adjust @bob" in result
+    # The blocked target must not have been recorded or scored.
+    assert ctx.deps.adjusted_credit_users == set()
+    assert await fake_redis.get("score:bob") is None
+
+
+@pytest.mark.anyio
+async def test_adjust_social_credit_unrestricted_allows_non_author(config, fake_redis):
+    """When the run is flagged unrestricted, any user can be adjusted."""
+    adjust = _find(build_tools(config, redis_client=fake_redis), "adjust_social_credit")
+    ctx = MagicMock()
+    ctx.deps.adjusted_credit_users = set()
+    ctx.deps.username = "alice"
+    ctx.deps.social_credit_unrestricted = True
+
+    result = await adjust(ctx, "bob", 5, "tribunal verdict")
+    assert "New score: 5" in result
+    assert await fake_redis.get("score:bob") == "5"
 
 
 @pytest.mark.anyio

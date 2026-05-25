@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from bot.bot import Bot
+from bot.bot import MAX_NOTE_LENGTH, Bot, _truncate_to_limit
 from bot.models import MiFile
 
 
@@ -164,7 +164,7 @@ async def test_send_note_preserves_reply_visibility(bot, make_note):
     assert post_mock.await_args is not None
     payload = post_mock.await_args.kwargs["json"]
     assert payload["visibility"] == "followers"
-    assert payload["text"] == "@alice\nhello there"
+    assert payload["text"] == "@alice hello there"
     assert "visibleUserIds" not in payload
 
 
@@ -247,6 +247,74 @@ async def test_on_auto_reply_updates_timestamp_and_triggers_reply(make_config, f
     assert bot._next_auto_reply_delay == 12
     save_mock.assert_awaited_once_with()
     mention_mock.assert_awaited_once_with(note)
+
+
+def test_truncate_to_limit_no_op_under_limit():
+    assert _truncate_to_limit("hello") == "hello"
+
+
+def test_truncate_to_limit_truncates_with_suffix():
+    text = "x" * (MAX_NOTE_LENGTH + 50)
+    truncated = _truncate_to_limit(text)
+    assert len(truncated) == MAX_NOTE_LENGTH
+    assert truncated.endswith("…")
+
+
+@pytest.mark.anyio
+async def test_send_note_truncates_oversized_output(bot, make_note):
+    note = make_note()
+    response = MagicMock()
+    response.json.return_value = {"createdNote": {"id": "created-note"}}
+    long_output = "a" * (MAX_NOTE_LENGTH + 500)
+
+    with (
+        patch.object(bot, "_build_mentions_from_note", AsyncMock(return_value=[])),
+        patch("bot.bot.api_client.post", AsyncMock(return_value=response)) as post_mock,
+    ):
+        await bot.send_note(long_output, in_reply_to=note)
+
+    payload = post_mock.await_args.kwargs["json"]
+    assert len(payload["text"]) == MAX_NOTE_LENGTH
+    assert payload["text"].endswith("…")
+
+
+@pytest.mark.anyio
+async def test_send_note_truncates_after_mentions_prepended(bot, make_note):
+    """Mentions count toward the 3000-char cap, so truncation must happen after they're prepended."""
+    note = make_note()
+    response = MagicMock()
+    response.json.return_value = {"createdNote": {"id": "created-note"}}
+    # Body alone fits, but body + mention header will overflow.
+    body = "a" * (MAX_NOTE_LENGTH - 5)
+    long_mention = "@" + ("b" * 100)
+
+    with (
+        patch.object(bot, "_build_mentions_from_note", AsyncMock(return_value=[long_mention])),
+        patch("bot.bot.api_client.post", AsyncMock(return_value=response)) as post_mock,
+    ):
+        await bot.send_note(body, in_reply_to=note)
+
+    payload = post_mock.await_args.kwargs["json"]
+    assert len(payload["text"]) == MAX_NOTE_LENGTH
+    assert payload["text"].startswith(long_mention)
+    assert payload["text"].endswith("…")
+
+
+@pytest.mark.anyio
+async def test_post_autonomous_truncates_oversized_output(bot):
+    response = MagicMock()
+    response.json.return_value = {"createdNote": {"id": "auto-1"}}
+    long_output = "z" * (MAX_NOTE_LENGTH + 200)
+
+    with (
+        patch.object(bot._agent, "run_auto", AsyncMock(return_value=long_output)),
+        patch("bot.bot.api_client.post", AsyncMock(return_value=response)) as post_mock,
+    ):
+        await bot.post_autonomous()
+
+    payload = post_mock.await_args.kwargs["json"]
+    assert len(payload["text"]) == MAX_NOTE_LENGTH
+    assert payload["text"].endswith("…")
 
 
 @pytest.mark.anyio
