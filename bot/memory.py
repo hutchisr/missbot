@@ -99,7 +99,9 @@ class MemoryStore:
         finally:
             await conn.close()
 
-        pool = await asyncpg.create_pool(config.postgres_url)
+        # A single-replica chatbot needs only a couple of connections; keep the pool
+        # small so idle connections don't count against the server's max_connections.
+        pool = await asyncpg.create_pool(config.postgres_url, min_size=1, max_size=5)
         assert pool is not None
         http = httpx.AsyncClient(timeout=httpx.Timeout(config.http_timeout_seconds))
         logfire.info("Memory store ready", embedding_model=config.embedding_model, embedding_dim=dim)
