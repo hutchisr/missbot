@@ -72,7 +72,7 @@ async def test_main_async_configures_services_and_runs_bot(config):
     loaded_config = api_configure_mock.call_args.args[0]
     assert loaded_config.token == config.token
     redis_from_url_mock.assert_not_called()
-    bot_cls.assert_called_once_with(config=loaded_config, redis_client=None)
+    bot_cls.assert_called_once_with(config=loaded_config, redis_client=None, memory=None)
     bot_instance.run.assert_awaited_once_with()
     assert set(signal_handlers) == {signal.SIGTERM, signal.SIGINT}
 

@@ -108,3 +108,33 @@ def test_custom_openai_model_vision_defaults_true():
         base_url="https://example.modal.run/v1",  # type: ignore[arg-type]
     )
     assert spec.vision is True
+
+
+def test_memory_disabled_by_default(make_config):
+    cfg = make_config()
+    assert cfg.memory_enabled is False
+    assert cfg.embedding_dim == 1024
+    assert cfg.embedding_api_key_env == "OPENROUTER_API_KEY"
+    assert "openrouter.ai" in str(cfg.embedding_base_url)
+
+
+def test_memory_enabled_requires_postgres_url(make_config):
+    with pytest.raises(ValidationError) as exc:
+        make_config(memory_enabled=True, embedding_model="perplexity/pplx-embed-v1-0.6b")
+    assert "postgres_url" in str(exc.value)
+
+
+def test_memory_enabled_requires_embedding_model(make_config):
+    with pytest.raises(ValidationError) as exc:
+        make_config(memory_enabled=True, postgres_url="postgres://u:p@db/x")
+    assert "embedding_model" in str(exc.value)
+
+
+def test_memory_enabled_with_required_fields_ok(make_config):
+    cfg = make_config(
+        memory_enabled=True,
+        postgres_url="postgres://u:p@db/x",
+        embedding_model="perplexity/pplx-embed-v1-0.6b",
+    )
+    assert cfg.memory_enabled is True
+    assert cfg.embedding_model == "perplexity/pplx-embed-v1-0.6b"

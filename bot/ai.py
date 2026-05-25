@@ -24,6 +24,7 @@ import logfire
 from redis.asyncio import Redis
 
 from .mcp import build_mcp_toolsets, gate_names
+from .memory import MemoryStore
 from .models import Config, CustomOpenAIModel, Note, User
 from .net import is_safe_media_url
 from .scoring import MessageQuality, SCORING_INSTRUCTIONS, build_scoring_prompt, delta_for
@@ -137,6 +138,8 @@ class AgentDeps:
 
     username: str
     """The handle of the user who sent the message."""
+    source_note_id: Optional[str] = None
+    """Id of the note being replied to, recorded as provenance on memory writes."""
     social_credit_score: Optional[int] = None
     """The user's current social credit score, or None if unavailable."""
     adjusted_credit_users: set[str] = field(default_factory=set)
@@ -165,9 +168,15 @@ def _make_enable_gate_tool(gate: str, servers: list[str]):
 
 
 class ChatAgent:
-    def __init__(self, config: Config, redis_client: Optional[Redis] = None):
+    def __init__(
+        self,
+        config: Config,
+        redis_client: Optional[Redis] = None,
+        memory: Optional[MemoryStore] = None,
+    ):
         self._config = config
         self._redis = redis_client
+        self._memory = memory
 
         fallback_on = (ModelAPIError, httpx.TimeoutException)
 
@@ -191,7 +200,7 @@ class ChatAgent:
         else:
             self._vision_model = _chain(vision_specs)
 
-        tools = build_tools(config, redis_client=redis_client)
+        tools = build_tools(config, redis_client=redis_client, memory=memory)
         gates = gate_names(config)
         for gate, servers in sorted(gates.items()):
             tools.append(_make_enable_gate_tool(gate, servers))
@@ -321,7 +330,12 @@ class ChatAgent:
         # Lift the author-only restriction when the note's author is a designated
         # privileged user (e.g. the operator), configured by user id.
         unrestricted = note.user.id in self._config.social_credit_unrestricted_user_ids
-        deps = AgentDeps(username=handle, social_credit_score=score, social_credit_unrestricted=unrestricted)
+        deps = AgentDeps(
+            username=handle,
+            source_note_id=note.id,
+            social_credit_score=score,
+            social_credit_unrestricted=unrestricted,
+        )
 
         run_kwargs: dict[str, Any] = {
             "deps": deps,

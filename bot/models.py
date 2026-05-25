@@ -233,10 +233,80 @@ class Config(BaseModel):
         default_factory=list,
         description="Streamable-HTTP MCP servers to expose as tools.",
     )
+    memory_enabled: bool = Field(
+        default=False,
+        description="Enable persistent long-term memory (Postgres + pgvector). Off by default; "
+        "requires postgres_url and embedding_model. Adds the remember_fact / search_memory tools.",
+    )
+    postgres_url: Optional[str] = Field(
+        default=None,
+        description="Postgres DSN for long-term memory (e.g. postgres://user:pass@host:5432/db). "
+        "The pgvector extension must be available on the server.",
+    )
+    embedding_model: Optional[str] = Field(
+        default=None,
+        description="Embedding model id sent to the embeddings endpoint (e.g. "
+        "'perplexity/pplx-embed-v1-0.6b'). Required when memory_enabled.",
+    )
+    embedding_dim: int = Field(
+        default=1024,
+        gt=0,
+        description="Embedding vector dimension; must match the embedding_model's output and the "
+        "pgvector column. pplx-embed-v1-0.6b is 1024. Changing this requires re-embedding all rows.",
+    )
+    embedding_base_url: AnyHttpUrl = Field(
+        default=AnyHttpUrl("https://openrouter.ai/api/v1"),
+        description="OpenAI-compatible base URL for the embeddings endpoint (POSTed to <base_url>/embeddings).",
+    )
+    embedding_api_key: Optional[str] = Field(
+        default=None,
+        description="API key for the embeddings endpoint. Use embedding_api_key_env to load from env instead.",
+    )
+    embedding_api_key_env: str = Field(
+        default="OPENROUTER_API_KEY",
+        description="Environment variable holding the embeddings API key (used when embedding_api_key is unset).",
+    )
+    global_recall_k: int = Field(
+        default=5,
+        gt=0,
+        description="Max number of global memory facts returned per search_memory call.",
+    )
+    global_recall_min_similarity: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=1.0,
+        description="Cosine-similarity floor for search_memory results; weaker matches are dropped.",
+    )
+    global_write_cooldown: int = Field(
+        default=60,
+        ge=0,
+        description="Minimum seconds between global memory writes per author. Bounds memory poisoning rate.",
+    )
+    global_dedup_threshold: float = Field(
+        default=0.95,
+        ge=0.0,
+        le=1.0,
+        description="If a new global fact is at least this cosine-similar to an existing one, the write is "
+        "skipped as a near-duplicate (anti-spam).",
+    )
+    max_fact_length: int = Field(
+        default=500,
+        gt=0,
+        description="Maximum character length of a single stored memory fact; longer writes are rejected.",
+    )
     debug: Optional[bool] = None
 
     @model_validator(mode="after")
     def check_auto_post_config(self) -> "Config":
         if self.auto_post_interval and not self.system_prompt_auto:
             raise ValueError("system_prompt_auto is required when auto_post_interval is set")
+        return self
+
+    @model_validator(mode="after")
+    def check_memory_config(self) -> "Config":
+        if self.memory_enabled:
+            if not self.postgres_url:
+                raise ValueError("postgres_url is required when memory_enabled is true")
+            if not self.embedding_model:
+                raise ValueError("embedding_model is required when memory_enabled is true")
         return self

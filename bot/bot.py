@@ -13,6 +13,7 @@ import httpx
 import logfire
 
 from .ai import ChatAgent, _image_urls_for
+from .memory import MemoryStore
 from .models import (
     Config,
     MiChannelConnect,
@@ -43,6 +44,7 @@ class Bot:
         self,
         config: Config,
         redis_client: Optional[Redis] = None,
+        memory: Optional[MemoryStore] = None,
     ):
         self.url = config.url
         self.ws_url = config.ws_url
@@ -53,7 +55,8 @@ class Bot:
 
         self._config = config
         self._redis = redis_client
-        self._agent = ChatAgent(config, redis_client=redis_client)
+        self._memory = memory
+        self._agent = ChatAgent(config, redis_client=redis_client, memory=memory)
         self._shutdown_event = asyncio.Event()
         self._last_auto_reply_time: float = time.time()
         self._next_auto_reply_delay: float = self._compute_auto_reply_delay()

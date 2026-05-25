@@ -1,6 +1,6 @@
 # Missbot
 
-Misskey/Fediverse chatbot using Pydantic AI with LLM fallback, WebSocket streaming, and optional Redis-backed social credit system.
+Misskey/Fediverse chatbot using Pydantic AI with LLM fallback, WebSocket streaming, an optional Redis-backed social credit system, and optional Postgres/pgvector long-term memory.
 
 ## Commands
 
@@ -34,6 +34,7 @@ mise run deploy     # Apply K8s manifests and restart
 | `bot/models.py` | Pydantic models: `Config`, `Note`, `User`, `MiFile`, WS message types |
 | `bot/tools.py` | `build_tools()` factory — datetime, web search, search_users/notes, social credit tools; `apply_social_credit()` helper |
 | `bot/scoring.py` | Injection-resistant message classifier: `MessageQuality`, code-side `QUALITY_DELTAS`, hardened prompt builder |
+| `bot/memory.py` | `MemoryStore` — Postgres/pgvector global long-term memory: embeds facts, cosine search, dedup, provenance. Only built when `memory_enabled` |
 | `bot/net.py` | `is_safe_media_url()` — SSRF guard for attacker-supplied image URLs (blocks private/reserved IPs and internal hosts) |
 | `bot/mcp.py` | `build_mcp_toolsets()` + `gate_names()` — streamable-HTTP MCP servers with allow/block and gate filtering |
 | `bot/api.py` | HTTP client utilities |
@@ -61,7 +62,21 @@ Optional fields:
 - `max_reply_mentions`: cap on total mentions (incl. the author) echoed into a reply (default 5); prevents mention-amplification/harassment relaying
 - `http_timeout_seconds`: HTTP timeout (default 30.0)
 - `mcp_servers`: list of streamable-HTTP MCP servers (see below)
+- `memory_enabled` (default `false`): turn on Postgres/pgvector long-term memory (see below). Requires `postgres_url` and `embedding_model`
 - `channel`, `debug`
+
+### Long-term memory
+Global (non-user-specific) long-term memory backed by Postgres + the `pgvector` extension. **Stage 1 of the memory feature — only the global store exists; per-user memory is planned.** Off unless `memory_enabled: true`. Config fields:
+- `postgres_url` (required when enabled): Postgres DSN; the server must have the `vector` extension available. `MemoryStore.create()` runs `CREATE EXTENSION/TABLE IF NOT EXISTS` on startup
+- `embedding_model` (required when enabled): embedding model id, e.g. `perplexity/pplx-embed-v1-0.6b`
+- `embedding_dim` (default `1024`): vector dimension; **must** match the model and the `global_memory.embedding vector(N)` column. Startup fails fast if an existing column's dimension disagrees (changing models means re-embedding every row). pplx-embed-v1-0.6b is 1024
+- `embedding_base_url` (default `https://openrouter.ai/api/v1`) + `embedding_api_key` / `embedding_api_key_env` (default env `OPENROUTER_API_KEY`): the OpenAI-compatible embeddings endpoint (POSTed to `<base_url>/embeddings`)
+- `global_recall_k` (default `5`), `global_recall_min_similarity` (default `0.3`): how many facts `search_memory` returns and the cosine-similarity floor
+- `global_write_cooldown` (default `60`): min seconds between global writes per author (bounds poisoning rate)
+- `global_dedup_threshold` (default `0.95`): a new fact this cosine-similar to an existing one is skipped as a near-duplicate
+- `max_fact_length` (default `500`): longer facts are rejected
+
+**Security:** global memory is writable from attacker-controlled message text (open-with-provenance model). Mitigations are mandatory and live in code: every fact stores `author` + `source_note_id` provenance; writes are rate-limited per author and de-duplicated; recalled facts are returned to the model fenced as untrusted data (`_fence_untrusted` in `bot/tools.py`). The embedding model emits **unnormalized** vectors, so all comparisons use cosine distance (`<=>`).
 
 ### MCP servers
 Each entry in `mcp_servers` takes:
@@ -80,7 +95,7 @@ Gating is progressive disclosure driven by the model itself: each unique `gate` 
 ## Key Patterns
 
 ### Agent setup (`bot/ai.py`)
-- `AgentDeps` is a **dataclass** (not BaseModel) with `username`, `social_credit_score`, `adjusted_credit_users`, `social_credit_unrestricted`
+- `AgentDeps` is a **dataclass** (not BaseModel) with `username`, `source_note_id`, `social_credit_score`, `adjusted_credit_users`, `social_credit_unrestricted`, `enabled_gates`. `source_note_id` is recorded as provenance on `remember_fact` writes
 - `adjust_social_credit` is privileged-only: it works only when `deps.social_credit_unrestricted` is set (`ChatAgent.run` sets it when the note's author id is in `social_credit_unrestricted_user_ids`); for everyone else it refuses
 - Every author's score moves via `ChatAgent._maybe_score_message` (privileged users included): a separate tool-less classifier (`bot/scoring.py`, model from `score_models` or the reply model) runs concurrently with the reply, returns a `MessageQuality` category that's mapped to a fixed delta in code, applied through `apply_social_credit` and rate-limited by a Redis `score_cooldown:<user>` key. This is the prompt-injection mitigation — the model never picks the number
 - Agent uses `output_type=str` (plain string output, not structured)
@@ -114,6 +129,7 @@ When `system_prompt_auto` and `auto_post_interval` are configured, `ChatAgent.ru
 - `search_web` — when `searxng_url` configured
 - `search_users`, `search_notes` — Misskey search APIs
 - Social credit tools (when Redis configured): `get_social_credit`, `adjust_social_credit` (privileged authors only), `get_social_credit_history`, `get_social_credit_leaderboard`. All users (privileged included) are also scored automatically by the `bot/scoring.py` classifier, separate from any tool call
+- Long-term memory tools (when `memory_enabled`): `remember_fact` (save a general fact to shared memory; rate-limited + deduped + provenance-stamped) and `search_memory` (semantic recall, results fenced as untrusted data). Not given to the auto-agent
 - `enable_<gate>` — one per unique `gate` value in `mcp_servers`; model calls it to unlock gated MCP tools
 - MCP tools — from each configured `mcp_servers` entry, name-prefixed per `tool_prefix`
 

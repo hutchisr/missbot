@@ -10,6 +10,7 @@ from logfire.integrations.logging import LogfireLoggingHandler
 from redis.asyncio import Redis
 
 from .bot import Bot
+from .memory import MemoryStore
 from .models import Config
 from .api import api_client
 
@@ -67,9 +68,15 @@ async def main_async(config):
         )
         logfire.info("Redis client initialized")
 
+    # Initialize the long-term memory store (Postgres + pgvector) if enabled
+    memory: Optional[MemoryStore] = None
+    if config.memory_enabled:
+        memory = await MemoryStore.create(config)
+
     bot = Bot(
         config=config,
         redis_client=redis_client,
+        memory=memory,
     )
 
     def shutdown_handler():
@@ -78,6 +85,8 @@ async def main_async(config):
         loop.create_task(api_client.close())
         if redis_client:
             loop.create_task(redis_client.aclose())
+        if memory:
+            loop.create_task(memory.close())
 
     loop.add_signal_handler(signal.SIGTERM, shutdown_handler)
     loop.add_signal_handler(signal.SIGINT, shutdown_handler)
