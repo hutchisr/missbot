@@ -248,9 +248,12 @@ class ChatAgent:
         self._score_model: Optional[Union[str, Model]] = None
         if redis_client is not None and config.social_credit_auto_score:
             self._score_model = _chain(config.score_models) if config.score_models else model
-            self._score_agent = Agent(
+            # pydantic-ai accepts a Literal output_type at runtime and constrains the
+            # output to those values, but pyright can't match a Literal special form to
+            # the Agent() overloads (it widens OutputDataT to str). Runtime is correct.
+            self._score_agent = Agent(  # type: ignore[reportCallIssue, reportAttributeAccessIssue]
                 self._score_model,
-                output_type=MessageQuality,
+                output_type=MessageQuality,  # type: ignore[reportArgumentType]
                 instructions=[SCORING_INSTRUCTIONS],
                 retries=2,
             )
