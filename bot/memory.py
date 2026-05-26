@@ -1,46 +1,174 @@
-"""Persistent long-term memory for Missbot (Postgres + pgvector).
+"""Evolving world-knowledge store for Missbot (Postgres + pgvector).
 
-This module owns the *global* (non-user-specific) memory store: shared facts the
-bot has learned, retrieved by semantic similarity. Per-user memory will live in a
-separate keyed table (a later stage) and does not need embeddings.
+This module owns the bot's shared, non-user-specific knowledge. It does **not** store
+bare facts: every row is a *claim* bound to a source and a time ("source S asserted X
+at time T"), so the model and callers always see who said something, when, and how
+well corroborated it is. Nothing here is treated as an oracle.
 
-Security note: global memory is writable from attacker-controlled message text, so
-every fact carries provenance (author + source note) for auditing/purging, writes
-are rate-limited per author and de-duplicated, and recalled facts are returned to
-the model as untrusted data (see bot/tools.py). The embedding model produces
-*unnormalized* int8 vectors, so all comparisons use cosine distance (`<=>`).
+Safety core (enforced in code, not convention):
+
+1. **No bare facts.** Every claim carries a ``source_id``, ``trust_tier``, and times.
+2. **Model output is quarantined.** LLM-generated claims enter at ``model_quarantine``
+   (the lowest tier) and can never be auto-promoted to ``believed`` — that blocks the
+   confabulation-laundering loop.
+3. **Append-only.** Updates insert a newer claim and set ``superseded_by`` on the old
+   one; we never destructively overwrite a value.
+4. **Promotion requires corroboration.** ``asserted`` -> ``believed`` only when
+   ``>= corroboration_threshold`` *independent* sources of tier ``>= secondary`` agree.
+5. **Conflict resolution is read-time policy** (see :func:`resolve_conflict`), not a
+   write-time guess; all conflicting claims are kept.
+6. **Provenance travels with the answer.** Recall returns claims *with* source, tier,
+   recency, confidence, and corroboration count.
+7. **Volatile facts expire.** Claims carry a volatility; stale volatile claims are
+   flagged on recall so the model re-verifies rather than trusting them.
+8. **Retraction is one query.** :meth:`MemoryStore.retract_source` tombstones every
+   claim from a compromised source and recomputes corroboration everywhere.
+
+The embedding model produces *unnormalized* vectors, so all comparisons use cosine
+distance (``<=>``).
 """
 
 import os
+import re
 from dataclasses import dataclass
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Optional, Union
 
 import asyncpg
 import httpx
 import logfire
+from asyncpg.pool import PoolConnectionProxy
 
 from .models import Config
 
+# Pool-acquired connections are proxies, not bare Connections; helpers accept either.
+_Conn = Union[asyncpg.Connection, PoolConnectionProxy]
 
-@dataclass
-class GlobalFact:
-    """A recalled global memory fact with its cosine similarity to the query."""
+# --- Trust tiers -----------------------------------------------------------------
+# Higher rank = more trusted. Only claims at tier >= ``secondary`` can be corroborated
+# into ``believed``; ``model_quarantine`` (LLM output) and ``user`` claims never can.
+TRUST_TIERS: dict[str, int] = {
+    "model_quarantine": 0,
+    "user": 1,
+    "secondary": 2,
+    "primary": 3,
+}
+# Tiers eligible for corroboration-based promotion to ``believed`` (rank >= secondary).
+PROMOTABLE_TIERS: tuple[str, ...] = tuple(t for t, r in TRUST_TIERS.items() if r >= TRUST_TIERS["secondary"])
 
-    fact: str
-    similarity: float
+# Read-time conflict ranking: a believed claim beats an asserted one, etc.
+STATUS_RANK: dict[str, int] = {"retracted": -1, "disputed": 0, "asserted": 1, "believed": 2}
+
+VOLATILITIES: frozenset[str] = frozenset({"stable", "slow", "volatile"})
+SOURCE_KINDS: frozenset[str] = frozenset({"web", "doc", "user", "model"})
+
+
+def tier_rank(tier: str) -> int:
+    """Trust rank for a tier name (unknown tiers rank lowest)."""
+    return TRUST_TIERS.get(tier, 0)
+
+
+def normalize_predicate(predicate: str) -> str:
+    """Normalize a predicate to a stable snake_case key for dedup/corroboration.
+
+    Two claims only corroborate or supersede each other when their predicates match
+    exactly, so we canonicalize aggressively (lowercase, non-alphanumeric -> ``_``).
+    """
+    p = re.sub(r"[^a-z0-9]+", "_", (predicate or "").strip().lower()).strip("_")
+    return p or "fact"
+
+
+def render_claim(subject: str, predicate: str, object_text: str) -> str:
+    """Human/embedding rendering of a claim's content (no provenance)."""
+    return f"{subject} — {predicate.replace('_', ' ')}: {object_text}"
+
+
+def is_stale(volatility: str, reference_time: Optional[datetime], now: datetime, ttl_seconds: int) -> bool:
+    """Whether a volatile claim is past its TTL and should be re-verified.
+
+    Only ``volatile`` claims expire; ``stable``/``slow`` never go stale here.
+    """
+    if volatility != "volatile" or reference_time is None:
+        return False
+    return (now - reference_time).total_seconds() > ttl_seconds
+
+
+def _conflict_sort_key(claim: dict) -> tuple[int, int, datetime]:
+    """Sort key for read-time conflict resolution.
+
+    Prefer (1) higher status (believed > asserted > disputed), then (2) higher trust
+    tier, then (3) the most recent valid_from (falling back to recorded_at).
+    """
+    ref = claim.get("valid_from") or claim["recorded_at"]
+    return (STATUS_RANK.get(claim["status"], 0), tier_rank(claim["trust_tier"]), ref)
+
+
+def resolve_conflict(claims: list[dict]) -> dict:
+    """Pick the winning claim from a set sharing the same subject+predicate.
+
+    Pure policy (no DB): believed > asserted, then trust tier, then recency. The full
+    set is preserved by the caller so conflicts surface with provenance.
+    """
+    return max(claims, key=_conflict_sort_key)
 
 
 def _vector_literal(vec: list[float]) -> str:
     """Render an embedding as a pgvector text literal (e.g. '[0.1,0.2,...]').
 
-    We pass vectors as text and cast to ``vector`` in SQL, which avoids depending
-    on a binary pgvector codec and never needs to decode vectors back in Python.
+    We pass vectors as text and cast to ``vector`` in SQL, which avoids depending on a
+    binary pgvector codec and never needs to decode vectors back in Python.
     """
     return "[" + ",".join(repr(float(x)) for x in vec) + "]"
 
 
+@dataclass
+class ConflictingClaim:
+    """An alternative value that disagrees with a recalled claim's winner."""
+
+    object_text: str
+    source_name: str
+    source_kind: str
+    trust_tier: str
+    status: str
+
+
+@dataclass
+class RecalledClaim:
+    """A recalled claim with full provenance (what the read path returns)."""
+
+    subject: str
+    predicate: str
+    object_text: str
+    status: str
+    trust_tier: str
+    source_name: str
+    source_kind: str
+    confidence: float
+    corroboration_count: int
+    volatility: str
+    recorded_at: datetime
+    valid_from: Optional[datetime]
+    similarity: float
+    stale: bool
+    conflicts: list[ConflictingClaim]
+
+
+@dataclass
+class ClaimWriteResult:
+    """Outcome of an :meth:`MemoryStore.add_claim` call."""
+
+    stored: bool
+    claim_id: Optional[int]
+    status: str
+    promoted: bool
+    duplicate: bool
+    superseded_claim_id: Optional[int]
+    subject: str
+    predicate: str
+
+
 class MemoryStore:
-    """Async Postgres-backed store for global long-term memory."""
+    """Async Postgres-backed store for the world-knowledge claim graph."""
 
     def __init__(self, pool: asyncpg.Pool, http: httpx.AsyncClient, config: Config):
         self._pool = pool
@@ -53,11 +181,11 @@ class MemoryStore:
 
     @classmethod
     async def create(cls, config: Config) -> "MemoryStore":
-        """Connect, ensure the schema/extension exist, and return a ready store.
+        """Connect, ensure the schema/extension exist, migrate legacy rows, return store.
 
-        Fails fast if the existing embedding column dimension disagrees with
-        ``config.embedding_dim`` — that mismatch silently returns garbage neighbors,
-        so it must surface loudly (it means the corpus needs re-embedding).
+        Fails fast if an existing claim-embedding column dimension disagrees with
+        ``config.embedding_dim`` — that mismatch silently returns garbage neighbors, so
+        it must surface loudly (it means the corpus needs re-embedding).
         """
         assert config.postgres_url, "postgres_url is required to build a MemoryStore"
         dim = config.embedding_dim
@@ -68,31 +196,80 @@ class MemoryStore:
         try:
             await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
             await conn.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS global_memory (
-                    id              BIGSERIAL PRIMARY KEY,
-                    fact            TEXT NOT NULL,
-                    embedding       vector({dim}) NOT NULL,
-                    author          TEXT,
-                    source_note_id  TEXT,
-                    embedding_model TEXT NOT NULL,
-                    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+                """
+                CREATE TABLE IF NOT EXISTS knowledge_source (
+                    id                 BIGSERIAL PRIMARY KEY,
+                    name               TEXT NOT NULL,
+                    kind               TEXT NOT NULL,
+                    default_trust_tier TEXT NOT NULL,
+                    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    UNIQUE (name, kind)
                 )
                 """
             )
             await conn.execute(
-                "CREATE INDEX IF NOT EXISTS global_memory_embedding_idx "
-                "ON global_memory USING hnsw (embedding vector_cosine_ops)"
+                f"""
+                CREATE TABLE IF NOT EXISTS knowledge_entity (
+                    id             BIGSERIAL PRIMARY KEY,
+                    canonical_name TEXT NOT NULL,
+                    aliases        TEXT[] NOT NULL DEFAULT '{{}}',
+                    type           TEXT,
+                    embedding      vector({dim}) NOT NULL,
+                    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
             )
-            await conn.execute("CREATE INDEX IF NOT EXISTS global_memory_author_idx ON global_memory (author)")
+            await conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS knowledge_claim (
+                    id                  BIGSERIAL PRIMARY KEY,
+                    subject_entity_id   BIGINT NOT NULL REFERENCES knowledge_entity(id),
+                    predicate           TEXT NOT NULL,
+                    object_text         TEXT NOT NULL,
+                    object_entity_id    BIGINT REFERENCES knowledge_entity(id),
+                    source_id           BIGINT NOT NULL REFERENCES knowledge_source(id),
+                    trust_tier          TEXT NOT NULL,
+                    confidence          REAL NOT NULL DEFAULT 0.5,
+                    status              TEXT NOT NULL DEFAULT 'asserted',
+                    valid_from          TIMESTAMPTZ,
+                    valid_to            TIMESTAMPTZ,
+                    recorded_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    superseded_by       BIGINT REFERENCES knowledge_claim(id),
+                    superseded_at       TIMESTAMPTZ,
+                    retracted_at        TIMESTAMPTZ,
+                    corroboration_count INTEGER NOT NULL DEFAULT 0,
+                    volatility          TEXT NOT NULL DEFAULT 'stable',
+                    embedding           vector({dim}) NOT NULL,
+                    author              TEXT,
+                    source_note_id      TEXT,
+                    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS knowledge_entity_embedding_idx "
+                "ON knowledge_entity USING hnsw (embedding vector_cosine_ops)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS knowledge_entity_name_idx ON knowledge_entity (lower(canonical_name))"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS knowledge_claim_embedding_idx "
+                "ON knowledge_claim USING hnsw (embedding vector_cosine_ops)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS knowledge_claim_sp_idx ON knowledge_claim (subject_entity_id, predicate)"
+            )
+            await conn.execute("CREATE INDEX IF NOT EXISTS knowledge_claim_author_idx ON knowledge_claim (author)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS knowledge_claim_source_idx ON knowledge_claim (source_id)")
 
             existing_dim = await conn.fetchval(
                 "SELECT atttypmod FROM pg_attribute "
-                "WHERE attrelid = 'global_memory'::regclass AND attname = 'embedding' AND NOT attisdropped"
+                "WHERE attrelid = 'knowledge_claim'::regclass AND attname = 'embedding' AND NOT attisdropped"
             )
             if existing_dim is not None and existing_dim > 0 and existing_dim != dim:
                 raise RuntimeError(
-                    f"global_memory.embedding has dimension {existing_dim} but embedding_dim={dim}. "
+                    f"knowledge_claim.embedding has dimension {existing_dim} but embedding_dim={dim}. "
                     "Changing the embedding model requires re-embedding every row (the vectors must "
                     "share one space); drop/migrate the table before changing embedding_dim."
                 )
@@ -104,8 +281,10 @@ class MemoryStore:
         pool = await asyncpg.create_pool(config.postgres_url, min_size=1, max_size=5)
         assert pool is not None
         http = httpx.AsyncClient(timeout=httpx.Timeout(config.http_timeout_seconds))
-        logfire.info("Memory store ready", embedding_model=config.embedding_model, embedding_dim=dim)
-        return cls(pool, http, config)
+        store = cls(pool, http, config)
+        await store._migrate_legacy_global_memory()
+        logfire.info("World-knowledge store ready", embedding_model=config.embedding_model, embedding_dim=dim)
+        return store
 
     async def close(self) -> None:
         await self._pool.close()
@@ -127,61 +306,417 @@ class MemoryStore:
         embedding = data["data"][0]["embedding"]
         return [float(x) for x in embedding]
 
-    @logfire.instrument(extract_args=["author", "source_note_id"])
-    async def add_global_fact(self, fact: str, author: Optional[str], source_note_id: Optional[str]) -> bool:
-        """Embed and store a global fact, skipping near-duplicates.
+    # --- Write path --------------------------------------------------------------
 
-        Returns True if stored, False if it was dropped as a near-duplicate of an
-        existing fact (cosine similarity >= global_dedup_threshold).
+    async def _get_or_create_source(self, conn: _Conn, name: str, kind: str, tier: str) -> int:
+        """Return the id of a source, creating it (with ``tier``) if new.
+
+        The trust tier is fixed at creation: a source's tier never silently changes on
+        a later write (that would let an attacker upgrade their own trust by re-asserting).
         """
-        vec = await self.embed(fact)
-        literal = _vector_literal(vec)
+        row = await conn.fetchval(
+            "INSERT INTO knowledge_source (name, kind, default_trust_tier) VALUES ($1, $2, $3) "
+            "ON CONFLICT (name, kind) DO UPDATE SET name = EXCLUDED.name RETURNING id",
+            name,
+            kind,
+            tier,
+        )
+        assert row is not None  # INSERT ... RETURNING always yields the id
+        return int(row)
+
+    async def _resolve_entity(self, conn: _Conn, name: str, name_vec_literal: str) -> int:
+        """Resolve a subject name to an entity id, linking or creating as needed.
+
+        Exact (case-insensitive) name/alias match wins; otherwise the nearest entity
+        within ``entity_match_threshold`` cosine similarity is linked; otherwise a new
+        entity is created.
+        """
+        exact = await conn.fetchval(
+            "SELECT id FROM knowledge_entity "
+            "WHERE lower(canonical_name) = lower($1) "
+            "OR EXISTS (SELECT 1 FROM unnest(aliases) a WHERE lower(a) = lower($1)) LIMIT 1",
+            name,
+        )
+        if exact is not None:
+            return int(exact)
+
+        nearest = await conn.fetchrow(
+            "SELECT id, embedding <=> $1::vector AS dist FROM knowledge_entity ORDER BY dist LIMIT 1",
+            name_vec_literal,
+        )
+        if nearest is not None and (1.0 - float(nearest["dist"])) >= self._config.entity_match_threshold:
+            return int(nearest["id"])
+
+        created = await conn.fetchval(
+            "INSERT INTO knowledge_entity (canonical_name, embedding) VALUES ($1, $2::vector) RETURNING id",
+            name,
+            name_vec_literal,
+        )
+        assert created is not None  # INSERT ... RETURNING always yields the id
+        return int(created)
+
+    @logfire.instrument(extract_args=["subject", "predicate", "trust_tier", "author", "source_note_id"])
+    async def add_claim(
+        self,
+        *,
+        subject: str,
+        predicate: str,
+        object_text: str,
+        source_name: str,
+        source_kind: str,
+        trust_tier: str,
+        author: Optional[str] = None,
+        source_note_id: Optional[str] = None,
+        volatility: str = "stable",
+        confidence: float = 0.5,
+        valid_from: Optional[datetime] = None,
+    ) -> ClaimWriteResult:
+        """Insert a claim with provenance; supersede stale same-source values; corroborate.
+
+        - LLM-sourced claims must pass ``trust_tier='model_quarantine'`` and can never be
+          promoted to ``believed`` (they are not in ``PROMOTABLE_TIERS``).
+        - A new value for the same subject+predicate from the *same source* supersedes that
+          source's prior value (append-only update).
+        - An identical/near-identical value from the same source is skipped as a duplicate.
+        - After insert, the matching subject+predicate+object group is re-evaluated for
+          corroboration-based promotion across *independent* tier-``>= secondary`` sources.
+        """
+        subject = subject.strip()
+        predicate = normalize_predicate(predicate)
+        object_text = object_text.strip()
+        if trust_tier not in TRUST_TIERS:
+            raise ValueError(f"unknown trust_tier {trust_tier!r}")
+        if source_kind not in SOURCE_KINDS:
+            raise ValueError(f"unknown source_kind {source_kind!r}")
+        if volatility not in VOLATILITIES:
+            volatility = "stable"
+
+        name_vec = _vector_literal(await self.embed(subject))
+        claim_vec = _vector_literal(await self.embed(render_claim(subject, predicate, object_text)))
+
         async with self._pool.acquire() as conn:
-            # Cosine distance of the nearest existing fact; similarity = 1 - distance.
-            nearest = await conn.fetchval(
-                "SELECT embedding <=> $1::vector AS dist FROM global_memory ORDER BY dist LIMIT 1",
-                literal,
-            )
-            if nearest is not None and (1.0 - float(nearest)) >= self._config.global_dedup_threshold:
-                logfire.info("Skipping near-duplicate global fact", similarity=1.0 - float(nearest))
-                return False
-            await conn.execute(
-                "INSERT INTO global_memory (fact, embedding, author, source_note_id, embedding_model) "
-                "VALUES ($1, $2::vector, $3, $4, $5)",
-                fact,
-                literal,
-                author,
-                source_note_id,
-                self._embed_model,
-            )
-        return True
+            async with conn.transaction():
+                source_id = await self._get_or_create_source(conn, source_name, source_kind, trust_tier)
+                subject_entity_id = await self._resolve_entity(conn, subject, name_vec)
+
+                # Existing live claims from this same source for this subject+predicate.
+                existing = await conn.fetch(
+                    "SELECT id, object_text, embedding <=> $4::vector AS dist FROM knowledge_claim "
+                    "WHERE source_id = $1 AND subject_entity_id = $2 AND predicate = $3 "
+                    "AND retracted_at IS NULL AND superseded_by IS NULL",
+                    source_id,
+                    subject_entity_id,
+                    predicate,
+                    claim_vec,
+                )
+                supersede_ids: list[int] = []
+                for row in existing:
+                    same_value = row["object_text"].strip().lower() == object_text.lower()
+                    near_dup = (1.0 - float(row["dist"])) >= self._config.global_dedup_threshold
+                    if same_value or near_dup:
+                        logfire.info("Skipping duplicate claim", subject=subject, predicate=predicate)
+                        return ClaimWriteResult(
+                            stored=False,
+                            claim_id=int(row["id"]),
+                            status="asserted",
+                            promoted=False,
+                            duplicate=True,
+                            superseded_claim_id=None,
+                            subject=subject,
+                            predicate=predicate,
+                        )
+                    supersede_ids.append(int(row["id"]))
+
+                claim_id = int(
+                    await conn.fetchval(
+                        "INSERT INTO knowledge_claim "
+                        "(subject_entity_id, predicate, object_text, source_id, trust_tier, confidence, "
+                        " status, valid_from, volatility, embedding, author, source_note_id) "
+                        "VALUES ($1, $2, $3, $4, $5, $6, 'asserted', $7, $8, $9::vector, $10, $11) RETURNING id",
+                        subject_entity_id,
+                        predicate,
+                        object_text,
+                        source_id,
+                        trust_tier,
+                        float(confidence),
+                        valid_from,
+                        volatility,
+                        claim_vec,
+                        author,
+                        source_note_id,
+                    )
+                )
+
+                superseded_claim_id: Optional[int] = None
+                if supersede_ids:
+                    await conn.execute(
+                        "UPDATE knowledge_claim SET superseded_by = $1, superseded_at = now() WHERE id = ANY($2)",
+                        claim_id,
+                        supersede_ids,
+                    )
+                    superseded_claim_id = supersede_ids[-1]
+                    # A superseded value may have been holding up a corroboration group.
+                    for old in existing:
+                        await self._recompute_corroboration(conn, subject_entity_id, predicate, old["object_text"])
+
+                promoted = await self._recompute_corroboration(conn, subject_entity_id, predicate, object_text)
+
+        status = "believed" if promoted else "asserted"
+        return ClaimWriteResult(
+            stored=True,
+            claim_id=claim_id,
+            status=status,
+            promoted=promoted,
+            duplicate=False,
+            superseded_claim_id=superseded_claim_id,
+            subject=subject,
+            predicate=predicate,
+        )
+
+    async def _recompute_corroboration(
+        self, conn: _Conn, subject_entity_id: int, predicate: str, object_text: str
+    ) -> bool:
+        """Recount independent tier->=secondary sources for a value and (de)promote.
+
+        A value asserted by ``>= corroboration_threshold`` *distinct* promotable-tier
+        sources becomes ``believed``; if it drops below that (e.g. after retraction) it
+        falls back to ``asserted``. ``model_quarantine``/``user`` claims are never touched,
+        so an LLM-sourced claim can never reach ``believed``. Returns True if the value
+        is believed afterwards.
+        """
+        count = await conn.fetchval(
+            "SELECT count(DISTINCT source_id) FROM knowledge_claim "
+            "WHERE subject_entity_id = $1 AND predicate = $2 AND lower(object_text) = lower($3) "
+            "AND retracted_at IS NULL AND superseded_by IS NULL AND trust_tier = ANY($4)",
+            subject_entity_id,
+            predicate,
+            object_text,
+            list(PROMOTABLE_TIERS),
+        )
+        n = int(count or 0)
+        promote = n >= self._config.corroboration_threshold
+        await conn.execute(
+            "UPDATE knowledge_claim SET corroboration_count = $4, "
+            "status = CASE WHEN $5 THEN 'believed' ELSE 'asserted' END "
+            "WHERE subject_entity_id = $1 AND predicate = $2 AND lower(object_text) = lower($3) "
+            "AND retracted_at IS NULL AND superseded_by IS NULL AND trust_tier = ANY($6) "
+            "AND status IN ('asserted', 'believed')",
+            subject_entity_id,
+            predicate,
+            object_text,
+            n,
+            promote,
+            list(PROMOTABLE_TIERS),
+        )
+        return promote
 
     async def seconds_since_last_write(self, author: str) -> Optional[float]:
-        """Seconds since ``author``'s most recent global write, or None if never."""
+        """Seconds since ``author``'s most recent claim write, or None if never."""
         async with self._pool.acquire() as conn:
             last = await conn.fetchval(
-                "SELECT EXTRACT(EPOCH FROM (now() - max(created_at))) FROM global_memory WHERE author = $1",
+                "SELECT EXTRACT(EPOCH FROM (now() - max(recorded_at))) FROM knowledge_claim WHERE author = $1",
                 author,
             )
         return float(last) if last is not None else None
 
-    @logfire.instrument(extract_args=["query"])
-    async def search_global(self, query: str, k: int) -> list[GlobalFact]:
-        """Return up to k global facts most cosine-similar to the query.
+    @logfire.instrument(extract_args=["source_name", "source_kind"])
+    async def retract_source(self, source_name: str, source_kind: Optional[str] = None) -> int:
+        """Tombstone every claim from a source and recompute corroboration everywhere.
 
-        Results below config.global_recall_min_similarity are dropped.
+        Killing a compromised source removes its influence in one operation (invariant 8):
+        its claims are marked ``retracted`` and any ``believed`` value that depended on it
+        is re-evaluated (and demoted if it no longer clears the threshold). Returns the
+        number of claims retracted.
         """
-        vec = await self.embed(query)
-        literal = _vector_literal(vec)
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                if source_kind is not None:
+                    source_ids = [
+                        int(r["id"])
+                        for r in await conn.fetch(
+                            "SELECT id FROM knowledge_source WHERE name = $1 AND kind = $2", source_name, source_kind
+                        )
+                    ]
+                else:
+                    source_ids = [
+                        int(r["id"])
+                        for r in await conn.fetch("SELECT id FROM knowledge_source WHERE name = $1", source_name)
+                    ]
+                if not source_ids:
+                    return 0
+                affected = await conn.fetch(
+                    "UPDATE knowledge_claim SET status = 'retracted', retracted_at = now() "
+                    "WHERE source_id = ANY($1) AND retracted_at IS NULL "
+                    "RETURNING subject_entity_id, predicate, object_text",
+                    source_ids,
+                )
+                seen: set[tuple[int, str, str]] = set()
+                for row in affected:
+                    key = (int(row["subject_entity_id"]), row["predicate"], row["object_text"].lower())
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    await self._recompute_corroboration(
+                        conn, int(row["subject_entity_id"]), row["predicate"], row["object_text"]
+                    )
+        return len(affected)
+
+    # --- Read path ---------------------------------------------------------------
+
+    @logfire.instrument(extract_args=["query"])
+    async def search_claims(self, query: str, k: int, as_of: Optional[datetime] = None) -> list[RecalledClaim]:
+        """Recall claims relevant to a query, conflict-resolved and provenance-attached.
+
+        Embedding recall produces a candidate set; candidates are grouped by
+        subject+predicate, the winner of each group is chosen by :func:`resolve_conflict`,
+        and disagreeing alternatives ride along as ``conflicts``. Retracted and superseded
+        claims are excluded from the default (current) view. Pass ``as_of`` to recover the
+        value believed as of a past instant (bitemporal read). Volatile winners past their
+        TTL are flagged ``stale``.
+        """
+        vec = _vector_literal(await self.embed(query))
         min_sim = self._config.global_recall_min_similarity
-        # similarity >= min_sim  <=>  distance <= 1 - min_sim
         max_dist = 1.0 - min_sim
+        # Pull a wider candidate pool than k so conflict groups are complete before we
+        # collapse each to a single winner.
+        candidate_limit = max(k * 4, 20)
+
+        if as_of is None:
+            visibility = "c.retracted_at IS NULL AND c.superseded_by IS NULL"
+            params: list = [vec, max_dist, candidate_limit]
+        else:
+            visibility = (
+                "c.recorded_at <= $4 "
+                "AND (c.retracted_at IS NULL OR c.retracted_at > $4) "
+                "AND (c.superseded_at IS NULL OR c.superseded_at > $4)"
+            )
+            params = [vec, max_dist, candidate_limit, as_of]
+
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT fact, embedding <=> $1::vector AS dist FROM global_memory "
-                "WHERE embedding <=> $1::vector <= $2 ORDER BY dist LIMIT $3",
-                literal,
-                max_dist,
-                k,
+                f"""
+                SELECT c.id, e.canonical_name AS subject, c.predicate, c.object_text, c.status,
+                       c.trust_tier, c.confidence, c.corroboration_count, c.volatility,
+                       c.valid_from, c.recorded_at, s.name AS source_name, s.kind AS source_kind,
+                       c.embedding <=> $1::vector AS dist
+                FROM knowledge_claim c
+                JOIN knowledge_entity e ON e.id = c.subject_entity_id
+                JOIN knowledge_source s ON s.id = c.source_id
+                WHERE {visibility} AND c.embedding <=> $1::vector <= $2
+                ORDER BY dist LIMIT $3
+                """,
+                *params,
             )
-        return [GlobalFact(fact=r["fact"], similarity=1.0 - float(r["dist"])) for r in rows]
+
+        # Group candidates by subject+predicate so conflicting values resolve together.
+        groups: dict[tuple[str, str], list[dict]] = {}
+        for row in rows:
+            d = dict(row)
+            key = (d["subject"].strip().lower(), d["predicate"])
+            groups.setdefault(key, []).append(d)
+
+        now = datetime.now(timezone.utc)
+        ttl = self._config.volatile_ttl_seconds
+        recalled: list[RecalledClaim] = []
+        for members in groups.values():
+            winner = resolve_conflict(members)
+            conflicts = [
+                ConflictingClaim(
+                    object_text=m["object_text"],
+                    source_name=m["source_name"],
+                    source_kind=m["source_kind"],
+                    trust_tier=m["trust_tier"],
+                    status=m["status"],
+                )
+                for m in members
+                if m["object_text"].strip().lower() != winner["object_text"].strip().lower()
+            ]
+            best_dist = min(float(m["dist"]) for m in members)
+            recalled.append(
+                RecalledClaim(
+                    subject=winner["subject"],
+                    predicate=winner["predicate"],
+                    object_text=winner["object_text"],
+                    status=winner["status"],
+                    trust_tier=winner["trust_tier"],
+                    source_name=winner["source_name"],
+                    source_kind=winner["source_kind"],
+                    confidence=float(winner["confidence"]),
+                    corroboration_count=int(winner["corroboration_count"]),
+                    volatility=winner["volatility"],
+                    recorded_at=winner["recorded_at"],
+                    valid_from=winner["valid_from"],
+                    similarity=1.0 - best_dist,
+                    stale=is_stale(winner["volatility"], winner["valid_from"] or winner["recorded_at"], now, ttl),
+                    conflicts=conflicts,
+                )
+            )
+
+        recalled.sort(key=lambda r: r.similarity, reverse=True)
+        return recalled[:k]
+
+    # --- Migration ---------------------------------------------------------------
+
+    async def _migrate_legacy_global_memory(self) -> None:
+        """Backfill rows from the legacy ``global_memory`` table as low-tier claims.
+
+        One-time, idempotent: runs only when a ``global_memory`` table exists and the new
+        claim table is still empty. Each old fact becomes a claim on a generic
+        ``(legacy memory)`` entity with predicate ``note``, attributed to its original
+        author (``user`` tier) or to ``model`` (``model_quarantine``) when authorless. The
+        original ``global_memory`` table is left intact as a backup; drop it manually once
+        the migration is verified.
+        """
+        async with self._pool.acquire() as conn:
+            has_legacy = await conn.fetchval("SELECT to_regclass('public.global_memory')")
+            if has_legacy is None:
+                return
+            already = await conn.fetchval("SELECT EXISTS (SELECT 1 FROM knowledge_claim)")
+            if already:
+                return
+            rows = await conn.fetch(
+                "SELECT fact, embedding::text AS embedding, embedding_model, author, source_note_id, created_at "
+                "FROM global_memory ORDER BY id"
+            )
+            if not rows:
+                return
+
+            name_vec = _vector_literal(await self.embed("legacy memory"))
+            async with conn.transaction():
+                entity_id = int(
+                    await conn.fetchval(
+                        "INSERT INTO knowledge_entity (canonical_name, embedding) VALUES ($1, $2::vector) RETURNING id",
+                        "(legacy memory)",
+                        name_vec,
+                    )
+                )
+                migrated = 0
+                for row in rows:
+                    author = row["author"]
+                    if author:
+                        src_name, src_kind, tier = author, "user", "user"
+                    else:
+                        src_name, src_kind, tier = "model", "model", "model_quarantine"
+                    source_id = await self._get_or_create_source(conn, src_name, src_kind, tier)
+                    # Reuse the old embedding only if it came from the current model (same
+                    # vector space); otherwise re-embed the fact text under the new model.
+                    if row["embedding_model"] == self._embed_model:
+                        claim_vec = row["embedding"]
+                    else:
+                        claim_vec = _vector_literal(await self.embed(row["fact"]))
+                    await conn.execute(
+                        "INSERT INTO knowledge_claim "
+                        "(subject_entity_id, predicate, object_text, source_id, trust_tier, status, "
+                        " recorded_at, volatility, embedding, author, source_note_id) "
+                        "VALUES ($1, 'note', $2, $3, $4, 'asserted', $5, 'stable', $6::vector, $7, $8)",
+                        entity_id,
+                        row["fact"],
+                        source_id,
+                        tier,
+                        row["created_at"],
+                        claim_vec,
+                        author,
+                        row["source_note_id"],
+                    )
+                    migrated += 1
+            logfire.info("Migrated legacy global_memory rows into claims", count=migrated)

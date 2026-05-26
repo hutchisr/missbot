@@ -276,8 +276,9 @@ class Config(BaseModel):
     )
     memory_enabled: bool = Field(
         default=False,
-        description="Enable persistent long-term memory (Postgres + pgvector). Off by default; "
-        "requires postgres_url and embedding_model. Adds the remember_fact / search_memory tools.",
+        description="Enable the persistent world-knowledge store (Postgres + pgvector). Off by default; "
+        "requires postgres_url and embedding_model. Adds the remember_fact / search_memory tools. The store "
+        "keeps claims-with-provenance (source, trust tier, time, corroboration), never bare facts.",
     )
     postgres_url: Optional[str] = Field(
         default=None,
@@ -310,7 +311,7 @@ class Config(BaseModel):
     global_recall_k: int = Field(
         default=5,
         gt=0,
-        description="Max number of global memory facts returned per search_memory call.",
+        description="Max number of claims returned per search_memory call (after conflict resolution).",
     )
     global_recall_min_similarity: float = Field(
         default=0.3,
@@ -327,13 +328,39 @@ class Config(BaseModel):
         default=0.95,
         ge=0.0,
         le=1.0,
-        description="If a new global fact is at least this cosine-similar to an existing one, the write is "
-        "skipped as a near-duplicate (anti-spam).",
+        description="If a new claim from the same source is at least this cosine-similar to an existing "
+        "(non-retracted) claim with the same subject+predicate, the write is skipped as a near-duplicate.",
     )
     max_fact_length: int = Field(
         default=500,
         gt=0,
-        description="Maximum character length of a single stored memory fact; longer writes are rejected.",
+        description="Maximum character length of a single submitted fact/claim; longer writes are rejected.",
+    )
+    corroboration_threshold: int = Field(
+        default=2,
+        gt=0,
+        description="Number of independent sources of tier >= secondary that must assert the same "
+        "subject+predicate+object before a claim is promoted from 'asserted' to 'believed'. Model-generated "
+        "(model_quarantine) claims never count toward this and are never promoted.",
+    )
+    entity_match_threshold: float = Field(
+        default=0.82,
+        ge=0.0,
+        le=1.0,
+        description="Cosine-similarity floor for linking a claim's subject to an existing entity. Below this "
+        "(and with no exact name/alias match) a new entity is created instead.",
+    )
+    volatile_ttl_seconds: int = Field(
+        default=86400,
+        gt=0,
+        description="A claim marked 'volatile' older than this (by valid_from, else recorded_at) is flagged "
+        "stale on recall so the model re-verifies it live rather than trusting it.",
+    )
+    memory_extract_models: List[Union[str, CustomOpenAIModel]] = Field(
+        default_factory=list,
+        description="Model chain for the claim-extraction classifier that turns a submitted fact into a "
+        "typed subject/predicate/object claim or rejects it (same forms as llm_models). Defaults to "
+        "llm_models when empty; a smaller/cheaper model is usually fine.",
     )
     debug: Optional[bool] = None
 

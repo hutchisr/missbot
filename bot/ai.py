@@ -23,6 +23,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 import logfire
 from redis.asyncio import Redis
 
+from .extract import EXTRACTION_INSTRUCTIONS, ClaimExtraction, build_extraction_prompt
 from .mcp import build_mcp_toolsets, gate_names
 from .memory import MemoryStore
 from .models import Config, CustomOpenAIModel, Note, User
@@ -211,7 +212,27 @@ class ChatAgent:
         else:
             self._vision_model = _chain(vision_specs)
 
-        tools = build_tools(config, redis_client=redis_client, memory=memory)
+        # Claim-extraction agent: turns a free-text fact into a typed claim (or rejects
+        # it) before anything is written to the world-knowledge store. Tool-less and
+        # constrained output, so untrusted text can only pick a branch, never free-form a
+        # stored fact (see bot/extract.py). Only built when memory is enabled.
+        self._extract_agent: Optional[Agent[None, ClaimExtraction]] = None
+        if memory is not None and config.memory_enabled:
+            extract_model = _chain(config.memory_extract_models) if config.memory_extract_models else model
+            # pydantic-ai accepts a Union as output_type at runtime and constrains the
+            # model to one of its member shapes, but pyright can't match a union special
+            # form to the Agent() overloads (same situation as the scoring agent below).
+            self._extract_agent = Agent(
+                extract_model,
+                output_type=ClaimExtraction,  # type: ignore[reportArgumentType]
+                instructions=[EXTRACTION_INSTRUCTIONS],
+                retries=2,
+            )
+
+        # Pass the extractor only when it exists, so remember_fact is exposed only when a
+        # fact can actually be structured into a claim.
+        extractor = self._extract_claim if self._extract_agent is not None else None
+        tools = build_tools(config, redis_client=redis_client, memory=memory, extractor=extractor)
         gates = gate_names(config)
         for gate, servers in sorted(gates.items()):
             tools.append(_make_enable_gate_tool(gate, servers))
@@ -446,6 +467,25 @@ class ChatAgent:
             model_settings={"timeout": 300.0},
         )
         self._auto_history.append(result.output)
+        return result.output
+
+    async def _extract_claim(self, fact: str) -> Optional[ClaimExtraction]:
+        """Run the claim extractor over a submitted fact for the world-knowledge store.
+
+        Returns an ``ExtractedClaim``, a ``Skip`` (rejection with a reason), or None if
+        the classifier itself failed. Never raises — a failed extraction just means the
+        fact isn't stored; it must not break the reply path.
+        """
+        if self._extract_agent is None:
+            return None
+        try:
+            result = await self._extract_agent.run(
+                build_extraction_prompt(fact),
+                model_settings={"timeout": 60.0},
+            )
+        except Exception:
+            logfire.exception("Claim extraction failed — fact not stored (reply unaffected)")
+            return None
         return result.output
 
     async def _get_social_credit_score(self, username: str) -> Optional[int]:
