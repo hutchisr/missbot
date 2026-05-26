@@ -1,17 +1,19 @@
 """Tool utilities for Missbot."""
 
+import asyncio
 import json
 import secrets
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 import logfire
 from pydantic_ai import RunContext
 from redis.asyncio import Redis
 
-from .extract import ClaimExtraction, Skip
+from .extract import ClaimExtraction, ExtractedClaim, Skip
 from .memory import MemoryStore, RecalledClaim
 from .models import Config
 
@@ -51,6 +53,59 @@ def _render_recalled_claim(claim: RecalledClaim) -> str:
         )
         line += f"\n    conflicting values: {alts}"
     return line
+
+
+def _domain_of(url: str) -> Optional[str]:
+    """Extract a normalized hostname from a URL, for use as a web source name.
+
+    Returns None when there's no parseable host (so a result with no usable
+    provenance is skipped for ingestion rather than attributed to an empty source).
+    """
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return None
+    if host.startswith("www."):
+        host = host[4:]
+    return host or None
+
+
+async def _ingest_web_results(
+    memory: MemoryStore,
+    extractor: Callable[[str], Awaitable[Optional[ClaimExtraction]]],
+    results: list[dict],
+) -> None:
+    """Deterministically ingest web-search results as `secondary`-tier claims.
+
+    Each result's content passes through the same hardened extraction admission gate as
+    every other write; an accepted claim is attributed to the result's domain (kind=web).
+    The source is set by code from the result URL, never by model self-report, so distinct
+    domains agreeing can corroborate a claim into 'believed'. Best-effort and concurrent;
+    a failure on one result never fails the search.
+    """
+
+    async def _one(result: dict) -> None:
+        domain = _domain_of(result.get("url") or "")
+        if not domain:
+            return
+        try:
+            extracted = await extractor(result["content"])
+            if not isinstance(extracted, ExtractedClaim):
+                return
+            await memory.add_claim(
+                subject=extracted.subject,
+                predicate=extracted.predicate,
+                object_text=extracted.object,
+                source_name=domain,
+                source_kind="web",
+                trust_tier="secondary",
+                volatility=extracted.volatility,
+                confidence=extracted.confidence,
+            )
+        except Exception:
+            logfire.exception("Web claim ingestion failed (search result still returned)", domain=domain)
+
+    await asyncio.gather(*(_one(r) for r in results))
 
 
 def current_datetime() -> str:
@@ -113,27 +168,48 @@ def build_tools(
     tools.append(current_datetime_tool)
 
     if config.searxng_url:
+        _web_extractor = extractor
 
         @logfire.instrument()
-        def search_web(query: str) -> Optional[str]:
+        async def search_web(query: str) -> Optional[str]:
             """Search the web for information."""
             auth: Optional[httpx.BasicAuth] = None
             if config.searxng_user and config.searxng_password:
                 auth = httpx.BasicAuth(config.searxng_user, config.searxng_password)
-            transport = httpx.HTTPTransport(retries=config.max_retries)
-            with httpx.Client(auth=auth, transport=transport) as client:
+            transport = httpx.AsyncHTTPTransport(retries=config.max_retries)
+            async with httpx.AsyncClient(
+                auth=auth, transport=transport, timeout=httpx.Timeout(config.http_timeout_seconds)
+            ) as client:
                 try:
-                    response = client.post(
+                    response = await client.post(
                         f"{config.searxng_url}search",
                         params={"q": query, "format": "json"},
                     )
                     response.raise_for_status()
                     data = response.json()
-                    contents = [r.get("content") for r in data.get("results", [])[:5] if r.get("content")]
-                    return "\n---\n".join(contents)
                 except httpx.HTTPError:
                     logfire.exception("HTTP Error during web search")
                     return None
+
+            results = [r for r in data.get("results", [])[:5] if r.get("content")]
+            # Deterministically learn from results: attribute each to its domain at the
+            # 'secondary' tier (the model never picks the source). Gated + best-effort.
+            if (
+                results
+                and memory is not None
+                and config.memory_enabled
+                and config.memory_ingest_web
+                and _web_extractor is not None
+            ):
+                await _ingest_web_results(memory, _web_extractor, results)
+
+            # Surface each snippet's domain so the model sees provenance too.
+            lines: list[str] = []
+            for r in results:
+                domain = _domain_of(r.get("url") or "")
+                content = r["content"]
+                lines.append(f"[{domain}] {content}" if domain else content)
+            return "\n---\n".join(lines)
 
         tools.append(search_web)
 

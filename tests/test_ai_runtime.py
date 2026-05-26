@@ -7,6 +7,7 @@ import pytest
 from pydantic_ai import ImageUrl
 
 from bot.ai import ChatAgent
+from bot.extract import ExtractedClaim, Skip
 from bot.models import MiFile
 
 
@@ -244,3 +245,97 @@ async def test_run_scoring_failure_does_not_break_reply(make_config, make_note, 
     assert await fake_redis.get("score:alice") is None
     # A failed classification must not burn the cooldown — it should retry next message.
     assert not await fake_redis.exists("score_cooldown:alice")
+
+
+# --- Note -> world-knowledge ingestion ---
+
+
+def _memory_cfg(make_config, **extra):
+    return make_config(
+        memory_enabled=True,
+        postgres_url="postgres://u:p@db/x",
+        embedding_model="perplexity/pplx-embed-v1-0.6b",
+        **extra,
+    )
+
+
+@pytest.mark.anyio
+async def test_run_ingests_note_as_user_tier_claim(make_config, make_note):
+    mem = AsyncMock()
+    mem.seconds_since_last_write.return_value = None
+    agent = ChatAgent(_memory_cfg(make_config), memory=mem)
+    note = make_note(text="Python's latest version is 3.13")  # author = alice
+    claim = ExtractedClaim(subject="Python", predicate="latest_version", object="3.13")
+
+    with (
+        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
+        patch.object(agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=claim))),
+    ):
+        out = await agent.run(note)
+
+    assert out == "reply"
+    mem.add_claim.assert_awaited_once()
+    kw = mem.add_claim.await_args.kwargs
+    # The author is the deterministic source, at the (non-promotable) user tier.
+    assert kw["source_kind"] == "user"
+    assert kw["trust_tier"] == "user"
+    assert kw["source_name"] == "alice"
+    assert kw["author"] == "alice"
+    assert kw["source_note_id"] == note.id
+
+
+@pytest.mark.anyio
+async def test_run_note_ingestion_respects_write_cooldown(make_config, make_note):
+    mem = AsyncMock()
+    mem.seconds_since_last_write.return_value = 5.0  # within the default 60s cooldown
+    agent = ChatAgent(_memory_cfg(make_config), memory=mem)
+    note = make_note(text="some durable world fact")
+    claim = ExtractedClaim(subject="X", predicate="y", object="z")
+
+    with (
+        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
+        patch.object(
+            agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=claim))
+        ) as extract_mock,
+    ):
+        await agent.run(note)
+
+    # Cooldown short-circuits before paying for an extraction call.
+    extract_mock.assert_not_awaited()
+    mem.add_claim.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_run_note_ingestion_skips_when_extractor_rejects(make_config, make_note):
+    mem = AsyncMock()
+    mem.seconds_since_last_write.return_value = None
+    agent = ChatAgent(_memory_cfg(make_config), memory=mem)
+    note = make_note(text="i really love pizza")
+
+    with (
+        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
+        patch.object(
+            agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=Skip(reason="personal detail")))
+        ),
+    ):
+        await agent.run(note)
+
+    mem.add_claim.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_run_note_ingestion_disabled_by_flag(make_config, make_note):
+    mem = AsyncMock()
+    mem.seconds_since_last_write.return_value = None
+    agent = ChatAgent(_memory_cfg(make_config, memory_ingest_notes=False), memory=mem)
+    note = make_note(text="Python's latest version is 3.13")
+
+    with (
+        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
+        patch.object(agent._extract_agent, "run", AsyncMock()) as extract_mock,
+    ):
+        await agent.run(note)
+
+    # Flag off => the ingestion path returns before extracting or writing.
+    extract_mock.assert_not_awaited()
+    mem.add_claim.assert_not_awaited()

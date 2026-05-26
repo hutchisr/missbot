@@ -362,6 +362,20 @@ class Config(BaseModel):
         "typed subject/predicate/object claim or rejects it (same forms as llm_models). Defaults to "
         "llm_models when empty; a smaller/cheaper model is usually fine.",
     )
+    memory_ingest_web: bool = Field(
+        default=True,
+        description="When memory is enabled, auto-ingest web-search results as claims attributed to their "
+        "source domain at the 'secondary' trust tier (deterministic provenance, and the only channel that "
+        "can corroborate a claim into 'believed'). Each result is run through the extraction admission gate. "
+        "Set false to skip the extra extraction calls per search.",
+    )
+    memory_ingest_notes: bool = Field(
+        default=True,
+        description="When memory is enabled, auto-ingest each incoming user note as a claim attributed to "
+        "its author at the 'user' trust tier (deterministic provenance; never promotable to 'believed' on "
+        "its own). The extractor's Skip branch drops chatter/opinions/personal details, and writes are "
+        "rate-limited per author by global_write_cooldown. Set false to disable note learning.",
+    )
     debug: Optional[bool] = None
 
     @model_validator(mode="after")

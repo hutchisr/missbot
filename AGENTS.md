@@ -81,6 +81,15 @@ Global (non-user-specific) knowledge backed by Postgres + the `pgvector` extensi
 - `entity_match_threshold` (default `0.82`): cosine-similarity floor for linking a subject to an existing entity (vs creating a new one); exact name/alias match always links
 - `volatile_ttl_seconds` (default `86400`): a `volatile` claim older than this (by `valid_from`, else `recorded_at`) is flagged stale on recall so the model re-verifies it live
 - `memory_extract_models` (defaults to `llm_models`): model chain for the claim extractor (`bot/extract.py`); a smaller/cheaper model is usually fine
+- `memory_ingest_web` (default `true`): auto-ingest web-search results as `web`/`secondary` claims attributed to their domain (adds an extraction call per result)
+- `memory_ingest_notes` (default `true`): auto-ingest each incoming user note as a `user`-tier claim attributed to its author (rate-limited per author by `global_write_cooldown`)
+
+**Source determination (by channel, never by model self-report).** A claim's `source`/`trust_tier` is assigned by code based on where the text provably came from, since the model is an unreliable narrator of its own provenance:
+- **Web** — `search_web` (now async) parses each result's domain and ingests it as `kind=web`, `secondary` tier (`bot/tools.py:_ingest_web_results`). Distinct domains agreeing is what lets a claim reach `believed`.
+- **User note** — `ChatAgent._maybe_ingest_note` extracts a claim from the author's note and stores it as `kind=user`, `user` tier, sourced to the author handle (deterministic; never promotable alone, but attributable + retractable by author).
+- **Model** — `remember_fact` (model decides to remember) → `kind=model`, `model_quarantine`.
+
+All three pass through the same `bot/extract.py` admission gate, so web/note text that isn't a durable, entity-bound fact is `Skip`ped.
 
 **Data model.** `knowledge_source` (`name`, `kind` = web|doc|user|model, `default_trust_tier`); `knowledge_entity` (`canonical_name`, `aliases`, `embedding`); `knowledge_claim` (`subject_entity_id`, `predicate`, `object_text`, `source_id`, `trust_tier`, `confidence`, `status` = asserted|believed|disputed|retracted, bitemporal `valid_from`/`valid_to` + `recorded_at`, `superseded_by`/`superseded_at`, `retracted_at`, `corroboration_count`, `volatility`, `embedding`, `author`/`source_note_id` provenance). Trust tiers rank `model_quarantine` < `user` < `secondary` < `primary`; only `secondary`/`primary` are promotable (`PROMOTABLE_TIERS`).
 
@@ -109,6 +118,7 @@ Gating is progressive disclosure driven by the model itself: each unique `gate` 
 - Agent uses `output_type=str` (plain string output, not structured)
 - Tools are built via `build_tools()` in `bot/tools.py` and passed to `Agent(..., tools=tools)`
 - When `memory_enabled`, `ChatAgent.__init__` builds a tool-less **claim-extraction agent** (`output_type=ClaimExtraction`, model from `memory_extract_models` or the reply model). Its `_extract_claim` method is passed into `build_tools(..., extractor=...)`; `remember_fact` is only exposed when that extractor exists, and uses it to structure (or `Skip`) a submitted fact before writing it as a `model_quarantine` claim. Like scoring, this is an injection-mitigation: untrusted text can only pick a union branch, never free-form a stored fact
+- `ChatAgent.run` runs three coroutines concurrently via `asyncio.gather`: the reply, `_maybe_score_message`, and `_maybe_ingest_note` (extract a `user`-tier claim from the author's note when `memory_ingest_notes`). Like scoring, note ingestion swallows its own errors and is rate-limited per author, so it never affects the reply
 - `FallbackModel` wraps multiple `llm_models` for automatic failover
 - Social credit score is injected via a dynamic system prompt function
 
@@ -135,7 +145,7 @@ When `system_prompt_auto` and `auto_post_interval` are configured, `ChatAgent.ru
 
 ## Available Tools (runtime)
 - `current_datetime_tool` — always available
-- `search_web` — when `searxng_url` configured
+- `search_web` (async) — when `searxng_url` configured. Returns domain-prefixed snippets; when `memory_enabled` + `memory_ingest_web`, also ingests each result as a `web`/`secondary` claim attributed to its domain
 - `search_users`, `search_notes` — Misskey search APIs
 - Social credit tools (when Redis configured): `get_social_credit`, `adjust_social_credit` (privileged authors only), `get_social_credit_history`, `get_social_credit_leaderboard`. All users (privileged included) are also scored automatically by the `bot/scoring.py` classifier, separate from any tool call
 - World-knowledge tools (when `memory_enabled`): `remember_fact` (extract a submitted fact into a typed claim and store it at the quarantined `model_quarantine` tier; rate-limited + deduped + provenance-stamped; only present when the extractor is wired) and `search_memory` (semantic recall, conflict-resolved, returned with full provenance and fenced as untrusted data). Not given to the auto-agent

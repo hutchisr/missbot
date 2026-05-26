@@ -23,7 +23,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 import logfire
 from redis.asyncio import Redis
 
-from .extract import EXTRACTION_INSTRUCTIONS, ClaimExtraction, build_extraction_prompt
+from .extract import EXTRACTION_INSTRUCTIONS, ClaimExtraction, ExtractedClaim, build_extraction_prompt
 from .mcp import build_mcp_toolsets, gate_names
 from .memory import MemoryStore
 from .models import Config, CustomOpenAIModel, Note, User
@@ -383,9 +383,13 @@ class ChatAgent:
         # Score the author's message in parallel with generating the reply so it
         # adds no user-facing latency. _maybe_score_message swallows its own
         # errors, so it can never fail the reply.
-        result, _ = await asyncio.gather(
+        # Score the author's message and learn any world-fact it asserts, both in
+        # parallel with generating the reply so they add no user-facing latency. Both
+        # swallow their own errors, so neither can fail the reply.
+        result, _, _ = await asyncio.gather(
             self._agent.run(prompt, **run_kwargs),
             self._maybe_score_message(note),
+            self._maybe_ingest_note(note),
         )
         return result.output
 
@@ -487,6 +491,52 @@ class ChatAgent:
             logfire.exception("Claim extraction failed — fact not stored (reply unaffected)")
             return None
         return result.output
+
+    async def _maybe_ingest_note(self, note: Note) -> None:
+        """Learn a world-fact claim from the author's note, sourced to the author.
+
+        Deterministic provenance: the source is the note's author (kind=user, `user`
+        tier), set by code — not by anything the model says. A `user`-tier claim can
+        never be promoted to 'believed' on its own, but it's attributable and
+        retractable by author. The extractor's Skip branch drops chatter, opinions, and
+        personal details, so only genuine world-fact assertions are stored. Rate-limited
+        per author by ``global_write_cooldown``. Never raises — must not break the reply.
+        """
+        if (
+            self._memory is None
+            or self._extract_agent is None
+            or not self._config.memory_enabled
+            or not self._config.memory_ingest_notes
+        ):
+            return
+        text = (note.text or "").strip()
+        if not text:
+            return
+        author = normalize_username(_user_handle(note.user))
+        try:
+            cooldown = self._config.global_write_cooldown
+            if cooldown > 0:
+                since = await self._memory.seconds_since_last_write(author)
+                if since is not None and since < cooldown:
+                    logfire.debug("Note ingestion skipped (write cooldown)", author=author)
+                    return
+            extracted = await self._extract_claim(text)
+            if not isinstance(extracted, ExtractedClaim):
+                return
+            await self._memory.add_claim(
+                subject=extracted.subject,
+                predicate=extracted.predicate,
+                object_text=extracted.object,
+                source_name=author,
+                source_kind="user",
+                trust_tier="user",
+                author=author,
+                source_note_id=note.id,
+                volatility=extracted.volatility,
+                confidence=extracted.confidence,
+            )
+        except Exception:
+            logfire.exception("Note claim ingestion failed (reply unaffected)", author=author)
 
     async def _get_social_credit_score(self, username: str) -> Optional[int]:
         """Fetch the user's social credit score from Redis."""

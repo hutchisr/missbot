@@ -70,7 +70,21 @@ def _mock_sync_client(response: Any = None, *, post_side_effect: Any = None) -> 
     return client, manager
 
 
-def test_search_web_returns_top_results_and_uses_auth(make_config):
+def _mock_async_client(response: Any = None, *, post_side_effect: Any = None) -> tuple[MagicMock, MagicMock]:
+    """Mock an `async with httpx.AsyncClient(...) as client` whose `client.post` is awaited."""
+    client = MagicMock()
+    if post_side_effect is not None:
+        client.post = AsyncMock(side_effect=post_side_effect)
+    else:
+        client.post = AsyncMock(return_value=response)
+    manager = MagicMock()
+    manager.__aenter__ = AsyncMock(return_value=client)
+    manager.__aexit__ = AsyncMock(return_value=False)
+    return client, manager
+
+
+@pytest.mark.anyio
+async def test_search_web_returns_top_results_and_uses_auth(make_config):
     cfg = make_config(
         searxng_url="https://searx.example/",
         searxng_user="searcher",
@@ -81,32 +95,101 @@ def test_search_web_returns_top_results_and_uses_auth(make_config):
     response.json.return_value = {
         "results": [{"content": f"result-{idx}"} for idx in range(1, 7)],
     }
-    client, manager = _mock_sync_client(response)
+    client, manager = _mock_async_client(response)
 
     with (
         patch("bot.tools.httpx.BasicAuth", return_value="auth") as auth_mock,
-        patch("bot.tools.httpx.Client", return_value=manager) as client_cls,
+        patch("bot.tools.httpx.AsyncClient", return_value=manager) as client_cls,
     ):
-        result = search_web("fediverse")
+        result = await search_web("fediverse")
 
+    # No url on these results -> no domain prefix, so output is unchanged.
     assert result == "result-1\n---\nresult-2\n---\nresult-3\n---\nresult-4\n---\nresult-5"
     auth_mock.assert_called_once_with("searcher", "secret")
     assert client_cls.call_args.kwargs["auth"] == "auth"
-    client.post.assert_called_once_with(
+    client.post.assert_awaited_once_with(
         f"{cfg.searxng_url}search",
         params={"q": "fediverse", "format": "json"},
     )
 
 
-def test_search_web_returns_none_on_http_error(make_config):
+@pytest.mark.anyio
+async def test_search_web_returns_none_on_http_error(make_config):
     cfg = make_config(searxng_url="https://searx.example/")
     search_web = _find(build_tools(cfg), "search_web")
     request = httpx.Request("POST", f"{cfg.searxng_url}search")
     error = httpx.RequestError("boom", request=request)
-    _, manager = _mock_sync_client(post_side_effect=error)
+    _, manager = _mock_async_client(post_side_effect=error)
 
-    with patch("bot.tools.httpx.Client", return_value=manager):
-        assert search_web("fediverse") is None
+    with patch("bot.tools.httpx.AsyncClient", return_value=manager):
+        assert await search_web("fediverse") is None
+
+
+def test_domain_of_normalizes_host():
+    from bot.tools import _domain_of
+
+    assert _domain_of("https://www.Example.com/path?q=1") == "example.com"
+    assert _domain_of("https://en.wikipedia.org/wiki/X") == "en.wikipedia.org"
+    assert _domain_of("not a url") is None
+    assert _domain_of("") is None
+
+
+@pytest.mark.anyio
+async def test_search_web_ingests_results_as_web_claims(make_config):
+    cfg = make_config(
+        searxng_url="https://searx.example/",
+        memory_enabled=True,
+        postgres_url="postgres://u:p@db/x",
+        embedding_model="perplexity/pplx-embed-v1-0.6b",
+    )
+    mem = _fake_memory()
+    extractor = _extractor(ExtractedClaim(subject="Python", predicate="latest_version", object="3.13"))
+    search_web = _find(build_tools(cfg, memory=mem, extractor=extractor), "search_web")
+    response = MagicMock()
+    response.json.return_value = {
+        "results": [
+            {"content": "Python 3.13 is out", "url": "https://www.python.org/downloads"},
+            {"content": "Python 3.13 is out", "url": "https://blog.example.com/post"},
+        ]
+    }
+    _, manager = _mock_async_client(response)
+
+    with patch("bot.tools.httpx.AsyncClient", return_value=manager):
+        result = await search_web("python version")
+
+    # Domains surfaced to the model as provenance.
+    assert "[python.org]" in result and "[blog.example.com]" in result
+    # Each result ingested as a secondary-tier web claim attributed to its domain.
+    assert mem.add_claim.await_count == 2
+    by_domain = {c.kwargs["source_name"]: c.kwargs for c in mem.add_claim.await_args_list}
+    assert set(by_domain) == {"python.org", "blog.example.com"}
+    for kw in by_domain.values():
+        assert kw["source_kind"] == "web"
+        assert kw["trust_tier"] == "secondary"
+        assert kw.get("author") is None  # web claims have no author
+
+
+@pytest.mark.anyio
+async def test_search_web_skips_ingestion_when_disabled(make_config):
+    cfg = make_config(
+        searxng_url="https://searx.example/",
+        memory_enabled=True,
+        postgres_url="postgres://u:p@db/x",
+        embedding_model="perplexity/pplx-embed-v1-0.6b",
+        memory_ingest_web=False,
+    )
+    mem = _fake_memory()
+    extractor = _extractor()
+    search_web = _find(build_tools(cfg, memory=mem, extractor=extractor), "search_web")
+    response = MagicMock()
+    response.json.return_value = {"results": [{"content": "x", "url": "https://python.org/"}]}
+    _, manager = _mock_async_client(response)
+
+    with patch("bot.tools.httpx.AsyncClient", return_value=manager):
+        await search_web("q")
+
+    mem.add_claim.assert_not_awaited()
+    extractor.assert_not_awaited()
 
 
 def test_search_users_formats_results_and_clamps_limit(config):
