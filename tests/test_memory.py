@@ -8,6 +8,7 @@ from bot.memory import (
     RecalledClaim,
     _vector_literal,
     is_stale,
+    merge_aliases,
     normalize_predicate,
     render_claim,
     resolve_conflict,
@@ -89,6 +90,16 @@ def test_resolve_conflict_breaks_ties_by_trust_then_recency():
         ]
         == "F"
     )
+
+
+def test_merge_aliases_unions_dedupes_and_drops_keeper_name():
+    out = merge_aliases("Python", ["py"], "python", ["CPython", "py", "Python3"])
+    # dup canonical "python" == keeper's name (case-insensitive) -> dropped; "py" deduped.
+    assert out == ["py", "CPython", "Python3"]
+
+
+def test_merge_aliases_from_empty_keeper():
+    assert merge_aliases("X", [], "Y", []) == ["Y"]
 
 
 def test_recalled_claim_carries_provenance():

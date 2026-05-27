@@ -112,6 +112,25 @@ def resolve_conflict(claims: list[dict]) -> dict:
     return max(claims, key=_conflict_sort_key)
 
 
+def merge_aliases(
+    keep_canonical: str, keep_aliases: list[str], dup_canonical: str, dup_aliases: list[str]
+) -> list[str]:
+    """Alias list for an entity that absorbs a duplicate (consolidation helper).
+
+    The duplicate's canonical name and aliases become aliases of the keeper, deduped
+    (case-insensitive) and excluding the keeper's own canonical name. Pure / DB-free.
+    """
+    merged: list[str] = []
+    seen: set[str] = {keep_canonical.lower()}
+    for alias in [*keep_aliases, dup_canonical, *dup_aliases]:
+        key = (alias or "").strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        merged.append(alias)
+    return merged
+
+
 def _vector_literal(vec: list[float]) -> str:
     """Render an embedding as a pgvector text literal (e.g. '[0.1,0.2,...]').
 
@@ -165,6 +184,15 @@ class ClaimWriteResult:
     superseded_claim_id: Optional[int]
     subject: str
     predicate: str
+
+
+@dataclass
+class EntityNeighbor:
+    """A pair of entities and their cosine similarity (for threshold calibration)."""
+
+    name_a: str
+    name_b: str
+    similarity: float
 
 
 class MemoryStore:
@@ -461,6 +489,13 @@ class MemoryStore:
 
                 promoted = await self._recompute_corroboration(conn, subject_entity_id, predicate, object_text)
 
+        if promoted:
+            logfire.info(
+                "Claim promoted to believed (corroborated)",
+                subject=subject,
+                predicate=predicate,
+                trust_tier=trust_tier,
+            )
         status = "believed" if promoted else "asserted"
         return ClaimWriteResult(
             stored=True,
@@ -487,7 +522,8 @@ class MemoryStore:
         count = await conn.fetchval(
             "SELECT count(DISTINCT source_id) FROM knowledge_claim "
             "WHERE subject_entity_id = $1 AND predicate = $2 AND lower(object_text) = lower($3) "
-            "AND retracted_at IS NULL AND superseded_by IS NULL AND trust_tier = ANY($4)",
+            "AND retracted_at IS NULL AND superseded_by IS NULL AND status <> 'disputed' "
+            "AND trust_tier = ANY($4)",
             subject_entity_id,
             predicate,
             object_text,
@@ -654,6 +690,192 @@ class MemoryStore:
 
         recalled.sort(key=lambda r: r.similarity, reverse=True)
         return recalled[:k]
+
+    # --- Maintenance (M4) --------------------------------------------------------
+
+    async def _merge_entity(self, conn: _Conn, keep: int, dup: int) -> None:
+        """Fold entity ``dup`` into ``keep``: repoint claims, union aliases, delete dup."""
+        await conn.execute("UPDATE knowledge_claim SET subject_entity_id = $1 WHERE subject_entity_id = $2", keep, dup)
+        await conn.execute("UPDATE knowledge_claim SET object_entity_id = $1 WHERE object_entity_id = $2", keep, dup)
+        krow = await conn.fetchrow("SELECT canonical_name, aliases FROM knowledge_entity WHERE id = $1", keep)
+        drow = await conn.fetchrow("SELECT canonical_name, aliases FROM knowledge_entity WHERE id = $1", dup)
+        assert krow is not None and drow is not None
+        new_aliases = merge_aliases(
+            krow["canonical_name"], list(krow["aliases"] or []), drow["canonical_name"], list(drow["aliases"] or [])
+        )
+        await conn.execute("UPDATE knowledge_entity SET aliases = $1 WHERE id = $2", new_aliases, keep)
+        await conn.execute("DELETE FROM knowledge_entity WHERE id = $1", dup)
+        logfire.info("Merged duplicate entity", keep_id=keep, dup_id=dup, dup_name=drow["canonical_name"])
+
+    @logfire.instrument()
+    async def consolidate(self) -> dict[str, int]:
+        """Merge near-duplicate entities, then recompute corroboration everywhere.
+
+        Entities within ``entity_match_threshold`` cosine similarity are folded into the
+        lowest-id keeper (claims repointed, aliases unioned, duplicate deleted). Afterwards
+        every live promotable-tier subject+predicate+object group is re-evaluated, so a
+        merge that newly satisfies the corroboration threshold promotes to ``believed``
+        (and one that no longer does is demoted). Returns a summary for the CLI/logs.
+        """
+        merged_entities = 0
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                entities = await conn.fetch("SELECT id, embedding::text AS emb FROM knowledge_entity ORDER BY id")
+                merged_away: set[int] = set()
+                max_dist = 1.0 - self._config.entity_match_threshold
+                for ent in entities:
+                    if ent["id"] in merged_away:
+                        continue
+                    dups = await conn.fetch(
+                        "SELECT id FROM knowledge_entity WHERE id <> $1 AND embedding <=> $2::vector <= $3",
+                        ent["id"],
+                        ent["emb"],
+                        max_dist,
+                    )
+                    for d in dups:
+                        if d["id"] <= ent["id"] or d["id"] in merged_away:
+                            continue  # keep the lowest id; lower-id matches were handled already
+                        await self._merge_entity(conn, keep=ent["id"], dup=d["id"])
+                        merged_away.add(d["id"])
+                        merged_entities += 1
+
+                groups = await conn.fetch(
+                    "SELECT DISTINCT subject_entity_id, predicate, object_text FROM knowledge_claim "
+                    "WHERE retracted_at IS NULL AND superseded_by IS NULL AND status <> 'disputed' "
+                    "AND trust_tier = ANY($1)",
+                    list(PROMOTABLE_TIERS),
+                )
+                for g in groups:
+                    await self._recompute_corroboration(conn, g["subject_entity_id"], g["predicate"], g["object_text"])
+
+        summary = {"merged_entities": merged_entities, "groups_recomputed": len(groups)}
+        logfire.info("Consolidation complete", summary=summary)
+        return summary
+
+    @logfire.instrument()
+    async def detect_contradictions(self) -> dict[str, int]:
+        """Flag same-subject+predicate disagreements as ``disputed`` (and self-heal).
+
+        For each live subject+predicate group: if two or more distinct object values
+        coexist it's a contradiction — every live claim in the group is marked
+        ``disputed`` (never deleted), which both demotes any ``believed`` value and drops
+        the group from corroboration counting until it's resolved. If a previously-disputed
+        group now has a single value, the flag is cleared back to ``asserted`` and the value
+        re-evaluated for promotion. Overlapping validity is approximated as "both live"
+        (claims rarely set ``valid_to``). Conservative by design: it surfaces conflict, it
+        does not pick a winner — the read path still does that.
+        """
+        conflicting = 0
+        cleared = 0
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                groups = await conn.fetch(
+                    "SELECT subject_entity_id, predicate, "
+                    "count(DISTINCT lower(object_text)) AS values, "
+                    "count(*) FILTER (WHERE status = 'disputed') AS disputed "
+                    "FROM knowledge_claim WHERE retracted_at IS NULL AND superseded_by IS NULL "
+                    "GROUP BY subject_entity_id, predicate"
+                )
+                for g in groups:
+                    if g["values"] >= 2:
+                        await conn.execute(
+                            "UPDATE knowledge_claim SET status = 'disputed' "
+                            "WHERE subject_entity_id = $1 AND predicate = $2 AND retracted_at IS NULL "
+                            "AND superseded_by IS NULL AND status <> 'disputed'",
+                            g["subject_entity_id"],
+                            g["predicate"],
+                        )
+                        conflicting += 1
+                        logfire.info(
+                            "Contradiction flagged",
+                            subject_entity_id=g["subject_entity_id"],
+                            predicate=g["predicate"],
+                            distinct_values=g["values"],
+                        )
+                    elif g["disputed"] > 0:
+                        # Conflict resolved (one value remains) — clear the flag and re-promote.
+                        await conn.execute(
+                            "UPDATE knowledge_claim SET status = 'asserted' "
+                            "WHERE subject_entity_id = $1 AND predicate = $2 AND retracted_at IS NULL "
+                            "AND superseded_by IS NULL AND status = 'disputed'",
+                            g["subject_entity_id"],
+                            g["predicate"],
+                        )
+                        obj = await conn.fetchval(
+                            "SELECT object_text FROM knowledge_claim WHERE subject_entity_id = $1 "
+                            "AND predicate = $2 AND retracted_at IS NULL AND superseded_by IS NULL LIMIT 1",
+                            g["subject_entity_id"],
+                            g["predicate"],
+                        )
+                        if obj is not None:
+                            await self._recompute_corroboration(conn, g["subject_entity_id"], g["predicate"], obj)
+                        cleared += 1
+
+        summary = {"conflicting_groups": conflicting, "cleared_groups": cleared}
+        logfire.info("Contradiction detection complete", summary=summary)
+        return summary
+
+    async def entity_neighbors(self, limit: int = 50, min_similarity: float = 0.5) -> list[EntityNeighbor]:
+        """Most-similar entity pairs in the store, for calibrating ``entity_match_threshold``.
+
+        For each entity, finds its single nearest other entity (by cosine), drops pairs
+        below ``min_similarity``, dedupes symmetric pairs, and returns them most-similar
+        first (capped at ``limit``). The top of this list is where true duplicates and
+        genuinely-distinct entities meet — set the threshold just above the most-similar
+        pair that should stay separate.
+        """
+        max_dist = 1.0 - min_similarity
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT e.id AS a_id, e.canonical_name AS a, n.id AS b_id, n.name AS b, n.dist AS dist
+                FROM knowledge_entity e
+                CROSS JOIN LATERAL (
+                    SELECT o.id, o.canonical_name AS name, o.embedding <=> e.embedding AS dist
+                    FROM knowledge_entity o
+                    WHERE o.id <> e.id
+                    ORDER BY o.embedding <=> e.embedding
+                    LIMIT 1
+                ) n
+                WHERE n.dist <= $1
+                ORDER BY n.dist
+                """,
+                max_dist,
+            )
+        seen: set[tuple[int, int]] = set()
+        pairs: list[EntityNeighbor] = []
+        for r in rows:
+            key = (min(int(r["a_id"]), int(r["b_id"])), max(int(r["a_id"]), int(r["b_id"])))
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs.append(EntityNeighbor(name_a=r["a"], name_b=r["b"], similarity=1.0 - float(r["dist"])))
+            if len(pairs) >= limit:
+                break
+        return pairs
+
+    async def stats(self) -> dict[str, object]:
+        """Snapshot counts for observability (entities, sources, claims by status/tier)."""
+        async with self._pool.acquire() as conn:
+            entities = await conn.fetchval("SELECT count(*) FROM knowledge_entity")
+            sources = await conn.fetchval("SELECT count(*) FROM knowledge_source")
+            live = "retracted_at IS NULL AND superseded_by IS NULL"
+            by_status = await conn.fetch(
+                f"SELECT status, count(*) AS n FROM knowledge_claim WHERE {live} GROUP BY status ORDER BY status"
+            )
+            by_tier = await conn.fetch(
+                f"SELECT trust_tier, count(*) AS n FROM knowledge_claim WHERE {live} GROUP BY trust_tier"
+            )
+            retracted = await conn.fetchval("SELECT count(*) FROM knowledge_claim WHERE retracted_at IS NOT NULL")
+            superseded = await conn.fetchval("SELECT count(*) FROM knowledge_claim WHERE superseded_by IS NOT NULL")
+        return {
+            "entities": int(entities or 0),
+            "sources": int(sources or 0),
+            "live_by_status": {r["status"]: int(r["n"]) for r in by_status},
+            "live_by_tier": {r["trust_tier"]: int(r["n"]) for r in by_tier},
+            "retracted": int(retracted or 0),
+            "superseded": int(superseded or 0),
+        }
 
     # --- Migration ---------------------------------------------------------------
 

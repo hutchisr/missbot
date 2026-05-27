@@ -11,6 +11,12 @@ uv sync
 # Run
 uv run python -m bot -c config.local.yaml   # or: mise run bot
 
+# World-knowledge maintenance (M4/M5) — out-of-process, also run by a k8s CronJob
+uv run python -m bot.maintenance run-all -c config.local.yaml          # consolidate + detect contradictions
+uv run python -m bot.maintenance retract-source -c config.local.yaml --name evil.example --kind web
+uv run python -m bot.maintenance stats -c config.local.yaml
+uv run python -m bot.maintenance calibrate-entities -c config.local.yaml   # tune entity_match_threshold
+
 # Lint & format
 uv run ruff check bot/
 uv run ruff format --check bot/
@@ -35,7 +41,8 @@ mise run deploy     # Apply K8s manifests and restart
 | `bot/tools.py` | `build_tools()` factory — datetime, web search, search_users/notes, social credit tools; `apply_social_credit()` helper |
 | `bot/scoring.py` | Injection-resistant message classifier: `build_scoring_spec()` turns `Config.social_credit_categories` into the constrained output type + delta map + hardened instructions; `build_scoring_prompt()` fences untrusted input |
 | `bot/extract.py` | Injection-resistant claim extractor: `ClaimExtraction` discriminated union (`ExtractedClaim` \| `Skip`) + `EXTRACTION_INSTRUCTIONS` + `build_extraction_prompt()`. The admission gate that structures a submitted fact into a typed subject/predicate/object claim or rejects it |
-| `bot/memory.py` | `MemoryStore` — Postgres/pgvector world-knowledge store: `source`/`entity`/`claim` tables, entity resolution, supersession, corroboration-based promotion, read-time conflict resolution + provenance, source retraction, legacy migration. Pure helpers (`resolve_conflict`, `tier_rank`, `is_stale`, `normalize_predicate`) are DB-free and unit-tested. Only built when `memory_enabled` |
+| `bot/memory.py` | `MemoryStore` — Postgres/pgvector world-knowledge store: `source`/`entity`/`claim` tables, entity resolution, supersession, corroboration-based promotion, read-time conflict resolution + provenance, source retraction, **M4 maintenance** (`consolidate`, `detect_contradictions`, `stats`), legacy migration. Pure helpers (`resolve_conflict`, `tier_rank`, `is_stale`, `normalize_predicate`, `merge_aliases`) are DB-free and unit-tested. Only built when `memory_enabled` |
+| `bot/maintenance.py` | Out-of-process maintenance/admin CLI (`python -m bot.maintenance`): `consolidate`, `detect-contradictions`, `run-all`, `retract-source`, `stats`, `calibrate-entities` (prints nearest-neighbor entity pairs + similarity to tune `entity_match_threshold`). Builds a one-shot `MemoryStore`; driven by a k8s CronJob (`k8s/maintenance.yaml`) |
 | `bot/net.py` | `is_safe_media_url()` — SSRF guard for attacker-supplied image URLs (blocks private/reserved IPs and internal hosts) |
 | `bot/mcp.py` | `build_mcp_toolsets()` + `gate_names()` — streamable-HTTP MCP servers with allow/block and gate filtering |
 | `bot/api.py` | HTTP client utilities |
@@ -69,7 +76,7 @@ Optional fields:
 - `channel`, `debug`
 
 ### World-knowledge store
-Global (non-user-specific) knowledge backed by Postgres + the `pgvector` extension. **It never stores bare facts** — every row is a *claim* bound to a source and a time. **Stage 1 (M1–M3): write path with quarantine + provenance, entity resolution, corroboration-based promotion, and a conflict-resolving read path. M4 (maintenance CronJobs) and M5 (retraction CLI + observability) are not built yet.** Per-user memory is also still planned. Off unless `memory_enabled: true`. Config fields:
+Global (non-user-specific) knowledge backed by Postgres + the `pgvector` extension. **It never stores bare facts** — every row is a *claim* bound to a source and a time. **Built: M1–M3 (write path with quarantine + provenance, entity resolution, corroboration-based promotion, conflict-resolving read path); M4 consolidation + contradiction detection; M5 retraction CLI + Logfire decision tracing.** M4 decay and re-verification are intentionally not built; per-user memory is still planned. Off unless `memory_enabled: true`. Config fields:
 - `postgres_url` (required when enabled): Postgres DSN; the server must have the `vector` extension available. `MemoryStore.create()` runs `CREATE EXTENSION/TABLE IF NOT EXISTS`, then migrates any legacy `global_memory` rows on startup
 - `embedding_model` (required when enabled): embedding model id, e.g. `perplexity/pplx-embed-v1-0.6b`
 - `embedding_dim` (default `1024`): vector dimension; **must** match the model and the `knowledge_claim.embedding` / `knowledge_entity.embedding vector(N)` columns. Startup fails fast if an existing column's dimension disagrees (changing models means re-embedding every row). pplx-embed-v1-0.6b is 1024
@@ -95,6 +102,8 @@ All three pass through the same `bot/extract.py` admission gate, so web/note tex
 **Data model.** `knowledge_source` (`name`, `kind` = web|doc|user|model, `default_trust_tier`); `knowledge_entity` (`canonical_name`, `aliases`, `embedding`); `knowledge_claim` (`subject_entity_id`, `predicate`, `object_text`, `source_id`, `trust_tier`, `confidence`, `status` = asserted|believed|disputed|retracted, bitemporal `valid_from`/`valid_to` + `recorded_at`, `superseded_by`/`superseded_at`, `retracted_at`, `corroboration_count`, `volatility`, `embedding`, `author`/`source_note_id` provenance). Trust tiers rank `model_quarantine` < `user` < `secondary` < `primary`; only `secondary`/`primary` are promotable (`PROMOTABLE_TIERS`).
 
 **Safety core (enforced in code):** (1) no bare facts — every claim has a source + time; (2) **model output is quarantined** — `remember_fact` writes at `model_quarantine` and can never auto-promote to `believed`; (3) append-only — updates supersede, never overwrite; (4) promotion needs `corroboration_threshold` independent tier-≥`secondary` sources; (5) conflicts resolved at *read* time (`resolve_conflict`: believed > asserted, then trust tier, then recency), never collapsed at write; (6) provenance always rides along with recalled claims; (7) volatile claims past TTL are flagged stale; (8) `MemoryStore.retract_source()` tombstones every claim from a source and recomputes corroboration everywhere. Writes are rate-limited per author and deduped; the submitted fact passes the `bot/extract.py` admission gate (typed claim or `Skip`); recalled claims reach the model fenced as untrusted data (`_fence_untrusted` in `bot/tools.py`). The embedding model emits **unnormalized** vectors, so all comparisons use cosine distance (`<=>`).
+
+**Maintenance (M4/M5).** Run out-of-process via `python -m bot.maintenance` (the `missbot-maintenance` k8s CronJob runs `run-all` daily). *Consolidation* (`consolidate`) folds near-duplicate entities (within `entity_match_threshold`) into the lowest-id keeper — repointing claims, unioning aliases — then recomputes corroboration everywhere (so a merge can newly promote/demote). *Contradiction detection* (`detect_contradictions`) marks every live claim in a subject+predicate group with ≥2 distinct object values as `disputed` (never deletes; just demotes and excludes them from corroboration until resolved), and clears the flag when a group narrows back to one value. `disputed` claims don't count toward corroboration. Decay and active re-verification are deliberately not implemented. `stats` prints store counts for observability; promotion/merge/contradiction/retraction decisions are traced to Logfire.
 
 ### MCP servers
 Each entry in `mcp_servers` takes:
