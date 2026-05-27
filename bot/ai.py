@@ -23,7 +23,13 @@ from pydantic_ai.providers.openai import OpenAIProvider
 import logfire
 from redis.asyncio import Redis
 
-from .extract import EXTRACTION_INSTRUCTIONS, ClaimExtraction, ExtractedClaim, build_extraction_prompt
+from .extract import (
+    EXTRACTION_INSTRUCTIONS,
+    ClaimExtraction,
+    ExtractedClaim,
+    build_extraction_prompt,
+    looks_sensitive,
+)
 from .mcp import build_mcp_toolsets, gate_names
 from .memory import MemoryStore
 from .models import Config, CustomOpenAIModel, Note, User
@@ -473,18 +479,20 @@ class ChatAgent:
         self._auto_history.append(result.output)
         return result.output
 
-    async def _extract_claim(self, fact: str) -> Optional[ClaimExtraction]:
+    async def _extract_claim(self, fact: str, speaker: Optional[str] = None) -> Optional[ClaimExtraction]:
         """Run the claim extractor over a submitted fact for the world-knowledge store.
 
-        Returns an ``ExtractedClaim``, a ``Skip`` (rejection with a reason), or None if
-        the classifier itself failed. Never raises — a failed extraction just means the
-        fact isn't stored; it must not break the reply path.
+        ``speaker`` lets the extractor resolve first-person references to that handle (used
+        by the note-ingestion path so a user's self-statement is attributed to them).
+        Returns an ``ExtractedClaim``, a ``Skip`` (rejection with a reason), or None if the
+        classifier itself failed. Never raises — a failed extraction just means the fact
+        isn't stored; it must not break the reply path.
         """
         if self._extract_agent is None:
             return None
         try:
             result = await self._extract_agent.run(
-                build_extraction_prompt(fact),
+                build_extraction_prompt(fact, speaker=speaker),
                 model_settings={"timeout": 60.0},
             )
         except Exception:
@@ -497,10 +505,12 @@ class ChatAgent:
 
         Deterministic provenance: the source is the note's author (kind=user, `user`
         tier), set by code — not by anything the model says. A `user`-tier claim can
-        never be promoted to 'believed' on its own, but it's attributable and
-        retractable by author. The extractor's Skip branch drops chatter, opinions, and
-        personal details, so only genuine world-fact assertions are stored. Rate-limited
-        per author by ``global_write_cooldown``. Never raises — must not break the reply.
+        never be promoted to 'believed' on its own, but it's attributable and retractable
+        by author. The author's handle is passed to the extractor so a self-statement
+        ("I use Arch") resolves to a claim about them. Durable personal facts are allowed,
+        but the extractor skips sensitive info and a ``looks_sensitive`` backstop drops any
+        obvious PII (email/phone/IDs) that slips through. Rate-limited per author by
+        ``global_write_cooldown``. Never raises — must not break the reply.
         """
         if (
             self._memory is None
@@ -520,8 +530,13 @@ class ChatAgent:
                 if since is not None and since < cooldown:
                     logfire.debug("Note ingestion skipped (write cooldown)", author=author)
                     return
-            extracted = await self._extract_claim(text)
+            extracted = await self._extract_claim(text, speaker=author)
             if not isinstance(extracted, ExtractedClaim):
+                return
+            # Backstop behind the extractor's sensitivity judgement: never store obvious
+            # PII, even if the model judged it storable.
+            if looks_sensitive(extracted.object) or looks_sensitive(extracted.subject):
+                logfire.info("Note claim dropped (sensitive-PII backstop)", author=author)
                 return
             await self._memory.add_claim(
                 subject=extracted.subject,

@@ -86,10 +86,10 @@ Global (non-user-specific) knowledge backed by Postgres + the `pgvector` extensi
 
 **Source determination (by channel, never by model self-report).** A claim's `source`/`trust_tier` is assigned by code based on where the text provably came from, since the model is an unreliable narrator of its own provenance:
 - **Web** — `search_web` (now async) parses each result's domain and ingests it as `kind=web`, `secondary` tier (`bot/tools.py:_ingest_web_results`). Distinct domains agreeing is what lets a claim reach `believed`.
-- **User note** — `ChatAgent._maybe_ingest_note` extracts a claim from the author's note and stores it as `kind=user`, `user` tier, sourced to the author handle (deterministic; never promotable alone, but attributable + retractable by author).
+- **User note** — `ChatAgent._maybe_ingest_note` extracts a claim from the author's note and stores it as `kind=user`, `user` tier, sourced to the author handle (deterministic; never promotable alone, but attributable + retractable by author). The author handle is passed to the extractor so a self-statement ("I use Arch") resolves to a claim about them. Durable **personal** facts about a named person are allowed, but the extractor skips sensitive categories and a `looks_sensitive` code backstop drops any obvious PII (email/phone/IDs) that slips through.
 - **Model** — `remember_fact` (model decides to remember) → `kind=model`, `model_quarantine`.
 
-All three pass through the same `bot/extract.py` admission gate, so web/note text that isn't a durable, entity-bound fact is `Skip`ped.
+All three pass through the same `bot/extract.py` admission gate, so web/note text that isn't a durable, entity-bound fact is `Skip`ped. Personal facts are scoped only by tier/provenance, not by who's asking — recall is global (per-user-scoped recall is the planned per-user memory).
 
 **Data model.** `knowledge_source` (`name`, `kind` = web|doc|user|model, `default_trust_tier`); `knowledge_entity` (`canonical_name`, `aliases`, `embedding`); `knowledge_claim` (`subject_entity_id`, `predicate`, `object_text`, `source_id`, `trust_tier`, `confidence`, `status` = asserted|believed|disputed|retracted, bitemporal `valid_from`/`valid_to` + `recorded_at`, `superseded_by`/`superseded_at`, `retracted_at`, `corroboration_count`, `volatility`, `embedding`, `author`/`source_note_id` provenance). Trust tiers rank `model_quarantine` < `user` < `secondary` < `primary`; only `secondary`/`primary` are promotable (`PROMOTABLE_TIERS`).
 

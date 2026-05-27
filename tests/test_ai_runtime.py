@@ -339,3 +339,44 @@ async def test_run_note_ingestion_disabled_by_flag(make_config, make_note):
     # Flag off => the ingestion path returns before extracting or writing.
     extract_mock.assert_not_awaited()
     mem.add_claim.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_run_note_ingestion_passes_speaker_to_extractor(make_config, make_note):
+    mem = AsyncMock()
+    mem.seconds_since_last_write.return_value = None
+    agent = ChatAgent(_memory_cfg(make_config), memory=mem)
+    note = make_note(text="I use Arch btw")  # author = alice
+    claim = ExtractedClaim(subject="alice", predicate="os", object="Arch Linux")
+
+    with (
+        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
+        patch.object(
+            agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=claim))
+        ) as extract_mock,
+    ):
+        await agent.run(note)
+
+    # The author's handle is plumbed into the extraction prompt so "I" resolves to them.
+    prompt = extract_mock.await_args.args[0]
+    assert "@alice" in prompt
+    mem.add_claim.assert_awaited_once()
+    assert mem.add_claim.await_args.kwargs["subject"] == "alice"
+
+
+@pytest.mark.anyio
+async def test_run_note_ingestion_drops_sensitive_pii(make_config, make_note):
+    mem = AsyncMock()
+    mem.seconds_since_last_write.return_value = None
+    agent = ChatAgent(_memory_cfg(make_config), memory=mem)
+    note = make_note(text="my email is alice@example.com")
+    # Even if the extractor judged it storable, the code backstop must block obvious PII.
+    claim = ExtractedClaim(subject="alice", predicate="email", object="alice@example.com")
+
+    with (
+        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
+        patch.object(agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=claim))),
+    ):
+        await agent.run(note)
+
+    mem.add_claim.assert_not_awaited()
