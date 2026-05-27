@@ -380,3 +380,28 @@ async def test_run_note_ingestion_drops_sensitive_pii(make_config, make_note):
         await agent.run(note)
 
     mem.add_claim.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_run_note_ingestion_supplies_thread_context(make_config, make_note):
+    mem = AsyncMock()
+    mem.seconds_since_last_write.return_value = None
+    agent = ChatAgent(_memory_cfg(make_config), memory=mem)
+    parent = make_note(id="note-0", text="I have a pet lizard")  # earlier note by alice
+    note = make_note(id="note-1", text="her name is Olive")  # follow-up by alice
+    claim = ExtractedClaim(subject="alice's lizard", predicate="name", object="Olive")
+
+    with (
+        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
+        patch.object(
+            agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=claim))
+        ) as extract_mock,
+    ):
+        await agent.run(note, context=[parent])
+
+    # The prior note rides along as reference context so "her" can resolve to the lizard.
+    prompt = extract_mock.await_args.args[0]
+    assert "I have a pet lizard" in prompt
+    assert "her name is Olive" in prompt
+    assert "@alice" in prompt
+    mem.add_claim.assert_awaited_once()

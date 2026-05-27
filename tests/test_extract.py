@@ -66,6 +66,19 @@ def test_build_extraction_prompt_includes_speaker_resolution():
     assert "@alice" not in build_extraction_prompt("I use Arch btw")
 
 
+def test_build_extraction_prompt_includes_thread_context():
+    prompt = build_extraction_prompt(
+        "her name is Olive",
+        speaker="alice",
+        context=["alice: I have a pet lizard"],
+    )
+    assert "her name is Olive" in prompt  # target message
+    assert "I have a pet lizard" in prompt  # prior thread supplied for reference
+    assert "@alice" in prompt
+    # Context is reference-only — the extractor must not mine separate claims from it.
+    assert "do NOT extract separate claims" in prompt
+
+
 def test_looks_sensitive_flags_obvious_pii():
     assert looks_sensitive("reach me at bob@example.com")
     assert looks_sensitive("call 555-123-4567")

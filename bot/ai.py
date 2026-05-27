@@ -395,7 +395,7 @@ class ChatAgent:
         result, _, _ = await asyncio.gather(
             self._agent.run(prompt, **run_kwargs),
             self._maybe_score_message(note),
-            self._maybe_ingest_note(note),
+            self._maybe_ingest_note(note, context),
         )
         return result.output
 
@@ -479,11 +479,14 @@ class ChatAgent:
         self._auto_history.append(result.output)
         return result.output
 
-    async def _extract_claim(self, fact: str, speaker: Optional[str] = None) -> Optional[ClaimExtraction]:
+    async def _extract_claim(
+        self, fact: str, speaker: Optional[str] = None, context: Optional[list[str]] = None
+    ) -> Optional[ClaimExtraction]:
         """Run the claim extractor over a submitted fact for the world-knowledge store.
 
         ``speaker`` lets the extractor resolve first-person references to that handle (used
         by the note-ingestion path so a user's self-statement is attributed to them).
+        ``context`` is the prior thread (reference-only) so cross-note references resolve.
         Returns an ``ExtractedClaim``, a ``Skip`` (rejection with a reason), or None if the
         classifier itself failed. Never raises — a failed extraction just means the fact
         isn't stored; it must not break the reply path.
@@ -492,7 +495,7 @@ class ChatAgent:
             return None
         try:
             result = await self._extract_agent.run(
-                build_extraction_prompt(fact, speaker=speaker),
+                build_extraction_prompt(fact, speaker=speaker, context=context),
                 model_settings={"timeout": 60.0},
             )
         except Exception:
@@ -500,14 +503,16 @@ class ChatAgent:
             return None
         return result.output
 
-    async def _maybe_ingest_note(self, note: Note) -> None:
+    async def _maybe_ingest_note(self, note: Note, context: Optional[list[Note]] = None) -> None:
         """Learn a world-fact claim from the author's note, sourced to the author.
 
         Deterministic provenance: the source is the note's author (kind=user, `user`
         tier), set by code — not by anything the model says. A `user`-tier claim can
         never be promoted to 'believed' on its own, but it's attributable and retractable
         by author. The author's handle is passed to the extractor so a self-statement
-        ("I use Arch") resolves to a claim about them. Durable personal facts are allowed,
+        ("I use Arch") resolves to a claim about them, and the prior thread (``context``)
+        is supplied as reference-only material so cross-note references resolve (e.g. "her
+        name is Olive" after "I have a pet lizard"). Durable personal facts are allowed,
         but the extractor skips sensitive info and a ``looks_sensitive`` backstop drops any
         obvious PII (email/phone/IDs) that slips through. Rate-limited per author by
         ``global_write_cooldown``. Never raises — must not break the reply.
@@ -523,6 +528,15 @@ class ChatAgent:
         if not text:
             return
         author = normalize_username(_user_handle(note.user))
+        # Render the prior thread chronologically as reference-only context. `context` is
+        # newest-first (as built for message_history), so reverse it.
+        context_lines: list[str] = []
+        for c in reversed(context or []):
+            ctext = (c.text or "").strip()
+            if not ctext:
+                continue
+            handle = self._config.bot_username if c.userId == self._config.bot_user_id else _user_handle(c.user)
+            context_lines.append(f"{handle}: {ctext}")
         try:
             cooldown = self._config.global_write_cooldown
             if cooldown > 0:
@@ -530,7 +544,7 @@ class ChatAgent:
                 if since is not None and since < cooldown:
                     logfire.debug("Note ingestion skipped (write cooldown)", author=author)
                     return
-            extracted = await self._extract_claim(text, speaker=author)
+            extracted = await self._extract_claim(text, speaker=author, context=context_lines or None)
             if not isinstance(extracted, ExtractedClaim):
                 return
             # Backstop behind the extractor's sensitivity judgement: never store obvious
