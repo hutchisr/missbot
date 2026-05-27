@@ -251,6 +251,37 @@ async def test_on_mention_processes_image_only_note(bot, make_note):
 
 
 @pytest.mark.anyio
+async def test_on_mention_ignores_direct_messages(bot, make_note):
+    """DMs (Misskey 'specified' visibility) are skipped by default — no run, no reply."""
+    note = make_note(text="psst, just between us").model_copy(update={"visibility": "specified"})
+
+    with (
+        patch.object(bot._agent, "run", AsyncMock()) as run_mock,
+        patch.object(bot, "send_note", AsyncMock()) as send_note_mock,
+    ):
+        await bot.on_mention(note)
+
+    run_mock.assert_not_awaited()
+    send_note_mock.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_on_mention_handles_dm_when_enabled(make_config, make_note):
+    """With ignore_direct_messages=False the bot replies to DMs like any other note."""
+    bot = Bot(config=make_config(ignore_direct_messages=False))
+    note = make_note(text="hi privately").model_copy(update={"visibility": "specified"})
+
+    with (
+        patch.object(bot._agent, "run", AsyncMock(return_value="dm reply")) as run_mock,
+        patch.object(bot, "send_note", AsyncMock()) as send_note_mock,
+    ):
+        await bot.on_mention(note)
+
+    run_mock.assert_awaited_once_with(note=note, context=[])
+    send_note_mock.assert_awaited_once_with("dm reply", in_reply_to=note)
+
+
+@pytest.mark.anyio
 async def test_on_auto_reply_updates_timestamp_and_triggers_reply(make_config, fake_redis, make_note):
     cfg = make_config(auto_reply_interval=5, auto_reply_jitter=0)
     bot = Bot(config=cfg, redis_client=fake_redis)

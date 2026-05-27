@@ -69,6 +69,11 @@ class Bot:
         if note.user.id == self.user_id:
             logfire.debug("Ignoring own mention")
             return
+        # The bot is designed for public-timeline threads; don't engage with direct
+        # messages (Misskey 'specified' visibility) unless explicitly configured to.
+        if self._config.ignore_direct_messages and note.visibility == "specified":
+            logfire.info("Ignoring direct message", note_id=note.id)
+            return
         if not self._note_has_prompt_content(note):
             logfire.info("Skipping note without text or supported images", note_id=note.id)
             return

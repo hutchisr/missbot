@@ -61,6 +61,7 @@ Optional fields:
 - `social_credit_categories`: list of sentiment buckets the classifier may assign, each `{name, delta, description}`. The model only picks a `name` (constrained output); code applies the matching `delta`, so configurability never lets the model choose the number. Defaults to the built-in toxic(−10)/rude(−5)/neutral(0)/good(+5)/exceptional(+10) set. Names must be unique (case-insensitive); `description` is shown to the classifier
 - `social_credit_unrestricted_user_ids`: list of user ids; when the note's author is one of these, the bot may manually adjust any user's score by any amount via `adjust_social_credit` (which is refused for everyone else)
 - `max_context`: parent notes to include (default 1)
+- `ignore_direct_messages` (default `true`): skip direct/private messages (Misskey `specified` visibility); the bot is built for public-timeline threads. Set false to also reply to DMs
 - `max_reply_mentions`: cap on total mentions (incl. the author) echoed into a reply (default 5); prevents mention-amplification/harassment relaying
 - `http_timeout_seconds`: HTTP timeout (default 30.0)
 - `mcp_servers`: list of streamable-HTTP MCP servers (see below)
@@ -134,7 +135,7 @@ tools.append(my_tool)
 For tools needing `RunContext`, use the signature `async def my_tool(ctx: RunContext[object], ...) -> str:`.
 
 ### Message flow
-1. WebSocket mention received → `Bot` ignores own mentions
+1. WebSocket mention received → `Bot` ignores own mentions and (by default) direct messages (`specified` visibility)
 2. Reply chain traversed (up to `max_context`) to build `message_history`
 3. Images passed inline via `ImageUrl` when `vision=true` — each URL is SSRF-checked with `bot/net.py:is_safe_media_url` first (attacker-controlled on federated notes); unsafe ones are dropped
 4. `ChatAgent.run()` calls Pydantic AI agent with fallback model

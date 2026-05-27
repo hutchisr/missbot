@@ -264,6 +264,11 @@ class Config(BaseModel):
         "toxic/rude/neutral/good/exceptional set. Names must be unique (case-insensitive).",
     )
     max_context: int = Field(gt=0, default=1, description="Number of context messages to include")
+    ignore_direct_messages: bool = Field(
+        default=True,
+        description="Ignore direct/private messages (Misskey 'specified' visibility) instead of replying. "
+        "The bot is designed for public-timeline threads; set false to also respond to DMs.",
+    )
     max_reply_mentions: int = Field(
         default=5,
         gt=0,
