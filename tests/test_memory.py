@@ -9,6 +9,7 @@ from bot.memory import (
     _vector_literal,
     is_stale,
     merge_aliases,
+    normalize_entity_name,
     normalize_predicate,
     render_claim,
     resolve_conflict,
@@ -100,6 +101,32 @@ def test_merge_aliases_unions_dedupes_and_drops_keeper_name():
 
 def test_merge_aliases_from_empty_keeper():
     assert merge_aliases("X", [], "Y", []) == ["Y"]
+
+
+def test_normalize_entity_name():
+    assert normalize_entity_name("@anemone") == "anemone"
+    assert normalize_entity_name("Hòabìnhian") == "hoabinhian"  # accents stripped
+    assert normalize_entity_name("PGG.Han") == "pgg han"  # punctuation -> space
+    assert normalize_entity_name("Cordillerans") == "cordilleran"  # plural fold
+    assert normalize_entity_name("class") == "class"  # 'ss' is not folded
+
+
+def test_normalize_entity_name_collapses_only_formatting_differences():
+    # Same name, different formatting/accent/punctuation -> same key (safe to merge).
+    assert normalize_entity_name("@anemone") == normalize_entity_name("anemone")
+    assert normalize_entity_name("Hòabìnhian") == normalize_entity_name("Hoabinhian")
+    assert normalize_entity_name("PGG.Han") == normalize_entity_name("PGG Han")
+    # Granularity differences are NOT collapsed (no generic-word stripping).
+    assert normalize_entity_name("Tausug") != normalize_entity_name("Tausug people")
+    assert normalize_entity_name("Hoabinhian") != normalize_entity_name("Hoabinhian culture")
+
+
+def test_normalize_entity_name_keeps_distinct_entities_apart():
+    # The false-merge traps the rule must avoid (validated on real store data).
+    assert normalize_entity_name("Philippines") != normalize_entity_name("Filipinos")
+    assert normalize_entity_name("Native Americans") != normalize_entity_name("Amazonian Native Americans")
+    assert normalize_entity_name("early Austronesians") != normalize_entity_name("early Austronesians (Taiwan)")
+    assert normalize_entity_name("Larena et al.") != normalize_entity_name("Maximilian Larena")  # paper vs author
 
 
 def test_recalled_claim_carries_provenance():

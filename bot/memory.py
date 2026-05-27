@@ -30,6 +30,7 @@ distance (``<=>``).
 
 import os
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Union
@@ -76,6 +77,26 @@ def normalize_predicate(predicate: str) -> str:
     """
     p = re.sub(r"[^a-z0-9]+", "_", (predicate or "").strip().lower()).strip("_")
     return p or "fact"
+
+
+def normalize_entity_name(name: str) -> str:
+    """Canonicalize an entity name for high-precision, embedding-free dedup.
+
+    This is the merge key for the consolidation name pass: strip accents, lowercase, drop a
+    leading ``@``, reduce punctuation to spaces, and apply a light plural fold (drop a
+    trailing ``s`` on tokens longer than 3 chars, but not ``ss``). Two names with the same
+    result differ only in formatting, so merging them is safe. It is deliberately
+    conservative — it only collapses formatting/accent/plural differences ("@anemone" /
+    "anemone"), not granularity differences ("Tausug" / "Tausug people"). A folding miss
+    (e.g. ``-ies`` plurals) only costs recall: a lone mis-stemmed name matches nothing,
+    never the wrong thing.
+    """
+    decomposed = unicodedata.normalize("NFKD", name or "")
+    ascii_ish = "".join(c for c in decomposed if not unicodedata.combining(c))
+    lowered = ascii_ish.strip().lower().lstrip("@")
+    tokens = re.sub(r"[^a-z0-9]+", " ", lowered).split()
+    folded = [t[:-1] if len(t) > 3 and t.endswith("s") and not t.endswith("ss") else t for t in tokens]
+    return " ".join(folded)
 
 
 def render_claim(subject: str, predicate: str, object_text: str) -> str:
@@ -707,38 +728,73 @@ class MemoryStore:
         await conn.execute("DELETE FROM knowledge_entity WHERE id = $1", dup)
         logfire.info("Merged duplicate entity", keep_id=keep, dup_id=dup, dup_name=drow["canonical_name"])
 
+    async def _merge_by_name(self, conn: _Conn) -> int:
+        """Merge entities with the same :func:`normalize_entity_name` into the lowest-id keeper.
+
+        High precision and embedding-free: it only collapses names that differ by
+        formatting/accents/punctuation/plural ("@anemone" / "anemone"). Returns the number
+        of duplicates folded away.
+        """
+        rows = await conn.fetch("SELECT id, canonical_name FROM knowledge_entity ORDER BY id")
+        groups: dict[str, list[int]] = {}
+        for r in rows:
+            key = normalize_entity_name(r["canonical_name"])
+            if key:
+                groups.setdefault(key, []).append(int(r["id"]))
+        merged = 0
+        for ids in groups.values():
+            if len(ids) < 2:
+                continue
+            keep = ids[0]  # lowest id (rows came back id-ascending)
+            for dup in ids[1:]:
+                await self._merge_entity(conn, keep=keep, dup=dup)
+                merged += 1
+        return merged
+
+    async def _merge_by_embedding(self, conn: _Conn) -> int:
+        """Merge entities within ``entity_merge_threshold`` cosine similarity (conservative).
+
+        Secondary to :meth:`_merge_by_name`; this is the destructive, embedding-based pass,
+        so its threshold is deliberately high. Each duplicate is folded into the lowest-id
+        keeper. Returns the number folded away.
+        """
+        entities = await conn.fetch("SELECT id, embedding::text AS emb FROM knowledge_entity ORDER BY id")
+        merged_away: set[int] = set()
+        max_dist = 1.0 - self._config.entity_merge_threshold
+        merged = 0
+        for ent in entities:
+            if ent["id"] in merged_away:
+                continue
+            dups = await conn.fetch(
+                "SELECT id FROM knowledge_entity WHERE id <> $1 AND embedding <=> $2::vector <= $3",
+                ent["id"],
+                ent["emb"],
+                max_dist,
+            )
+            for d in dups:
+                if d["id"] <= ent["id"] or d["id"] in merged_away:
+                    continue  # keep the lowest id; lower-id matches were handled already
+                await self._merge_entity(conn, keep=ent["id"], dup=d["id"])
+                merged_away.add(d["id"])
+                merged += 1
+        return merged
+
     @logfire.instrument()
     async def consolidate(self) -> dict[str, int]:
-        """Merge near-duplicate entities, then recompute corroboration everywhere.
+        """Merge duplicate entities (name pass, then embedding pass), then recompute.
 
-        Entities within ``entity_match_threshold`` cosine similarity are folded into the
-        lowest-id keeper (claims repointed, aliases unioned, duplicate deleted). Afterwards
-        every live promotable-tier subject+predicate+object group is re-evaluated, so a
-        merge that newly satisfies the corroboration threshold promotes to ``believed``
-        (and one that no longer does is demoted). Returns a summary for the CLI/logs.
+        Pass 1 (:meth:`_merge_by_name`) collapses entities with an identical normalized
+        name key — high precision, any name length, no embeddings. Pass 2
+        (:meth:`_merge_by_embedding`) is a conservative embedding fallback at
+        ``entity_merge_threshold``. Both repoint claims, union aliases, and delete the
+        duplicate. Afterwards every live promotable-tier subject+predicate+object group is
+        re-evaluated, so a merge that newly satisfies the corroboration threshold promotes
+        to ``believed`` (and one that no longer does is demoted).
         """
-        merged_entities = 0
         async with self._pool.acquire() as conn:
             async with conn.transaction():
-                entities = await conn.fetch("SELECT id, embedding::text AS emb FROM knowledge_entity ORDER BY id")
-                merged_away: set[int] = set()
-                max_dist = 1.0 - self._config.entity_match_threshold
-                for ent in entities:
-                    if ent["id"] in merged_away:
-                        continue
-                    dups = await conn.fetch(
-                        "SELECT id FROM knowledge_entity WHERE id <> $1 AND embedding <=> $2::vector <= $3",
-                        ent["id"],
-                        ent["emb"],
-                        max_dist,
-                    )
-                    for d in dups:
-                        if d["id"] <= ent["id"] or d["id"] in merged_away:
-                            continue  # keep the lowest id; lower-id matches were handled already
-                        await self._merge_entity(conn, keep=ent["id"], dup=d["id"])
-                        merged_away.add(d["id"])
-                        merged_entities += 1
-
+                merged_by_name = await self._merge_by_name(conn)
+                merged_by_embedding = await self._merge_by_embedding(conn)
                 groups = await conn.fetch(
                     "SELECT DISTINCT subject_entity_id, predicate, object_text FROM knowledge_claim "
                     "WHERE retracted_at IS NULL AND superseded_by IS NULL AND status <> 'disputed' "
@@ -748,7 +804,11 @@ class MemoryStore:
                 for g in groups:
                     await self._recompute_corroboration(conn, g["subject_entity_id"], g["predicate"], g["object_text"])
 
-        summary = {"merged_entities": merged_entities, "groups_recomputed": len(groups)}
+        summary = {
+            "merged_by_name": merged_by_name,
+            "merged_by_embedding": merged_by_embedding,
+            "groups_recomputed": len(groups),
+        }
         logfire.info("Consolidation complete", summary=summary)
         return summary
 

@@ -352,8 +352,17 @@ class Config(BaseModel):
         default=0.82,
         ge=0.0,
         le=1.0,
-        description="Cosine-similarity floor for linking a claim's subject to an existing entity. Below this "
-        "(and with no exact name/alias match) a new entity is created instead.",
+        description="Cosine-similarity floor for linking a claim's subject to an existing entity at write time. "
+        "Below this (and with no exact name/alias match) a new entity is created instead.",
+    )
+    entity_merge_threshold: float = Field(
+        default=0.90,
+        ge=0.0,
+        le=1.0,
+        description="Cosine-similarity floor for the destructive embedding-based entity merge in the "
+        "`consolidate` maintenance pass. Kept higher than entity_match_threshold because merging deletes an "
+        "entity — name-based merging (exact normalized key) does the bulk of the work; this is a conservative "
+        "secondary signal. Run `bot.maintenance calibrate-entities` to tune against your embedding model.",
     )
     volatile_ttl_seconds: int = Field(
         default=86400,
