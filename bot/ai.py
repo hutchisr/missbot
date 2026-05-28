@@ -25,9 +25,12 @@ import logfire
 from redis.asyncio import Redis
 
 from .extract import (
+    ENTITY_LINK_INSTRUCTIONS,
     EXTRACTION_INSTRUCTIONS,
     ClaimExtraction,
+    EntityMatch,
     ExtractedClaim,
+    build_entity_link_prompt,
     build_extraction_prompt,
     looks_sensitive,
 )
@@ -236,7 +239,14 @@ class ChatAgent:
         # it) before anything is written to the world-knowledge store. Tool-less and
         # constrained output, so untrusted text can only pick a branch, never free-form a
         # stored fact (see bot/extract.py). Only built when memory is enabled.
+        # Two write-path classifiers, built only when memory is enabled (both reuse the
+        # extractor's model chain):
+        #  - extract: turns free-text into a typed claim or rejects it (the admission gate).
+        #  - link: at write time decides whether a new claim's subject is the SAME entity as
+        #    one of the nearest existing entities (preventing fragmentation) or new — a
+        #    constrained candidate-index/null output, so it can only pick an offered candidate.
         self._extract_agent: Optional[Agent[None, ClaimExtraction]] = None
+        self._link_agent: Optional[Agent[None, EntityMatch]] = None
         if memory is not None and config.memory_enabled:
             extract_model = _chain(config.memory_extract_models) if config.memory_extract_models else model
             # pydantic-ai accepts a Union as output_type at runtime and constrains the
@@ -248,6 +258,13 @@ class ChatAgent:
                 instructions=[EXTRACTION_INSTRUCTIONS],
                 retries=2,
             )
+            self._link_agent = Agent(
+                extract_model,
+                output_type=EntityMatch,
+                instructions=[ENTITY_LINK_INSTRUCTIONS],
+                retries=2,
+            )
+            memory.entity_linker = self._link_entity
 
         # Pass the extractor only when it exists, so remember_fact is exposed only when a
         # fact can actually be structured into a claim.
@@ -514,6 +531,29 @@ class ChatAgent:
             logfire.exception("Claim extraction failed — fact not stored (reply unaffected)")
             return None
         return result.output
+
+    async def _link_entity(self, subject: str, candidates: list[tuple[int, str]]) -> Optional[int]:
+        """Decide whether ``subject`` is the same entity as one of ``candidates``.
+
+        ``candidates`` is a list of (entity_id, canonical_name) offered by the store. Runs
+        the constrained linker and returns the chosen entity id, or None for "new" (also the
+        safe fallback on any error or an out-of-range index). Never raises.
+        """
+        if self._link_agent is None or not candidates:
+            return None
+        names = [name for _, name in candidates]
+        try:
+            result = await self._link_agent.run(
+                build_entity_link_prompt(subject, names),
+                model_settings={"timeout": 60.0},
+            )
+        except Exception:
+            logfire.exception("Entity linking failed — treating subject as a new entity")
+            return None
+        idx = result.output.match_index
+        if idx is None or not (0 <= idx < len(candidates)):
+            return None
+        return candidates[idx][0]
 
     async def _maybe_ingest_note(self, note: Note, context: Optional[list[Note]] = None) -> None:
         """Learn a world-fact claim from the author's note, sourced to the author.

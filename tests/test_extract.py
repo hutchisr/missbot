@@ -5,8 +5,10 @@ import typing
 from bot.extract import (
     EXTRACTION_INSTRUCTIONS,
     ClaimExtraction,
+    EntityMatch,
     ExtractedClaim,
     Skip,
+    build_entity_link_prompt,
     build_extraction_prompt,
     looks_sensitive,
 )
@@ -87,3 +89,15 @@ def test_looks_sensitive_flags_obvious_pii():
     assert not looks_sensitive("I love Rust and hiking")
     assert not looks_sensitive("released in 1991")
     assert not looks_sensitive("")
+
+
+def test_entity_match_defaults_to_new():
+    assert EntityMatch().match_index is None  # null => new/distinct entity
+    assert EntityMatch(match_index=2).match_index == 2
+
+
+def test_build_entity_link_prompt_numbers_and_fences_candidates():
+    prompt = build_entity_link_prompt("Cordilleran tribes", ["Cordillerans", "Philippines"])
+    assert "Cordilleran tribes" in prompt  # the subject
+    assert "0: Cordillerans" in prompt and "1: Philippines" in prompt  # numbered candidates
+    assert "untrusted data" in prompt

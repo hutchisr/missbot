@@ -32,6 +32,7 @@ import asyncio
 import os
 import re
 import unicodedata
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Union
@@ -42,6 +43,16 @@ import logfire
 from asyncpg.pool import PoolConnectionProxy
 
 from .models import Config
+
+# Write-time entity linking: an injected async classifier that, given a subject name and
+# the nearest existing entities, returns the id of the one it's the SAME entity as (or None
+# for "new"). Set by the bot wiring; None in maintenance/headless contexts (deterministic
+# embedding fallback then applies).
+EntityLinker = Callable[[str, list[tuple[int, str]]], Awaitable[Optional[int]]]
+# How many nearest entities to offer the linker, and the (broad) similarity floor below
+# which a candidate isn't even a plausible duplicate.
+_LINK_CANDIDATES = 8
+_LINK_FLOOR = 0.4
 
 # Pool-acquired connections are proxies, not bare Connections; helpers accept either.
 _Conn = Union[asyncpg.Connection, PoolConnectionProxy]
@@ -249,6 +260,8 @@ class MemoryStore:
         self._embed_model = config.embedding_model
         key = config.embedding_api_key or os.environ.get(config.embedding_api_key_env)
         self._embed_headers = {"Authorization": f"Bearer {key}"} if key else {}
+        # Optional write-time entity-linking classifier, injected by the bot wiring.
+        self.entity_linker: Optional[EntityLinker] = None
 
     @classmethod
     async def create(cls, config: Config) -> "MemoryStore":
@@ -401,36 +414,49 @@ class MemoryStore:
         assert row is not None  # INSERT ... RETURNING always yields the id
         return int(row)
 
-    async def _resolve_entity(self, conn: _Conn, name: str, name_vec_literal: str) -> int:
-        """Resolve a subject name to an entity id, linking or creating as needed.
+    async def _resolve_entity(self, name: str, name_vec_literal: str) -> Optional[int]:
+        """Decide which existing entity a subject maps to, or None to create a new one.
 
-        Exact (case-insensitive) name/alias match wins; otherwise the nearest entity
-        within ``entity_match_threshold`` cosine similarity is linked; otherwise a new
-        entity is created.
+        Exact (case-insensitive) name/alias match wins immediately. Otherwise the nearest
+        existing entities are offered to ``entity_linker`` (the LLM linker), which returns
+        the id of the same-real-world-entity match or None; without a linker, the single
+        nearest entity within ``entity_match_threshold`` is linked. The (possibly LLM) call
+        is made with NO DB transaction held — the caller creates the entity in its own txn.
         """
-        exact = await conn.fetchval(
-            "SELECT id FROM knowledge_entity "
-            "WHERE lower(canonical_name) = lower($1) "
-            "OR EXISTS (SELECT 1 FROM unnest(aliases) a WHERE lower(a) = lower($1)) LIMIT 1",
-            name,
-        )
-        if exact is not None:
-            return int(exact)
+        async with self._pool.acquire() as conn:
+            exact = await conn.fetchval(
+                "SELECT id FROM knowledge_entity "
+                "WHERE lower(canonical_name) = lower($1) "
+                "OR EXISTS (SELECT 1 FROM unnest(aliases) a WHERE lower(a) = lower($1)) LIMIT 1",
+                name,
+            )
+            if exact is not None:
+                return int(exact)
+            candidates = await conn.fetch(
+                "SELECT id, canonical_name, embedding <=> $1::vector AS dist FROM knowledge_entity "
+                "ORDER BY dist LIMIT $2",
+                name_vec_literal,
+                _LINK_CANDIDATES,
+            )
+        if not candidates:
+            return None
 
-        nearest = await conn.fetchrow(
-            "SELECT id, embedding <=> $1::vector AS dist FROM knowledge_entity ORDER BY dist LIMIT 1",
-            name_vec_literal,
-        )
-        if nearest is not None and (1.0 - float(nearest["dist"])) >= self._config.entity_match_threshold:
+        if self.entity_linker is not None:
+            # Offer only plausibly-duplicate neighbours (above a broad floor) to the linker.
+            offered = [
+                (int(c["id"]), c["canonical_name"]) for c in candidates if (1.0 - float(c["dist"])) >= _LINK_FLOOR
+            ]
+            if not offered:
+                return None
+            chosen = await self.entity_linker(name, offered)
+            # Trust only an id the linker was actually offered.
+            return chosen if chosen in {oid for oid, _ in offered} else None
+
+        # No linker (maintenance/headless): deterministic nearest-within-threshold link.
+        nearest = candidates[0]
+        if (1.0 - float(nearest["dist"])) >= self._config.entity_match_threshold:
             return int(nearest["id"])
-
-        created = await conn.fetchval(
-            "INSERT INTO knowledge_entity (canonical_name, embedding) VALUES ($1, $2::vector) RETURNING id",
-            name,
-            name_vec_literal,
-        )
-        assert created is not None  # INSERT ... RETURNING always yields the id
-        return int(created)
+        return None
 
     @logfire.instrument(extract_args=["subject", "predicate", "trust_tier", "author", "source_note_id"])
     async def add_claim(
@@ -475,10 +501,23 @@ class MemoryStore:
         name_vec = _vector_literal(name_emb)
         claim_vec = _vector_literal(claim_emb)
 
+        # Resolve the subject entity BEFORE opening the transaction, so the (possibly LLM)
+        # linking decision never holds a DB transaction/locks open.
+        resolved_entity_id = await self._resolve_entity(subject, name_vec)
+
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 source_id = await self._get_or_create_source(conn, source_name, source_kind, trust_tier)
-                subject_entity_id = await self._resolve_entity(conn, subject, name_vec)
+                if resolved_entity_id is not None:
+                    subject_entity_id = resolved_entity_id
+                else:
+                    created = await conn.fetchval(
+                        "INSERT INTO knowledge_entity (canonical_name, embedding) VALUES ($1, $2::vector) RETURNING id",
+                        subject,
+                        name_vec,
+                    )
+                    assert created is not None  # INSERT ... RETURNING always yields the id
+                    subject_entity_id = int(created)
 
                 # Existing live claims from this same source for this subject+predicate.
                 existing = await conn.fetch(

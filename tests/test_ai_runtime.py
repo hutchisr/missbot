@@ -7,7 +7,7 @@ import pytest
 from pydantic_ai import ImageUrl
 
 from bot.ai import ChatAgent
-from bot.extract import ExtractedClaim, Skip
+from bot.extract import EntityMatch, ExtractedClaim, Skip
 from bot.models import MiFile
 
 
@@ -405,3 +405,37 @@ async def test_run_note_ingestion_supplies_thread_context(make_config, make_note
     assert "her name is Olive" in prompt
     assert "@alice" in prompt
     mem.add_claim.assert_awaited_once()
+
+
+# --- Write-time entity linking ---
+
+
+def test_entity_linker_wired_when_memory_enabled(make_config):
+    mem = AsyncMock()
+    agent = ChatAgent(_memory_cfg(make_config), memory=mem)
+    assert agent._link_agent is not None
+    assert mem.entity_linker == agent._link_entity  # store gets the linker callable
+
+
+@pytest.mark.anyio
+async def test_link_entity_returns_chosen_candidate_id(make_config):
+    agent = ChatAgent(_memory_cfg(make_config), memory=AsyncMock())
+    candidates = [(10, "Cordillerans"), (20, "Philippines")]
+    with patch.object(
+        agent._link_agent, "run", AsyncMock(return_value=SimpleNamespace(output=EntityMatch(match_index=0)))
+    ):
+        assert await agent._link_entity("Cordilleran tribes", candidates) == 10
+
+
+@pytest.mark.anyio
+async def test_link_entity_returns_none_for_new_or_out_of_range(make_config):
+    agent = ChatAgent(_memory_cfg(make_config), memory=AsyncMock())
+    candidates = [(10, "Cordillerans")]
+    with patch.object(
+        agent._link_agent, "run", AsyncMock(return_value=SimpleNamespace(output=EntityMatch(match_index=None)))
+    ):
+        assert await agent._link_entity("Mars", candidates) is None  # null => new
+    with patch.object(
+        agent._link_agent, "run", AsyncMock(return_value=SimpleNamespace(output=EntityMatch(match_index=5)))
+    ):
+        assert await agent._link_entity("X", candidates) is None  # out-of-range => new
