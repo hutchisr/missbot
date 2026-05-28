@@ -370,6 +370,20 @@ class Config(BaseModel):
         description="A claim marked 'volatile' older than this (by valid_from, else recorded_at) is flagged "
         "stale on recall so the model re-verifies it live rather than trusting it.",
     )
+    decay_ttl_seconds: int = Field(
+        default=2592000,  # 30 days
+        gt=0,
+        description="Autonomous pruning (the `decay` maintenance pass): a low-trust claim (tier < secondary) "
+        "that has not been recorded or recalled within this window is soft-retracted (tombstoned, not deleted). "
+        "Promotable/believed/recently-recalled claims are never decayed.",
+    )
+    dispute_grace_seconds: int = Field(
+        default=604800,  # 7 days
+        gt=0,
+        description="Autonomous dispute resolution (the `resolve-disputes` maintenance pass): a contradiction "
+        "must stay disputed at least this long (giving corroborating evidence time to arrive) before the pass "
+        "picks the best-supported value and supersedes the rest.",
+    )
     memory_extract_models: List[Union[str, CustomOpenAIModel]] = Field(
         default_factory=list,
         description="Model chain for the claim-extraction classifier that turns a submitted fact into a "

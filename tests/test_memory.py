@@ -11,6 +11,7 @@ from bot.memory import (
     merge_aliases,
     normalize_entity_name,
     normalize_predicate,
+    rank_dispute_values,
     render_claim,
     resolve_conflict,
     tier_rank,
@@ -91,6 +92,29 @@ def test_resolve_conflict_breaks_ties_by_trust_then_recency():
         ]
         == "F"
     )
+
+
+def test_rank_dispute_values_prefers_more_independent_sources():
+    now = datetime.now(timezone.utc)
+    older = now - timedelta(days=1)
+    claims = [
+        {"object_text": "A", "trust_tier": "secondary", "source_id": 1, "valid_from": None, "recorded_at": older},
+        {"object_text": "A", "trust_tier": "secondary", "source_id": 2, "valid_from": None, "recorded_at": older},
+        {"object_text": "B", "trust_tier": "secondary", "source_id": 3, "valid_from": None, "recorded_at": now},
+    ]
+    # Two independent secondary sources beat a single more-recent one.
+    assert rank_dispute_values(claims) == "A"
+
+
+def test_rank_dispute_values_breaks_ties_by_recency():
+    now = datetime.now(timezone.utc)
+    older = now - timedelta(days=1)
+    claims = [
+        {"object_text": "old", "trust_tier": "user", "source_id": 1, "valid_from": None, "recorded_at": older},
+        {"object_text": "new", "trust_tier": "user", "source_id": 2, "valid_from": None, "recorded_at": now},
+    ]
+    # No promotable sources and same tier -> most recent assertion wins.
+    assert rank_dispute_values(claims) == "new"
 
 
 def test_merge_aliases_unions_dedupes_and_drops_keeper_name():

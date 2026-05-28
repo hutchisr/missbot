@@ -13,8 +13,10 @@ from bot.memory import EntityNeighbor
 @pytest.fixture
 def fake_store() -> AsyncMock:
     store = AsyncMock()
-    store.consolidate.return_value = {"merged_entities": 2, "groups_recomputed": 5}
+    store.consolidate.return_value = {"merged_by_name": 2, "merged_by_embedding": 0, "groups_recomputed": 5}
     store.detect_contradictions.return_value = {"conflicting_groups": 1, "cleared_groups": 0}
+    store.resolve_disputes.return_value = {"resolved_groups": 1}
+    store.decay.return_value = {"tombstoned": 4}
     store.retract_source.return_value = 3
     store.stats.return_value = {"entities": 10, "sources": 4}
     store.entity_neighbors.return_value = [
@@ -43,7 +45,7 @@ def test_consolidate_runs_and_closes(make_config, fake_store):
     assert result.exit_code == 0, result.output
     fake_store.consolidate.assert_awaited_once()
     fake_store.close.assert_awaited_once()
-    assert "merged_entities" in result.output
+    assert "merged_by_name" in result.output
 
 
 def test_detect_contradictions_runs(make_config, fake_store):
@@ -53,12 +55,33 @@ def test_detect_contradictions_runs(make_config, fake_store):
     fake_store.close.assert_awaited_once()
 
 
-def test_run_all_runs_both_passes(make_config, fake_store):
+def test_resolve_disputes_runs(make_config, fake_store):
+    result = _invoke(["resolve-disputes", "-c", "x.yaml"], _memory_cfg(make_config), fake_store)
+    assert result.exit_code == 0, result.output
+    fake_store.resolve_disputes.assert_awaited_once()
+    fake_store.close.assert_awaited_once()
+
+
+def test_decay_runs(make_config, fake_store):
+    result = _invoke(["decay", "-c", "x.yaml"], _memory_cfg(make_config), fake_store)
+    assert result.exit_code == 0, result.output
+    fake_store.decay.assert_awaited_once()
+    fake_store.close.assert_awaited_once()
+
+
+def test_run_all_runs_full_pass(make_config, fake_store):
     result = _invoke(["run-all", "-c", "x.yaml"], _memory_cfg(make_config), fake_store)
     assert result.exit_code == 0, result.output
     fake_store.consolidate.assert_awaited_once()
     fake_store.detect_contradictions.assert_awaited_once()
-    assert set(json.loads(result.output)) == {"consolidate", "detect_contradictions"}
+    fake_store.resolve_disputes.assert_awaited_once()
+    fake_store.decay.assert_awaited_once()
+    assert set(json.loads(result.output)) == {
+        "consolidate",
+        "detect_contradictions",
+        "resolve_disputes",
+        "decay",
+    }
 
 
 def test_retract_source_passes_name_and_kind(make_config, fake_store):

@@ -133,6 +133,27 @@ def resolve_conflict(claims: list[dict]) -> dict:
     return max(claims, key=_conflict_sort_key)
 
 
+def rank_dispute_values(claims: list[dict]) -> str:
+    """Pick the winning object value among disputed claims (autonomous resolution).
+
+    Pure policy (no DB): group by object value and rank by (1) number of independent
+    tier-≥``secondary`` sources, then (2) the highest trust tier present, then (3) recency
+    (``valid_from`` else ``recorded_at``). Recency is the final tiebreaker so a resolution
+    always exists. Returns the winning value's original-cased text.
+    """
+    by_value: dict[str, dict] = {}
+    for c in claims:
+        key = c["object_text"].strip().lower()
+        v = by_value.setdefault(key, {"object_text": c["object_text"], "sources": set(), "tier": 0, "recency": None})
+        if tier_rank(c["trust_tier"]) >= TRUST_TIERS["secondary"]:
+            v["sources"].add(c["source_id"])
+        v["tier"] = max(v["tier"], tier_rank(c["trust_tier"]))
+        ref = c.get("valid_from") or c["recorded_at"]
+        v["recency"] = ref if v["recency"] is None else max(v["recency"], ref)
+    best = max(by_value.values(), key=lambda v: (len(v["sources"]), v["tier"], v["recency"]))
+    return best["object_text"]
+
+
 def merge_aliases(
     keep_canonical: str, keep_aliases: list[str], dup_canonical: str, dup_aliases: list[str]
 ) -> list[str]:
@@ -291,10 +312,16 @@ class MemoryStore:
                     embedding           vector({dim}) NOT NULL,
                     author              TEXT,
                     source_note_id      TEXT,
+                    last_recalled_at    TIMESTAMPTZ,
+                    disputed_at         TIMESTAMPTZ,
                     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
                 """
             )
+            # Columns added after the initial schema — ALTER for already-deployed databases
+            # (CREATE TABLE IF NOT EXISTS won't add them to an existing table).
+            await conn.execute("ALTER TABLE knowledge_claim ADD COLUMN IF NOT EXISTS last_recalled_at TIMESTAMPTZ")
+            await conn.execute("ALTER TABLE knowledge_claim ADD COLUMN IF NOT EXISTS disputed_at TIMESTAMPTZ")
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS knowledge_entity_embedding_idx "
                 "ON knowledge_entity USING hnsw (embedding vector_cosine_ops)"
@@ -674,7 +701,9 @@ class MemoryStore:
 
         now = datetime.now(timezone.utc)
         ttl = self._config.volatile_ttl_seconds
-        recalled: list[RecalledClaim] = []
+        # Each entry pairs the recalled claim with the row ids of its whole group, so we can
+        # record usage (last_recalled_at) for everything actually surfaced to the model.
+        entries: list[tuple[RecalledClaim, list[int]]] = []
         for members in groups.values():
             winner = resolve_conflict(members)
             conflicts = [
@@ -689,28 +718,38 @@ class MemoryStore:
                 if m["object_text"].strip().lower() != winner["object_text"].strip().lower()
             ]
             best_dist = min(float(m["dist"]) for m in members)
-            recalled.append(
-                RecalledClaim(
-                    subject=winner["subject"],
-                    predicate=winner["predicate"],
-                    object_text=winner["object_text"],
-                    status=winner["status"],
-                    trust_tier=winner["trust_tier"],
-                    source_name=winner["source_name"],
-                    source_kind=winner["source_kind"],
-                    confidence=float(winner["confidence"]),
-                    corroboration_count=int(winner["corroboration_count"]),
-                    volatility=winner["volatility"],
-                    recorded_at=winner["recorded_at"],
-                    valid_from=winner["valid_from"],
-                    similarity=1.0 - best_dist,
-                    stale=is_stale(winner["volatility"], winner["valid_from"] or winner["recorded_at"], now, ttl),
-                    conflicts=conflicts,
-                )
+            claim = RecalledClaim(
+                subject=winner["subject"],
+                predicate=winner["predicate"],
+                object_text=winner["object_text"],
+                status=winner["status"],
+                trust_tier=winner["trust_tier"],
+                source_name=winner["source_name"],
+                source_kind=winner["source_kind"],
+                confidence=float(winner["confidence"]),
+                corroboration_count=int(winner["corroboration_count"]),
+                volatility=winner["volatility"],
+                recorded_at=winner["recorded_at"],
+                valid_from=winner["valid_from"],
+                similarity=1.0 - best_dist,
+                stale=is_stale(winner["volatility"], winner["valid_from"] or winner["recorded_at"], now, ttl),
+                conflicts=conflicts,
             )
+            entries.append((claim, [int(m["id"]) for m in members]))
 
-        recalled.sort(key=lambda r: r.similarity, reverse=True)
-        return recalled[:k]
+        entries.sort(key=lambda e: e[0].similarity, reverse=True)
+        top = entries[:k]
+
+        # Record usage so the decay pass can prune never-recalled claims. Current reads
+        # only — an as-of (historical) read shouldn't count a claim as currently used.
+        if as_of is None and top:
+            recalled_ids = [cid for _, ids in top for cid in ids]
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE knowledge_claim SET last_recalled_at = now() WHERE id = ANY($1)", recalled_ids
+                )
+
+        return [claim for claim, _ in top]
 
     # --- Maintenance (M4) --------------------------------------------------------
 
@@ -822,8 +861,9 @@ class MemoryStore:
         the group from corroboration counting until it's resolved. If a previously-disputed
         group now has a single value, the flag is cleared back to ``asserted`` and the value
         re-evaluated for promotion. Overlapping validity is approximated as "both live"
-        (claims rarely set ``valid_to``). Conservative by design: it surfaces conflict, it
-        does not pick a winner — the read path still does that.
+        (claims rarely set ``valid_to``). It records ``disputed_at`` so the autonomous
+        ``resolve_disputes`` pass can act after a grace period; here it only flags, it does
+        not pick a winner.
         """
         conflicting = 0
         cleared = 0
@@ -838,10 +878,14 @@ class MemoryStore:
                 )
                 for g in groups:
                     if g["values"] >= 2:
+                        # Mark disputed and stamp disputed_at, preserving any existing
+                        # timestamp (COALESCE) so the grace period runs from first dispute.
+                        # The `disputed_at IS NULL` arm also backfills claims disputed before
+                        # the column existed, so they become eligible for resolution.
                         await conn.execute(
-                            "UPDATE knowledge_claim SET status = 'disputed' "
+                            "UPDATE knowledge_claim SET status = 'disputed', disputed_at = COALESCE(disputed_at, now()) "
                             "WHERE subject_entity_id = $1 AND predicate = $2 AND retracted_at IS NULL "
-                            "AND superseded_by IS NULL AND status <> 'disputed'",
+                            "AND superseded_by IS NULL AND (status <> 'disputed' OR disputed_at IS NULL)",
                             g["subject_entity_id"],
                             g["predicate"],
                         )
@@ -855,7 +899,7 @@ class MemoryStore:
                     elif g["disputed"] > 0:
                         # Conflict resolved (one value remains) — clear the flag and re-promote.
                         await conn.execute(
-                            "UPDATE knowledge_claim SET status = 'asserted' "
+                            "UPDATE knowledge_claim SET status = 'asserted', disputed_at = NULL "
                             "WHERE subject_entity_id = $1 AND predicate = $2 AND retracted_at IS NULL "
                             "AND superseded_by IS NULL AND status = 'disputed'",
                             g["subject_entity_id"],
@@ -873,6 +917,95 @@ class MemoryStore:
 
         summary = {"conflicting_groups": conflicting, "cleared_groups": cleared}
         logfire.info("Contradiction detection complete", summary=summary)
+        return summary
+
+    @logfire.instrument()
+    async def resolve_disputes(self) -> dict[str, int]:
+        """Autonomously resolve contradictions that have stayed disputed past the grace period.
+
+        For each disputed subject+predicate group whose dispute is older than
+        ``dispute_grace_seconds``, :func:`rank_dispute_values` picks the best-supported value
+        (independent sources, then trust tier, then recency). Claims asserting the losing
+        values are **superseded** by the winning claim (archived, recoverable via an as-of
+        read, and no longer re-flagged by ``detect_contradictions``); the winning value's
+        claims are un-disputed and re-evaluated for promotion. Self-correcting: a later claim
+        for a losing value re-opens the dispute. No human in the loop.
+        """
+        grace = self._config.dispute_grace_seconds
+        resolved = 0
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                groups = await conn.fetch(
+                    "SELECT subject_entity_id, predicate FROM knowledge_claim "
+                    "WHERE retracted_at IS NULL AND superseded_by IS NULL AND status = 'disputed' "
+                    "AND disputed_at IS NOT NULL "
+                    "GROUP BY subject_entity_id, predicate "
+                    "HAVING min(disputed_at) < now() - make_interval(secs => $1)",
+                    float(grace),
+                )
+                for g in groups:
+                    claims = await conn.fetch(
+                        "SELECT id, object_text, trust_tier, source_id, valid_from, recorded_at FROM knowledge_claim "
+                        "WHERE subject_entity_id = $1 AND predicate = $2 AND retracted_at IS NULL "
+                        "AND superseded_by IS NULL",
+                        g["subject_entity_id"],
+                        g["predicate"],
+                    )
+                    if not claims:
+                        continue
+                    winner = rank_dispute_values([dict(c) for c in claims]).strip().lower()
+                    winner_ids = [c["id"] for c in claims if c["object_text"].strip().lower() == winner]
+                    loser_ids = [c["id"] for c in claims if c["object_text"].strip().lower() != winner]
+                    if not winner_ids:
+                        continue
+                    if loser_ids:
+                        await conn.execute(
+                            "UPDATE knowledge_claim SET superseded_by = $1, superseded_at = now() WHERE id = ANY($2)",
+                            winner_ids[0],
+                            loser_ids,
+                        )
+                    await conn.execute(
+                        "UPDATE knowledge_claim SET status = 'asserted', disputed_at = NULL WHERE id = ANY($1)",
+                        winner_ids,
+                    )
+                    winning_value = next(c["object_text"] for c in claims if c["id"] == winner_ids[0])
+                    await self._recompute_corroboration(conn, g["subject_entity_id"], g["predicate"], winning_value)
+                    resolved += 1
+                    logfire.info(
+                        "Dispute resolved",
+                        subject_entity_id=g["subject_entity_id"],
+                        predicate=g["predicate"],
+                        superseded=len(loser_ids),
+                    )
+
+        summary = {"resolved_groups": resolved}
+        logfire.info("Dispute resolution complete", summary=summary)
+        return summary
+
+    @logfire.instrument()
+    async def decay(self) -> dict[str, int]:
+        """Autonomously prune low-value claims (soft-retract, never delete).
+
+        Tombstones (``retracted_at``) claims that are low-trust (tier < secondary, i.e.
+        ``model_quarantine``/``user``), not ``believed``, and neither recorded nor recalled
+        within ``decay_ttl_seconds``. Secondary/primary, believed, and recently-used claims
+        are never touched. Low-trust claims never count toward corroboration, so no recompute
+        is needed. Soft-retract keeps the row auditable and recoverable (append-only).
+        """
+        low_tiers = [t for t, r in TRUST_TIERS.items() if r < TRUST_TIERS["secondary"]]
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE knowledge_claim SET retracted_at = now() "
+                "WHERE retracted_at IS NULL AND superseded_by IS NULL AND status <> 'believed' "
+                "AND trust_tier = ANY($1) "
+                "AND recorded_at < now() - make_interval(secs => $2) "
+                "AND (last_recalled_at IS NULL OR last_recalled_at < now() - make_interval(secs => $2))",
+                low_tiers,
+                float(self._config.decay_ttl_seconds),
+            )
+        tombstoned = int(result.split()[-1]) if result else 0
+        summary = {"tombstoned": tombstoned}
+        logfire.info("Decay complete", summary=summary)
         return summary
 
     async def entity_neighbors(self, limit: int = 50, min_similarity: float = 0.5) -> list[EntityNeighbor]:

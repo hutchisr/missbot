@@ -5,7 +5,9 @@ bot) via ``python -m bot.maintenance <command> -c /config.yaml``:
 
     consolidate            merge duplicate entities + recompute corroboration
     detect-contradictions  flag same-subject+predicate disagreements as `disputed`
-    run-all                consolidate, then detect-contradictions
+    resolve-disputes       resolve disputes past the grace period (supersede losing values)
+    decay                  soft-retract stale, never-recalled, low-trust claims
+    run-all                consolidate -> detect -> resolve disputes -> decay
     retract-source         tombstone every claim from a source (and recompute)
     stats                  print store counts (entities/sources/claims by status & tier)
 
@@ -82,15 +84,34 @@ def detect_contradictions(config_path: str) -> None:
     click.echo(json.dumps(summary))
 
 
+@cli.command("resolve-disputes")
+@_config_option
+def resolve_disputes(config_path: str) -> None:
+    """Autonomously resolve contradictions older than the grace period (supersede losers)."""
+    summary = _run(config_path, lambda store: store.resolve_disputes())
+    click.echo(json.dumps(summary))
+
+
+@cli.command()
+@_config_option
+def decay(config_path: str) -> None:
+    """Soft-retract stale, never-recalled, low-trust claims (autonomous pruning)."""
+    summary = _run(config_path, lambda store: store.decay())
+    click.echo(json.dumps(summary))
+
+
 @cli.command("run-all")
 @_config_option
 def run_all(config_path: str) -> None:
-    """Run consolidation, then contradiction detection (the usual scheduled pass)."""
+    """Run the full scheduled pass: consolidate, detect, resolve disputes, then decay."""
 
     async def _action(store: MemoryStore) -> dict[str, Any]:
-        consolidated = await store.consolidate()
-        contradictions = await store.detect_contradictions()
-        return {"consolidate": consolidated, "detect_contradictions": contradictions}
+        return {
+            "consolidate": await store.consolidate(),
+            "detect_contradictions": await store.detect_contradictions(),
+            "resolve_disputes": await store.resolve_disputes(),
+            "decay": await store.decay(),
+        }
 
     click.echo(json.dumps(_run(config_path, _action)))
 
