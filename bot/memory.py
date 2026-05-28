@@ -28,6 +28,7 @@ The embedding model produces *unnormalized* vectors, so all comparisons use cosi
 distance (``<=>``).
 """
 
+import asyncio
 import os
 import re
 import unicodedata
@@ -467,8 +468,12 @@ class MemoryStore:
         if volatility not in VOLATILITIES:
             volatility = "stable"
 
-        name_vec = _vector_literal(await self.embed(subject))
-        claim_vec = _vector_literal(await self.embed(render_claim(subject, predicate, object_text)))
+        # Independent embeddings — run them concurrently (every claim write pays both).
+        name_emb, claim_emb = await asyncio.gather(
+            self.embed(subject), self.embed(render_claim(subject, predicate, object_text))
+        )
+        name_vec = _vector_literal(name_emb)
+        claim_vec = _vector_literal(claim_emb)
 
         async with self._pool.acquire() as conn:
             async with conn.transaction():
@@ -701,9 +706,9 @@ class MemoryStore:
 
         now = datetime.now(timezone.utc)
         ttl = self._config.volatile_ttl_seconds
-        # Each entry pairs the recalled claim with the row ids of its whole group, so we can
-        # record usage (last_recalled_at) for everything actually surfaced to the model.
-        entries: list[tuple[RecalledClaim, list[int]]] = []
+        # Each entry pairs the recalled claim with its winning row id, so we can record usage
+        # (last_recalled_at) on the claim actually chosen for the model.
+        entries: list[tuple[RecalledClaim, int]] = []
         for members in groups.values():
             winner = resolve_conflict(members)
             conflicts = [
@@ -735,15 +740,17 @@ class MemoryStore:
                 stale=is_stale(winner["volatility"], winner["valid_from"] or winner["recorded_at"], now, ttl),
                 conflicts=conflicts,
             )
-            entries.append((claim, [int(m["id"]) for m in members]))
+            entries.append((claim, int(winner["id"])))
 
         entries.sort(key=lambda e: e[0].similarity, reverse=True)
         top = entries[:k]
 
-        # Record usage so the decay pass can prune never-recalled claims. Current reads
-        # only — an as-of (historical) read shouldn't count a claim as currently used.
+        # Record usage so the decay pass can prune never-recalled claims. Stamp only the
+        # winning claim of each returned group — not the losing alternatives, or a perpetual
+        # low-trust loser would have its decay clock reset every time the winner is recalled.
+        # Current reads only — an as-of (historical) read shouldn't count as current use.
         if as_of is None and top:
-            recalled_ids = [cid for _, ids in top for cid in ids]
+            recalled_ids = [winner_id for _, winner_id in top]
             async with self._pool.acquire() as conn:
                 await conn.execute(
                     "UPDATE knowledge_claim SET last_recalled_at = now() WHERE id = ANY($1)", recalled_ids
@@ -987,16 +994,19 @@ class MemoryStore:
         """Autonomously prune low-value claims (soft-retract, never delete).
 
         Tombstones (``retracted_at``) claims that are low-trust (tier < secondary, i.e.
-        ``model_quarantine``/``user``), not ``believed``, and neither recorded nor recalled
-        within ``decay_ttl_seconds``. Secondary/primary, believed, and recently-used claims
-        are never touched. Low-trust claims never count toward corroboration, so no recompute
-        is needed. Soft-retract keeps the row auditable and recoverable (append-only).
+        ``model_quarantine``/``user``), neither ``believed`` nor ``disputed``, and neither
+        recorded nor recalled within ``decay_ttl_seconds``. Secondary/primary, believed,
+        disputed (left to ``resolve_disputes``), and recently-used claims are never touched.
+        Low-trust claims never count toward corroboration, so no recompute is needed.
+        Soft-retract keeps the row auditable and recoverable (append-only).
         """
         low_tiers = [t for t, r in TRUST_TIERS.items() if r < TRUST_TIERS["secondary"]]
         async with self._pool.acquire() as conn:
             result = await conn.execute(
                 "UPDATE knowledge_claim SET retracted_at = now() "
-                "WHERE retracted_at IS NULL AND superseded_by IS NULL AND status <> 'believed' "
+                # Leave 'disputed' claims to resolve_disputes — decaying one side of a live
+                # contradiction would silently decide it by attrition.
+                "WHERE retracted_at IS NULL AND superseded_by IS NULL AND status NOT IN ('believed', 'disputed') "
                 "AND trust_tier = ANY($1) "
                 "AND recorded_at < now() - make_interval(secs => $2) "
                 "AND (last_recalled_at IS NULL OR last_recalled_at < now() - make_interval(secs => $2))",
@@ -1119,11 +1129,15 @@ class MemoryStore:
                         claim_vec = row["embedding"]
                     else:
                         claim_vec = _vector_literal(await self.embed(row["fact"]))
+                    # Seed last_recalled_at = now() so the imported facts get a fresh decay
+                    # window: they carry their original (old) recorded_at, so without this the
+                    # decay pass running later in the same `run-all` would immediately
+                    # tombstone the whole migrated corpus.
                     await conn.execute(
                         "INSERT INTO knowledge_claim "
                         "(subject_entity_id, predicate, object_text, source_id, trust_tier, status, "
-                        " recorded_at, volatility, embedding, author, source_note_id) "
-                        "VALUES ($1, 'note', $2, $3, $4, 'asserted', $5, 'stable', $6::vector, $7, $8)",
+                        " recorded_at, last_recalled_at, volatility, embedding, author, source_note_id) "
+                        "VALUES ($1, 'note', $2, $3, $4, 'asserted', $5, now(), 'stable', $6::vector, $7, $8)",
                         entity_id,
                         row["fact"],
                         source_id,

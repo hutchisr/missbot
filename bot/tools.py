@@ -17,6 +17,17 @@ from .extract import ClaimExtraction, ExtractedClaim, Skip
 from .memory import MemoryStore, RecalledClaim
 from .models import Config
 
+# Strong refs for fire-and-forget web-ingestion tasks; asyncio holds only weak refs,
+# so without this the task could be GC'd mid-run.
+_web_ingest_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_web_ingest(coro) -> None:
+    """Schedule best-effort web ingestion in the background (don't block the search)."""
+    task = asyncio.create_task(coro)
+    _web_ingest_tasks.add(task)
+    task.add_done_callback(_web_ingest_tasks.discard)
+
 
 def _fence_untrusted(label: str, body: str) -> str:
     """Wrap recalled/stored text as clearly-delimited untrusted data.
@@ -193,7 +204,9 @@ def build_tools(
 
             results = [r for r in data.get("results", [])[:5] if r.get("content")]
             # Deterministically learn from results: attribute each to its domain at the
-            # 'secondary' tier (the model never picks the source). Gated + best-effort.
+            # 'secondary' tier (the model never picks the source). Gated + best-effort, and
+            # fired in the BACKGROUND so the extraction/embedding work never adds latency to
+            # the search result the model is waiting on.
             if (
                 results
                 and memory is not None
@@ -201,7 +214,7 @@ def build_tools(
                 and config.memory_ingest_web
                 and _web_extractor is not None
             ):
-                await _ingest_web_results(memory, _web_extractor, results)
+                _spawn_web_ingest(_ingest_web_results(memory, _web_extractor, results))
 
             # Surface each snippet's domain so the model sees provenance too.
             lines: list[str] = []

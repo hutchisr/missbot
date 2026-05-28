@@ -1,6 +1,7 @@
 import asyncio
 import os
 from collections import deque
+from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Optional, Union
@@ -183,6 +184,19 @@ def _make_enable_gate_tool(gate: str, servers: list[str]):
         "The tools become visible on the next model turn."
     )
     return enable_gate
+
+
+async def _guarded(coro: Awaitable[object], label: str) -> None:
+    """Await a best-effort side task, swallowing ANY error so it can't fail the reply.
+
+    Belt-and-suspenders over each side task's own try/except: it also covers work that
+    runs before that try (handle/context building), which would otherwise propagate
+    through ``asyncio.gather`` and cancel the in-flight reply.
+    """
+    try:
+        await coro
+    except Exception:
+        logfire.exception(f"{label} failed (reply unaffected)")
 
 
 class ChatAgent:
@@ -386,16 +400,14 @@ class ChatAgent:
         }
         if run_model is not None:
             run_kwargs["model"] = run_model
-        # Score the author's message in parallel with generating the reply so it
-        # adds no user-facing latency. _maybe_score_message swallows its own
-        # errors, so it can never fail the reply.
-        # Score the author's message and learn any world-fact it asserts, both in
-        # parallel with generating the reply so they add no user-facing latency. Both
-        # swallow their own errors, so neither can fail the reply.
+        # Score the author's message and learn any world-fact it asserts, both in parallel
+        # with generating the reply so they add no user-facing latency. Each side task is
+        # wrapped so any error in it (including work before its own try/except) is swallowed
+        # and can never cancel the reply.
         result, _, _ = await asyncio.gather(
             self._agent.run(prompt, **run_kwargs),
-            self._maybe_score_message(note),
-            self._maybe_ingest_note(note, context),
+            _guarded(self._maybe_score_message(note), "Message scoring"),
+            _guarded(self._maybe_ingest_note(note, context), "Note ingestion"),
         )
         return result.output
 

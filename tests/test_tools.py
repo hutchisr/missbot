@@ -1,5 +1,6 @@
 """Tests for bot.tools."""
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -10,6 +11,7 @@ from unittest.mock import patch
 from datetime import datetime, timezone
 
 from bot.extract import ExtractedClaim, Skip
+from bot import tools as bot_tools
 from bot.memory import ClaimWriteResult, ConflictingClaim, RecalledClaim
 from bot.tools import build_tools, current_datetime
 
@@ -156,6 +158,9 @@ async def test_search_web_ingests_results_as_web_claims(make_config):
 
     with patch("bot.tools.httpx.AsyncClient", return_value=manager):
         result = await search_web("python version")
+        # Ingestion is fire-and-forget (background task) so it doesn't block the search;
+        # drain the scheduled tasks before asserting on the writes.
+        await asyncio.gather(*list(bot_tools._web_ingest_tasks))
 
     # Domains surfaced to the model as provenance.
     assert "[python.org]" in result and "[blog.example.com]" in result
