@@ -11,6 +11,7 @@ from bot.extract import (
     build_entity_link_prompt,
     build_extraction_prompt,
     looks_sensitive,
+    pick_entity_match,
 )
 
 
@@ -101,3 +102,11 @@ def test_build_entity_link_prompt_numbers_and_fences_candidates():
     assert "Cordilleran tribes" in prompt  # the subject
     assert "0: Cordillerans" in prompt and "1: Philippines" in prompt  # numbered candidates
     assert "untrusted data" in prompt
+
+
+def test_pick_entity_match_maps_index_or_falls_back_to_new():
+    candidates = [(10, "A"), (20, "B")]
+    assert pick_entity_match(EntityMatch(match_index=1), candidates) == 20  # picks the offered id
+    assert pick_entity_match(EntityMatch(match_index=None), candidates) is None  # null => new
+    assert pick_entity_match(EntityMatch(match_index=5), candidates) is None  # out of range => new
+    assert pick_entity_match(EntityMatch(match_index=0), []) is None  # no candidates => new

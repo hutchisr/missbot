@@ -9,6 +9,7 @@ bot) via ``python -m bot.maintenance <command> -c /config.yaml``:
     decay                  soft-retract stale, never-recalled, low-trust claims
     run-all                consolidate -> detect -> resolve disputes -> decay
     retract-source         tombstone every claim from a source (and recompute)
+    unmerge                reverse a soft entity-merge (reactivate + restore claims)
     stats                  print store counts (entities/sources/claims by status & tier)
 
 Each command builds a one-shot :class:`MemoryStore`, runs, and closes it. Requires
@@ -24,6 +25,7 @@ import click
 import logfire
 import yaml
 
+from .ai import build_entity_linker
 from .memory import MemoryStore
 from .models import Config
 
@@ -35,13 +37,18 @@ def load_config(path: str) -> Config:
 
 
 def _run(config_path: str, action: Callable[[MemoryStore], Awaitable[Any]]) -> Any:
-    """Build a MemoryStore from config, run ``action`` against it, then close it."""
+    """Build a MemoryStore from config, run ``action`` against it, then close it.
+
+    The entity linker is wired in so the consolidation LLM merge pass works here in the
+    headless CronJob (which has no ChatAgent).
+    """
 
     async def _main() -> Any:
         config = load_config(config_path)
         if not config.memory_enabled:
             raise click.ClickException("memory_enabled must be true in the config to run maintenance")
         store = await MemoryStore.create(config)
+        store.entity_linker = build_entity_linker(config)
         try:
             return await action(store)
         finally:
@@ -124,6 +131,15 @@ def retract_source(config_path: str, name: str, kind: str | None) -> None:
     """Tombstone every claim from a source and recompute corroboration everywhere."""
     count = _run(config_path, lambda store: store.retract_source(name, kind))
     click.echo(f"Retracted {count} claim(s) from source {name!r}" + (f" (kind={kind})" if kind else ""))
+
+
+@cli.command()
+@_config_option
+@click.option("--id", "merged_id", required=True, type=int, help="Entity id to un-merge (reactivate).")
+def unmerge(config_path: str, merged_id: int) -> None:
+    """Reverse a soft entity-merge: reactivate the entity and move its claims back."""
+    ok = _run(config_path, lambda store: store.unmerge_entity(merged_id))
+    click.echo(f"Un-merged entity {merged_id}" if ok else f"Nothing to un-merge for entity {merged_id}")
 
 
 @cli.command()

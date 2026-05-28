@@ -13,11 +13,17 @@ from bot.memory import EntityNeighbor
 @pytest.fixture
 def fake_store() -> AsyncMock:
     store = AsyncMock()
-    store.consolidate.return_value = {"merged_by_name": 2, "merged_by_embedding": 0, "groups_recomputed": 5}
+    store.consolidate.return_value = {
+        "merged_by_name": 2,
+        "merged_by_embedding": 0,
+        "merged_by_llm": 1,
+        "groups_recomputed": 5,
+    }
     store.detect_contradictions.return_value = {"conflicting_groups": 1, "cleared_groups": 0}
     store.resolve_disputes.return_value = {"resolved_groups": 1}
     store.decay.return_value = {"tombstoned": 4}
     store.retract_source.return_value = 3
+    store.unmerge_entity.return_value = True
     store.stats.return_value = {"entities": 10, "sources": 4}
     store.entity_neighbors.return_value = [
         EntityNeighbor("Python", "Python (programming language)", 0.94),
@@ -35,6 +41,7 @@ def _invoke(args, cfg, fake_store):
     with (
         patch("bot.maintenance.logfire.configure"),
         patch("bot.maintenance.load_config", return_value=cfg),
+        patch("bot.maintenance.build_entity_linker", return_value=None),
         patch("bot.maintenance.MemoryStore.create", AsyncMock(return_value=fake_store)),
     ):
         return runner.invoke(cli, args)
@@ -93,6 +100,20 @@ def test_retract_source_passes_name_and_kind(make_config, fake_store):
     assert result.exit_code == 0, result.output
     fake_store.retract_source.assert_awaited_once_with("evil.example", "web")
     assert "Retracted 3" in result.output
+
+
+def test_unmerge_runs_and_reports(make_config, fake_store):
+    result = _invoke(["unmerge", "-c", "x.yaml", "--id", "42"], _memory_cfg(make_config), fake_store)
+    assert result.exit_code == 0, result.output
+    fake_store.unmerge_entity.assert_awaited_once_with(42)
+    assert "Un-merged entity 42" in result.output
+
+
+def test_unmerge_reports_nothing_to_do(make_config, fake_store):
+    fake_store.unmerge_entity.return_value = False
+    result = _invoke(["unmerge", "-c", "x.yaml", "--id", "7"], _memory_cfg(make_config), fake_store)
+    assert result.exit_code == 0, result.output
+    assert "Nothing to un-merge" in result.output
 
 
 def test_stats_prints_json(make_config, fake_store):

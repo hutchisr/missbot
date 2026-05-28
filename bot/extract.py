@@ -200,3 +200,15 @@ def build_entity_link_prompt(subject: str, candidate_names: list[str]) -> str:
         f"SUBJECT:\n{nonce}\n{subject}\n{nonce}\n"
         f"EXISTING ENTITIES (index: name):\n{nonce}\n{listing}\n{nonce}"
     )
+
+
+def pick_entity_match(match: EntityMatch, candidates: list[tuple[int, str]]) -> Optional[int]:
+    """Map an ``EntityMatch`` (a candidate index or null) to the chosen entity id, or None.
+
+    Returns None for "new" and for any out-of-range index, so a malformed model answer
+    safely degrades to "new entity" rather than linking to the wrong row.
+    """
+    idx = match.match_index
+    if idx is None or not (0 <= idx < len(candidates)):
+        return None
+    return candidates[idx][0]

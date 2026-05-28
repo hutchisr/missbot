@@ -359,10 +359,17 @@ class Config(BaseModel):
         default=0.90,
         ge=0.0,
         le=1.0,
-        description="Cosine-similarity floor for the destructive embedding-based entity merge in the "
-        "`consolidate` maintenance pass. Kept higher than entity_match_threshold because merging deletes an "
-        "entity — name-based merging (exact normalized key) does the bulk of the work; this is a conservative "
-        "secondary signal. Run `bot.maintenance calibrate-entities` to tune against your embedding model.",
+        description="Cosine-similarity floor for the embedding-based entity merge in the `consolidate` "
+        "maintenance pass. Kept higher than entity_match_threshold because merging is structural — name-based "
+        "merging (exact normalized key) does the bulk of the work; this is a conservative secondary signal. "
+        "Run `bot.maintenance calibrate-entities` to tune against your embedding model.",
+    )
+    entity_merge_llm: bool = Field(
+        default=True,
+        description="In the `consolidate` maintenance pass, after the deterministic name/embedding passes, run "
+        "an LLM merge pass that offers each entity's near-neighbours to the entity-link classifier and folds in "
+        "confirmed same-entity matches. Heals existing fragmentation the deterministic passes miss. Merges are "
+        "soft (reversible via `unmerge`). Requires a model; set false to skip the extra LLM calls per run.",
     )
     volatile_ttl_seconds: int = Field(
         default=86400,

@@ -6,8 +6,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from pydantic_ai import ImageUrl
 
-from bot.ai import ChatAgent
-from bot.extract import EntityMatch, ExtractedClaim, Skip
+from bot.ai import ChatAgent, build_entity_linker
+from bot.extract import ExtractedClaim, Skip
 from bot.models import MiFile
 
 
@@ -413,29 +413,14 @@ async def test_run_note_ingestion_supplies_thread_context(make_config, make_note
 def test_entity_linker_wired_when_memory_enabled(make_config):
     mem = AsyncMock()
     agent = ChatAgent(_memory_cfg(make_config), memory=mem)
-    assert agent._link_agent is not None
-    assert mem.entity_linker == agent._link_entity  # store gets the linker callable
+    assert agent._entity_linker is not None
+    assert mem.entity_linker is agent._entity_linker  # store gets the linker callable
 
 
-@pytest.mark.anyio
-async def test_link_entity_returns_chosen_candidate_id(make_config):
-    agent = ChatAgent(_memory_cfg(make_config), memory=AsyncMock())
-    candidates = [(10, "Cordillerans"), (20, "Philippines")]
-    with patch.object(
-        agent._link_agent, "run", AsyncMock(return_value=SimpleNamespace(output=EntityMatch(match_index=0)))
-    ):
-        assert await agent._link_entity("Cordilleran tribes", candidates) == 10
+def test_entity_linker_absent_without_memory(make_config):
+    assert ChatAgent(make_config())._entity_linker is None  # memory disabled
 
 
-@pytest.mark.anyio
-async def test_link_entity_returns_none_for_new_or_out_of_range(make_config):
-    agent = ChatAgent(_memory_cfg(make_config), memory=AsyncMock())
-    candidates = [(10, "Cordillerans")]
-    with patch.object(
-        agent._link_agent, "run", AsyncMock(return_value=SimpleNamespace(output=EntityMatch(match_index=None)))
-    ):
-        assert await agent._link_entity("Mars", candidates) is None  # null => new
-    with patch.object(
-        agent._link_agent, "run", AsyncMock(return_value=SimpleNamespace(output=EntityMatch(match_index=5)))
-    ):
-        assert await agent._link_entity("X", candidates) is None  # out-of-range => new
+def test_build_entity_linker_only_when_memory_enabled(make_config):
+    assert build_entity_linker(make_config()) is None  # disabled => no linker
+    assert callable(build_entity_linker(_memory_cfg(make_config)))  # enabled => a callable

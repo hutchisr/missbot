@@ -299,7 +299,21 @@ class MemoryStore:
                     aliases        TEXT[] NOT NULL DEFAULT '{{}}',
                     type           TEXT,
                     embedding      vector({dim}) NOT NULL,
+                    merged_into    BIGINT REFERENCES knowledge_entity(id),
+                    merged_at      TIMESTAMPTZ,
                     created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+            # Audit/recovery log for entity merges, so a soft-merge is fully reversible.
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS knowledge_entity_merge_log (
+                    id         BIGSERIAL PRIMARY KEY,
+                    keeper_id  BIGINT NOT NULL,
+                    merged_id  BIGINT NOT NULL,
+                    claim_ids  BIGINT[] NOT NULL DEFAULT '{}',
+                    merged_at  TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
                 """
             )
@@ -336,6 +350,10 @@ class MemoryStore:
             # (CREATE TABLE IF NOT EXISTS won't add them to an existing table).
             await conn.execute("ALTER TABLE knowledge_claim ADD COLUMN IF NOT EXISTS last_recalled_at TIMESTAMPTZ")
             await conn.execute("ALTER TABLE knowledge_claim ADD COLUMN IF NOT EXISTS disputed_at TIMESTAMPTZ")
+            await conn.execute(
+                "ALTER TABLE knowledge_entity ADD COLUMN IF NOT EXISTS merged_into BIGINT REFERENCES knowledge_entity(id)"
+            )
+            await conn.execute("ALTER TABLE knowledge_entity ADD COLUMN IF NOT EXISTS merged_at TIMESTAMPTZ")
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS knowledge_entity_embedding_idx "
                 "ON knowledge_entity USING hnsw (embedding vector_cosine_ops)"
@@ -426,15 +444,15 @@ class MemoryStore:
         async with self._pool.acquire() as conn:
             exact = await conn.fetchval(
                 "SELECT id FROM knowledge_entity "
-                "WHERE lower(canonical_name) = lower($1) "
-                "OR EXISTS (SELECT 1 FROM unnest(aliases) a WHERE lower(a) = lower($1)) LIMIT 1",
+                "WHERE merged_into IS NULL AND (lower(canonical_name) = lower($1) "
+                "OR EXISTS (SELECT 1 FROM unnest(aliases) a WHERE lower(a) = lower($1))) LIMIT 1",
                 name,
             )
             if exact is not None:
                 return int(exact)
             candidates = await conn.fetch(
                 "SELECT id, canonical_name, embedding <=> $1::vector AS dist FROM knowledge_entity "
-                "ORDER BY dist LIMIT $2",
+                "WHERE merged_into IS NULL ORDER BY dist LIMIT $2",
                 name_vec_literal,
                 _LINK_CANDIDATES,
             )
@@ -800,7 +818,17 @@ class MemoryStore:
     # --- Maintenance (M4) --------------------------------------------------------
 
     async def _merge_entity(self, conn: _Conn, keep: int, dup: int) -> None:
-        """Fold entity ``dup`` into ``keep``: repoint claims, union aliases, delete dup."""
+        """Fold entity ``dup`` into ``keep`` reversibly: repoint claims, union aliases, log, soft-mark.
+
+        The duplicate row is **not deleted** — it is marked ``merged_into = keep`` (so it
+        drops out of resolution/recall/consolidation but stays auditable), and the repointed
+        claim ids are recorded in ``knowledge_entity_merge_log`` so :meth:`unmerge_entity`
+        can fully reverse it. This is the one autonomous structural op, so it's recoverable.
+        """
+        moved = await conn.fetch(
+            "SELECT id FROM knowledge_claim WHERE subject_entity_id = $1 OR object_entity_id = $1", dup
+        )
+        claim_ids = [int(r["id"]) for r in moved]
         await conn.execute("UPDATE knowledge_claim SET subject_entity_id = $1 WHERE subject_entity_id = $2", keep, dup)
         await conn.execute("UPDATE knowledge_claim SET object_entity_id = $1 WHERE object_entity_id = $2", keep, dup)
         krow = await conn.fetchrow("SELECT canonical_name, aliases FROM knowledge_entity WHERE id = $1", keep)
@@ -810,7 +838,13 @@ class MemoryStore:
             krow["canonical_name"], list(krow["aliases"] or []), drow["canonical_name"], list(drow["aliases"] or [])
         )
         await conn.execute("UPDATE knowledge_entity SET aliases = $1 WHERE id = $2", new_aliases, keep)
-        await conn.execute("DELETE FROM knowledge_entity WHERE id = $1", dup)
+        await conn.execute("UPDATE knowledge_entity SET merged_into = $1, merged_at = now() WHERE id = $2", keep, dup)
+        await conn.execute(
+            "INSERT INTO knowledge_entity_merge_log (keeper_id, merged_id, claim_ids) VALUES ($1, $2, $3)",
+            keep,
+            dup,
+            claim_ids,
+        )
         logfire.info("Merged duplicate entity", keep_id=keep, dup_id=dup, dup_name=drow["canonical_name"])
 
     async def _merge_by_name(self, conn: _Conn) -> int:
@@ -820,7 +854,7 @@ class MemoryStore:
         formatting/accents/punctuation/plural ("@anemone" / "anemone"). Returns the number
         of duplicates folded away.
         """
-        rows = await conn.fetch("SELECT id, canonical_name FROM knowledge_entity ORDER BY id")
+        rows = await conn.fetch("SELECT id, canonical_name FROM knowledge_entity WHERE merged_into IS NULL ORDER BY id")
         groups: dict[str, list[int]] = {}
         for r in rows:
             key = normalize_entity_name(r["canonical_name"])
@@ -843,7 +877,9 @@ class MemoryStore:
         so its threshold is deliberately high. Each duplicate is folded into the lowest-id
         keeper. Returns the number folded away.
         """
-        entities = await conn.fetch("SELECT id, embedding::text AS emb FROM knowledge_entity ORDER BY id")
+        entities = await conn.fetch(
+            "SELECT id, embedding::text AS emb FROM knowledge_entity WHERE merged_into IS NULL ORDER BY id"
+        )
         merged_away: set[int] = set()
         max_dist = 1.0 - self._config.entity_merge_threshold
         merged = 0
@@ -851,7 +887,8 @@ class MemoryStore:
             if ent["id"] in merged_away:
                 continue
             dups = await conn.fetch(
-                "SELECT id FROM knowledge_entity WHERE id <> $1 AND embedding <=> $2::vector <= $3",
+                "SELECT id FROM knowledge_entity "
+                "WHERE merged_into IS NULL AND id <> $1 AND embedding <=> $2::vector <= $3",
                 ent["id"],
                 ent["emb"],
                 max_dist,
@@ -864,22 +901,81 @@ class MemoryStore:
                 merged += 1
         return merged
 
+    async def _merge_by_llm(self) -> int:
+        """Heal fragmentation the deterministic passes miss, via the entity linker (LLM).
+
+        For each active entity, offers its near-neighbours (within ``_LINK_FLOOR``) to
+        ``entity_linker``; on a confirmed same-entity match the two are merged (lowest id
+        kept). Decisions are made with NO transaction held — only each individual merge is
+        transactional (and re-checks both entities are still active). No-op without a linker.
+        Returns the number folded away.
+        """
+        if self.entity_linker is None:
+            return 0
+        async with self._pool.acquire() as conn:
+            entities = await conn.fetch(
+                "SELECT id, canonical_name, embedding::text AS emb FROM knowledge_entity "
+                "WHERE merged_into IS NULL ORDER BY id"
+            )
+        merged_away: set[int] = set()
+        merged = 0
+        for ent in entities:
+            ent_id = int(ent["id"])
+            if ent_id in merged_away:
+                continue
+            async with self._pool.acquire() as conn:
+                neighbors = await conn.fetch(
+                    "SELECT id, canonical_name FROM knowledge_entity "
+                    "WHERE merged_into IS NULL AND id <> $1 AND embedding <=> $2::vector <= $3 "
+                    "ORDER BY embedding <=> $2::vector LIMIT $4",
+                    ent_id,
+                    ent["emb"],
+                    1.0 - _LINK_FLOOR,
+                    _LINK_CANDIDATES,
+                )
+            offered = [(int(n["id"]), n["canonical_name"]) for n in neighbors if int(n["id"]) not in merged_away]
+            if not offered:
+                continue
+            chosen = await self.entity_linker(ent["canonical_name"], offered)
+            if chosen not in {oid for oid, _ in offered}:
+                continue
+            keep, dup = (chosen, ent_id) if chosen < ent_id else (ent_id, chosen)
+            async with self._pool.acquire() as conn:
+                async with conn.transaction():
+                    still_active = await conn.fetchval(
+                        "SELECT count(*) FROM knowledge_entity WHERE id = ANY($1) AND merged_into IS NULL",
+                        [keep, dup],
+                    )
+                    if still_active == 2:
+                        await self._merge_entity(conn, keep=keep, dup=dup)
+                        merged += 1
+            merged_away.add(dup)
+        return merged
+
     @logfire.instrument()
     async def consolidate(self) -> dict[str, int]:
-        """Merge duplicate entities (name pass, then embedding pass), then recompute.
+        """Merge duplicate entities (name, then embedding, then LLM pass), then recompute.
 
-        Pass 1 (:meth:`_merge_by_name`) collapses entities with an identical normalized
-        name key — high precision, any name length, no embeddings. Pass 2
-        (:meth:`_merge_by_embedding`) is a conservative embedding fallback at
-        ``entity_merge_threshold``. Both repoint claims, union aliases, and delete the
-        duplicate. Afterwards every live promotable-tier subject+predicate+object group is
-        re-evaluated, so a merge that newly satisfies the corroboration threshold promotes
-        to ``believed`` (and one that no longer does is demoted).
+        Pass 1 (:meth:`_merge_by_name`) collapses entities with an identical normalized name
+        key — high precision, no embeddings. Pass 2 (:meth:`_merge_by_embedding`) is a
+        conservative embedding fallback at ``entity_merge_threshold``. Pass 3
+        (:meth:`_merge_by_llm`, when a linker is wired and ``entity_merge_llm``) heals
+        fragmentation the deterministic passes miss. All merges are soft/reversible. Then
+        every live promotable subject+predicate+object group is re-evaluated, so a merge that
+        newly clears the corroboration threshold promotes to ``believed`` (or demotes).
         """
+        # Deterministic passes are atomic; the LLM pass makes decisions outside any
+        # transaction (each merge is its own short txn) so no transaction is held across an
+        # LLM call.
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 merged_by_name = await self._merge_by_name(conn)
                 merged_by_embedding = await self._merge_by_embedding(conn)
+
+        merged_by_llm = await self._merge_by_llm() if self._config.entity_merge_llm else 0
+
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
                 groups = await conn.fetch(
                     "SELECT DISTINCT subject_entity_id, predicate, object_text FROM knowledge_claim "
                     "WHERE retracted_at IS NULL AND superseded_by IS NULL AND status <> 'disputed' "
@@ -892,6 +988,7 @@ class MemoryStore:
         summary = {
             "merged_by_name": merged_by_name,
             "merged_by_embedding": merged_by_embedding,
+            "merged_by_llm": merged_by_llm,
             "groups_recomputed": len(groups),
         }
         logfire.info("Consolidation complete", summary=summary)
@@ -1057,6 +1154,65 @@ class MemoryStore:
         logfire.info("Decay complete", summary=summary)
         return summary
 
+    @logfire.instrument(extract_args=["merged_id"])
+    async def unmerge_entity(self, merged_id: int) -> bool:
+        """Reverse a soft-merge: reactivate ``merged_id`` and move its claims back from the keeper.
+
+        Uses the latest ``knowledge_entity_merge_log`` row for ``merged_id`` to repoint exactly
+        the claims that were folded in, clears the ``merged_into`` marker, drops the merged
+        name from the keeper's aliases, and recomputes corroboration for both entities. Returns
+        False if there's nothing to un-merge (no log row, or already active).
+        """
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                ent = await conn.fetchrow("SELECT merged_into FROM knowledge_entity WHERE id = $1", merged_id)
+                log = await conn.fetchrow(
+                    "SELECT keeper_id, claim_ids FROM knowledge_entity_merge_log "
+                    "WHERE merged_id = $1 ORDER BY merged_at DESC LIMIT 1",
+                    merged_id,
+                )
+                if ent is None or ent["merged_into"] is None or log is None:
+                    return False
+                keeper_id = int(log["keeper_id"])
+                claim_ids = [int(x) for x in (log["claim_ids"] or [])]
+                if claim_ids:
+                    await conn.execute(
+                        "UPDATE knowledge_claim SET subject_entity_id = $1 "
+                        "WHERE id = ANY($2) AND subject_entity_id = $3",
+                        merged_id,
+                        claim_ids,
+                        keeper_id,
+                    )
+                    await conn.execute(
+                        "UPDATE knowledge_claim SET object_entity_id = $1 WHERE id = ANY($2) AND object_entity_id = $3",
+                        merged_id,
+                        claim_ids,
+                        keeper_id,
+                    )
+                await conn.execute(
+                    "UPDATE knowledge_entity SET merged_into = NULL, merged_at = NULL WHERE id = $1", merged_id
+                )
+                merged_name = await conn.fetchval(
+                    "SELECT canonical_name FROM knowledge_entity WHERE id = $1", merged_id
+                )
+                keeper_aliases = await conn.fetchval("SELECT aliases FROM knowledge_entity WHERE id = $1", keeper_id)
+                if merged_name is not None and keeper_aliases is not None:
+                    pruned = [a for a in keeper_aliases if a.lower() != merged_name.lower()]
+                    await conn.execute("UPDATE knowledge_entity SET aliases = $1 WHERE id = $2", pruned, keeper_id)
+                # Claims moved between the two entities, so re-evaluate both their groups.
+                for eid in (keeper_id, merged_id):
+                    groups = await conn.fetch(
+                        "SELECT DISTINCT predicate, object_text FROM knowledge_claim "
+                        "WHERE subject_entity_id = $1 AND retracted_at IS NULL AND superseded_by IS NULL "
+                        "AND status <> 'disputed' AND trust_tier = ANY($2)",
+                        eid,
+                        list(PROMOTABLE_TIERS),
+                    )
+                    for g in groups:
+                        await self._recompute_corroboration(conn, eid, g["predicate"], g["object_text"])
+        logfire.info("Un-merged entity", merged_id=merged_id, keeper_id=keeper_id, claims_restored=len(claim_ids))
+        return True
+
     async def entity_neighbors(self, limit: int = 50, min_similarity: float = 0.5) -> list[EntityNeighbor]:
         """Most-similar entity pairs in the store, for calibrating ``entity_match_threshold``.
 
@@ -1075,11 +1231,11 @@ class MemoryStore:
                 CROSS JOIN LATERAL (
                     SELECT o.id, o.canonical_name AS name, o.embedding <=> e.embedding AS dist
                     FROM knowledge_entity o
-                    WHERE o.id <> e.id
+                    WHERE o.id <> e.id AND o.merged_into IS NULL
                     ORDER BY o.embedding <=> e.embedding
                     LIMIT 1
                 ) n
-                WHERE n.dist <= $1
+                WHERE e.merged_into IS NULL AND n.dist <= $1
                 ORDER BY n.dist
                 """,
                 max_dist,
@@ -1099,7 +1255,8 @@ class MemoryStore:
     async def stats(self) -> dict[str, object]:
         """Snapshot counts for observability (entities, sources, claims by status/tier)."""
         async with self._pool.acquire() as conn:
-            entities = await conn.fetchval("SELECT count(*) FROM knowledge_entity")
+            entities = await conn.fetchval("SELECT count(*) FROM knowledge_entity WHERE merged_into IS NULL")
+            merged_entities = await conn.fetchval("SELECT count(*) FROM knowledge_entity WHERE merged_into IS NOT NULL")
             sources = await conn.fetchval("SELECT count(*) FROM knowledge_source")
             live = "retracted_at IS NULL AND superseded_by IS NULL"
             by_status = await conn.fetch(
@@ -1112,6 +1269,7 @@ class MemoryStore:
             superseded = await conn.fetchval("SELECT count(*) FROM knowledge_claim WHERE superseded_by IS NOT NULL")
         return {
             "entities": int(entities or 0),
+            "merged_entities": int(merged_entities or 0),
             "sources": int(sources or 0),
             "live_by_status": {r["status"]: int(r["n"]) for r in by_status},
             "live_by_tier": {r["trust_tier"]: int(r["n"]) for r in by_tier},
