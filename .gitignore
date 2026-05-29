@@ -19,6 +19,7 @@ wheels/
 config.local.yaml
 test.ipynb
 /k8s/config.yaml
+/k8s/config.yaml.bak
 /k8s/secrets.txt
 
 mise.local.toml

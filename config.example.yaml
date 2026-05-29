@@ -23,9 +23,17 @@ llm_models:
   #   vision: false  # opt this string-form model out of vision routing
 # Pass images directly to the main LLM (requires a multimodal model)
 vision: true
-max_tokens: 512
+max_tokens: 512  # hard cap on reply/auto-post length; enforced via model_settings
 max_retries: 1
 http_timeout_seconds: 30
+# Sampling / anti-repetition knobs for the reply + auto-post models. Each is only
+# sent to the model when set, so leaving one unset keeps the provider default (and
+# avoids sending it to models that reject it). Positive frequency/presence penalties
+# reduce the bot reusing its own phrasing turn-after-turn.
+# temperature: 0.9          # 0.0-2.0
+# top_p: 0.95               # 0.0-1.0
+# frequency_penalty: 0.4    # -2.0-2.0; penalizes tokens by how often they recur
+# presence_penalty: 0.4     # -2.0-2.0; penalizes tokens that appeared at all
 # Parent notes to include as conversation context (default 1)
 max_context: 1
 # Cap on mentions (including the author) the bot echoes into a reply. Stops a note

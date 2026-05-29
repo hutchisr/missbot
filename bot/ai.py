@@ -376,6 +376,28 @@ class ChatAgent:
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self._agent.__aexit__(exc_type, exc, tb)
 
+    def _generation_settings(self, timeout: float) -> dict[str, Any]:
+        """Model settings for the reply/auto agents: the configured token cap
+        (``max_tokens`` — otherwise unused), any configured sampling/anti-repetition
+        knobs, and a per-call timeout.
+
+        Sampling params are only included when set in config, so unset ones keep the
+        provider default (and aren't sent to models that reject them).
+        """
+        settings: dict[str, Any] = {
+            "timeout": timeout,
+            "max_tokens": self._config.max_tokens,
+        }
+        if self._config.temperature is not None:
+            settings["temperature"] = self._config.temperature
+        if self._config.top_p is not None:
+            settings["top_p"] = self._config.top_p
+        if self._config.frequency_penalty is not None:
+            settings["frequency_penalty"] = self._config.frequency_penalty
+        if self._config.presence_penalty is not None:
+            settings["presence_penalty"] = self._config.presence_penalty
+        return settings
+
     @logfire.instrument(extract_args=["note"])
     async def run(self, note: Note, context: Optional[list[Note]] = None) -> str:
         """Process a note and generate a reply."""
@@ -441,7 +463,7 @@ class ChatAgent:
         run_kwargs: dict[str, Any] = {
             "deps": deps,
             "message_history": message_history,
-            "model_settings": {"timeout": 300.0},
+            "model_settings": self._generation_settings(300.0),
         }
         if run_model is not None:
             run_kwargs["model"] = run_model
@@ -531,7 +553,7 @@ class ChatAgent:
         result = await self._auto_agent.run(
             "Generate a post for the timeline.",
             message_history=message_history,
-            model_settings={"timeout": 300.0},
+            model_settings=self._generation_settings(300.0),
         )
         self._auto_history.append(result.output)
         return result.output

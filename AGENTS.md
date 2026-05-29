@@ -56,8 +56,10 @@ Required fields:
 - `bot_user_id`, `bot_username`
 - `llm_models`: list of model entries — either pydantic-ai strings (e.g. `"openrouter:anthropic/claude-3.5-sonnet"`) or dicts for custom OpenAI-compatible endpoints (`model`, `base_url`, optional `api_key` / `api_key_env`)
 - `system_prompt`, `max_tokens`, `max_retries`
+  - `max_tokens` is the hard reply/auto-post length cap. It's wired into the reply and auto agents' `model_settings` by `ChatAgent._generation_settings` (along with the sampling knobs below) — unset, models generate unboundedly and long replies get truncated at the Misskey note cap, which makes the bot resume/repeat itself on the next turn
 
 Optional fields:
+- `temperature`, `top_p`, `frequency_penalty`, `presence_penalty` (all default unset/`None`): sampling + anti-repetition knobs for the **reply and auto-post** models, applied via `ChatAgent._generation_settings`. Each is only sent to the model when set (so an unset one keeps the provider default and isn't sent to models that reject it). Positive `frequency_penalty`/`presence_penalty` curb the bot reusing its own phrasing turn-after-turn. Bounds: temperature 0–2, top_p 0–1, penalties −2–2. The scoring/extraction/entity-linker agents are unaffected (they keep their own structured-output settings)
 - `vision`: bool (default `true`) — pass images directly to the main LLM
 - `vision_models`: legacy, unused when `vision=true`
 - `system_prompt_auto` + `auto_post_interval`: autonomous posting (interval in seconds)

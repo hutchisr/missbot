@@ -188,6 +188,33 @@ class Config(BaseModel):
         default=None, description="Vision model strings (legacy, unused when vision=True)"
     )
     max_tokens: int = Field(gt=0)
+    temperature: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=2.0,
+        description="Sampling temperature for the reply/auto models. None leaves the provider default "
+        "unchanged. Higher = more varied (helps avoid the bot repeating its own phrasing).",
+    )
+    top_p: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        le=1.0,
+        description="Nucleus-sampling top_p for the reply/auto models. None leaves the provider default.",
+    )
+    frequency_penalty: Optional[float] = Field(
+        default=None,
+        ge=-2.0,
+        le=2.0,
+        description="Frequency penalty for the reply/auto models (penalizes tokens by how often they've "
+        "appeared). Positive values reduce verbatim self-repetition. None = not sent (provider default).",
+    )
+    presence_penalty: Optional[float] = Field(
+        default=None,
+        ge=-2.0,
+        le=2.0,
+        description="Presence penalty for the reply/auto models (penalizes tokens that appeared at all). "
+        "Positive values push the model toward new topics/phrasing. None = not sent (provider default).",
+    )
     bot_user_id: str = Field(description="bot_user_id")
     bot_username: str = Field(description="bot_username")
     system_prompt: str = Field(description="system_prompt")
@@ -263,7 +290,7 @@ class Config(BaseModel):
         "delta applied in code (the model only picks a category, never the number). Defaults to the built-in "
         "toxic/rude/neutral/good/exceptional set. Names must be unique (case-insensitive).",
     )
-    max_context: int = Field(gt=0, default=1, description="Number of context messages to include")
+    max_context: int = Field(gt=0, default=3, description="Number of context messages to include")
     ignore_direct_messages: bool = Field(
         default=True,
         description="Ignore direct/private messages (Misskey 'specified' visibility) instead of replying. "
