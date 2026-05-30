@@ -1,6 +1,5 @@
 """Tests for bot.tools."""
 
-import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -11,7 +10,6 @@ from unittest.mock import patch
 from datetime import datetime, timezone
 
 from bot.extract import ExtractedClaim, Skip
-from bot import tools as bot_tools
 from bot.memory import ClaimWriteResult, ConflictingClaim, RecalledClaim
 from bot.tools import build_tools, current_datetime
 
@@ -134,67 +132,6 @@ def test_domain_of_normalizes_host():
     assert _domain_of("https://en.wikipedia.org/wiki/X") == "en.wikipedia.org"
     assert _domain_of("not a url") is None
     assert _domain_of("") is None
-
-
-@pytest.mark.anyio
-async def test_search_web_ingests_results_as_web_claims(make_config):
-    cfg = make_config(
-        searxng_url="https://searx.example/",
-        memory_enabled=True,
-        postgres_url="postgres://u:p@db/x",
-        embedding_model="perplexity/pplx-embed-v1-0.6b",
-    )
-    mem = _fake_memory()
-    extractor = _extractor(ExtractedClaim(subject="Python", predicate="latest_version", object="3.13"))
-    search_web = _find(build_tools(cfg, memory=mem, extractor=extractor), "search_web")
-    response = MagicMock()
-    response.json.return_value = {
-        "results": [
-            {"content": "Python 3.13 is out", "url": "https://www.python.org/downloads"},
-            {"content": "Python 3.13 is out", "url": "https://blog.example.com/post"},
-        ]
-    }
-    _, manager = _mock_async_client(response)
-
-    with patch("bot.tools.httpx.AsyncClient", return_value=manager):
-        result = await search_web("python version")
-        # Ingestion is fire-and-forget (background task) so it doesn't block the search;
-        # drain the scheduled tasks before asserting on the writes.
-        await asyncio.gather(*list(bot_tools._web_ingest_tasks))
-
-    # Domains surfaced to the model as provenance.
-    assert "[python.org]" in result and "[blog.example.com]" in result
-    # Each result ingested as a secondary-tier web claim attributed to its domain.
-    assert mem.add_claim.await_count == 2
-    by_domain = {c.kwargs["source_name"]: c.kwargs for c in mem.add_claim.await_args_list}
-    assert set(by_domain) == {"python.org", "blog.example.com"}
-    for kw in by_domain.values():
-        assert kw["source_kind"] == "web"
-        assert kw["trust_tier"] == "secondary"
-        assert kw.get("author") is None  # web claims have no author
-
-
-@pytest.mark.anyio
-async def test_search_web_skips_ingestion_when_disabled(make_config):
-    cfg = make_config(
-        searxng_url="https://searx.example/",
-        memory_enabled=True,
-        postgres_url="postgres://u:p@db/x",
-        embedding_model="perplexity/pplx-embed-v1-0.6b",
-        memory_ingest_web=False,
-    )
-    mem = _fake_memory()
-    extractor = _extractor()
-    search_web = _find(build_tools(cfg, memory=mem, extractor=extractor), "search_web")
-    response = MagicMock()
-    response.json.return_value = {"results": [{"content": "x", "url": "https://python.org/"}]}
-    _, manager = _mock_async_client(response)
-
-    with patch("bot.tools.httpx.AsyncClient", return_value=manager):
-        await search_web("q")
-
-    mem.add_claim.assert_not_awaited()
-    extractor.assert_not_awaited()
 
 
 def test_search_users_formats_results_and_clamps_limit(config):

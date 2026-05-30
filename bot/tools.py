@@ -1,6 +1,5 @@
 """Tool utilities for Missbot."""
 
-import asyncio
 import json
 import secrets
 from collections.abc import Awaitable, Callable
@@ -13,20 +12,9 @@ import logfire
 from pydantic_ai import RunContext
 from redis.asyncio import Redis
 
-from .extract import ClaimExtraction, ExtractedClaim, Skip
+from .extract import ClaimExtraction, Skip
 from .memory import MemoryStore, RecalledClaim
 from .models import Config
-
-# Strong refs for fire-and-forget web-ingestion tasks; asyncio holds only weak refs,
-# so without this the task could be GC'd mid-run.
-_web_ingest_tasks: set[asyncio.Task] = set()
-
-
-def _spawn_web_ingest(coro) -> None:
-    """Schedule best-effort web ingestion in the background (don't block the search)."""
-    task = asyncio.create_task(coro)
-    _web_ingest_tasks.add(task)
-    task.add_done_callback(_web_ingest_tasks.discard)
 
 
 def _fence_untrusted(label: str, body: str) -> str:
@@ -79,44 +67,6 @@ def _domain_of(url: str) -> Optional[str]:
     if host.startswith("www."):
         host = host[4:]
     return host or None
-
-
-async def _ingest_web_results(
-    memory: MemoryStore,
-    extractor: Callable[[str], Awaitable[Optional[ClaimExtraction]]],
-    results: list[dict],
-) -> None:
-    """Deterministically ingest web-search results as `secondary`-tier claims.
-
-    Each result's content passes through the same hardened extraction admission gate as
-    every other write; an accepted claim is attributed to the result's domain (kind=web).
-    The source is set by code from the result URL, never by model self-report, so distinct
-    domains agreeing can corroborate a claim into 'believed'. Best-effort and concurrent;
-    a failure on one result never fails the search.
-    """
-
-    async def _one(result: dict) -> None:
-        domain = _domain_of(result.get("url") or "")
-        if not domain:
-            return
-        try:
-            extracted = await extractor(result["content"])
-            if not isinstance(extracted, ExtractedClaim):
-                return
-            await memory.add_claim(
-                subject=extracted.subject,
-                predicate=extracted.predicate,
-                object_text=extracted.object,
-                source_name=domain,
-                source_kind="web",
-                trust_tier="secondary",
-                volatility=extracted.volatility,
-                confidence=extracted.confidence,
-            )
-        except Exception:
-            logfire.exception("Web claim ingestion failed (search result still returned)", domain=domain)
-
-    await asyncio.gather(*(_one(r) for r in results))
 
 
 def current_datetime() -> str:
@@ -179,7 +129,6 @@ def build_tools(
     tools.append(current_datetime_tool)
 
     if config.searxng_url:
-        _web_extractor = extractor
 
         @logfire.instrument()
         async def search_web(query: str) -> Optional[str]:
@@ -203,19 +152,6 @@ def build_tools(
                     return None
 
             results = [r for r in data.get("results", [])[:5] if r.get("content")]
-            # Deterministically learn from results: attribute each to its domain at the
-            # 'secondary' tier (the model never picks the source). Gated + best-effort, and
-            # fired in the BACKGROUND so the extraction/embedding work never adds latency to
-            # the search result the model is waiting on.
-            if (
-                results
-                and memory is not None
-                and config.memory_enabled
-                and config.memory_ingest_web
-                and _web_extractor is not None
-            ):
-                _spawn_web_ingest(_ingest_web_results(memory, _web_extractor, results))
-
             # Surface each snippet's domain so the model sees provenance too.
             lines: list[str] = []
             for r in results:
