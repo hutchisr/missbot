@@ -247,6 +247,29 @@ def build_entity_linker(config: Config) -> Optional[EntityLinker]:
     return link
 
 
+# Characters reserved on a reply for the mention prefix the bot prepends before
+# sending (up to ``max_reply_mentions`` handles, e.g. ``@user@remote.example``).
+# Telling the model a budget below the raw cap keeps the final note — mentions
+# included — within the platform limit. There is no truncation backstop: an
+# over-cap note is refused (bot/bot.py:send_note), so the budget must hold.
+_MENTION_HEADROOM = 280
+
+
+def _length_instruction(char_limit: int) -> str:
+    """Instruction telling a reply/auto model its hard character budget.
+
+    There is no post-hoc truncation: a note over the platform cap is refused, so
+    the model must compose a complete reply within the budget rather than rely on
+    its output being trimmed.
+    """
+    return (
+        f"Hard length limit: your entire reply must be at most {char_limit} characters. "
+        "This is a strict platform cap, not a target. A reply over the limit is cut off "
+        "mid-sentence, so plan a complete, self-contained answer that fits — do not begin "
+        "anything you cannot finish within the budget. Prefer concision; stop when done."
+    )
+
+
 class ChatAgent:
     def __init__(
         self,
@@ -324,11 +347,14 @@ class ChatAgent:
                 )
             return "\n".join(parts)
 
+        # Budget the reply below the raw note cap so the prepended mention prefix
+        # still fits; the auto post (no mentions) gets the full cap.
+        reply_char_budget = max(1, config.max_note_length - _MENTION_HEADROOM)
         self._agent: Agent[AgentDeps, str] = Agent(
             model,
             output_type=str,
             deps_type=AgentDeps,
-            instructions=[config.system_prompt, _inject_social_credit],
+            instructions=[config.system_prompt, _length_instruction(reply_char_budget), _inject_social_credit],
             tools=tools,
             toolsets=mcp_toolsets or None,
             retries=3,
@@ -340,7 +366,7 @@ class ChatAgent:
             self._auto_agent = Agent(
                 model,
                 output_type=str,
-                instructions=[config.system_prompt_auto],
+                instructions=[config.system_prompt_auto, _length_instruction(config.max_note_length)],
                 tools=auto_tools,
                 retries=3,
             )

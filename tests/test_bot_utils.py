@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from bot.bot import MAX_NOTE_LENGTH, Bot, _truncate_to_limit
+from bot.bot import Bot
 from bot.models import MiFile
 
 
@@ -303,72 +303,55 @@ async def test_on_auto_reply_updates_timestamp_and_triggers_reply(make_config, f
     mention_mock.assert_awaited_once_with(note)
 
 
-def test_truncate_to_limit_no_op_under_limit():
-    assert _truncate_to_limit("hello") == "hello"
-
-
-def test_truncate_to_limit_truncates_with_suffix():
-    text = "x" * (MAX_NOTE_LENGTH + 50)
-    truncated = _truncate_to_limit(text)
-    assert len(truncated) == MAX_NOTE_LENGTH
-    assert truncated.endswith("…")
-
-
 @pytest.mark.anyio
-async def test_send_note_truncates_oversized_output(bot, make_note):
+async def test_send_note_raises_on_oversized_output(bot, make_note):
+    """Over-cap output is refused, not truncated — the model ignored its length budget."""
     note = make_note()
-    response = MagicMock()
-    response.json.return_value = {"createdNote": {"id": "created-note"}}
-    long_output = "a" * (MAX_NOTE_LENGTH + 500)
+    limit = bot._config.max_note_length
+    long_output = "a" * (limit + 500)
 
     with (
         patch.object(bot, "_build_mentions_from_note", AsyncMock(return_value=[])),
-        patch("bot.bot.api_client.post", AsyncMock(return_value=response)) as post_mock,
+        patch("bot.bot.api_client.post", AsyncMock(return_value=MagicMock())) as post_mock,
     ):
-        await bot.send_note(long_output, in_reply_to=note)
+        with pytest.raises(ValueError):
+            await bot.send_note(long_output, in_reply_to=note)
 
-    payload = post_mock.await_args.kwargs["json"]
-    assert len(payload["text"]) == MAX_NOTE_LENGTH
-    assert payload["text"].endswith("…")
+    post_mock.assert_not_awaited()
 
 
 @pytest.mark.anyio
-async def test_send_note_truncates_after_mentions_prepended(bot, make_note):
-    """Mentions count toward the 3000-char cap, so truncation must happen after they're prepended."""
+async def test_send_note_raises_when_mentions_push_over_cap(bot, make_note):
+    """Mentions count toward the cap, so a body that just fits can overflow once they're prepended."""
     note = make_note()
-    response = MagicMock()
-    response.json.return_value = {"createdNote": {"id": "created-note"}}
-    # Body alone fits, but body + mention header will overflow.
-    body = "a" * (MAX_NOTE_LENGTH - 5)
+    limit = bot._config.max_note_length
+    # Body alone fits, but body + mention header overflows.
+    body = "a" * (limit - 5)
     long_mention = "@" + ("b" * 100)
 
     with (
         patch.object(bot, "_build_mentions_from_note", AsyncMock(return_value=[long_mention])),
-        patch("bot.bot.api_client.post", AsyncMock(return_value=response)) as post_mock,
+        patch("bot.bot.api_client.post", AsyncMock(return_value=MagicMock())) as post_mock,
     ):
-        await bot.send_note(body, in_reply_to=note)
+        with pytest.raises(ValueError):
+            await bot.send_note(body, in_reply_to=note)
 
-    payload = post_mock.await_args.kwargs["json"]
-    assert len(payload["text"]) == MAX_NOTE_LENGTH
-    assert payload["text"].startswith(long_mention)
-    assert payload["text"].endswith("…")
+    post_mock.assert_not_awaited()
 
 
 @pytest.mark.anyio
-async def test_post_autonomous_truncates_oversized_output(bot):
-    response = MagicMock()
-    response.json.return_value = {"createdNote": {"id": "auto-1"}}
-    long_output = "z" * (MAX_NOTE_LENGTH + 200)
+async def test_post_autonomous_raises_on_oversized_output(bot):
+    limit = bot._config.max_note_length
+    long_output = "z" * (limit + 200)
 
     with (
         patch.object(bot._agent, "run_auto", AsyncMock(return_value=long_output)),
-        patch("bot.bot.api_client.post", AsyncMock(return_value=response)) as post_mock,
+        patch("bot.bot.api_client.post", AsyncMock(return_value=MagicMock())) as post_mock,
     ):
-        await bot.post_autonomous()
+        with pytest.raises(ValueError):
+            await bot.post_autonomous()
 
-    payload = post_mock.await_args.kwargs["json"]
-    assert len(payload["text"]) == MAX_NOTE_LENGTH
-    assert payload["text"].endswith("…")
+    post_mock.assert_not_awaited()
 
 
 @pytest.mark.anyio

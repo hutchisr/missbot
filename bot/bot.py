@@ -28,16 +28,6 @@ from .api import api_client
 
 _REDIS_AUTO_REPLY_KEY = "global:last_auto_reply_time"
 
-# Misskey enforces a 3000-character cap on note text.
-MAX_NOTE_LENGTH = 3000
-_TRUNCATION_SUFFIX = "…"
-
-
-def _truncate_to_limit(text: str, limit: int = MAX_NOTE_LENGTH) -> str:
-    if len(text) <= limit:
-        return text
-    return text[: limit - len(_TRUNCATION_SUFFIX)] + _TRUNCATION_SUFFIX
-
 
 class Bot:
     def __init__(
@@ -110,13 +100,15 @@ class Bot:
         text = self._strip_leading_mentions(output)
         if mentions:
             text = f"{' '.join(mentions)} {text}"
-        if len(text) > MAX_NOTE_LENGTH:
-            logfire.warning(
-                "Reply exceeds Misskey note length cap; truncating",
-                original_length=len(text),
-                limit=MAX_NOTE_LENGTH,
+        # The reply model is told its character budget up front (bot/ai.py:_length_instruction),
+        # so over-cap output means it ignored that budget. Fail fast rather than ship a note the
+        # model didn't intend to end here (truncation chops mid-sentence and Misskey 400s anyway).
+        limit = self._config.max_note_length
+        if len(text) > limit:
+            raise ValueError(
+                f"Reply is {len(text)} chars, over the {limit}-char note cap "
+                "(model ignored its length budget); refusing to send."
             )
-            text = _truncate_to_limit(text)
 
         payload: dict[str, object] = {
             "text": text,
@@ -279,13 +271,12 @@ class Bot:
     async def post_autonomous(self):
         """Generate and post an autonomous note to the timeline."""
         result = await self._agent.run_auto()
-        if len(result) > MAX_NOTE_LENGTH:
-            logfire.warning(
-                "Autonomous post exceeds Misskey note length cap; truncating",
-                original_length=len(result),
-                limit=MAX_NOTE_LENGTH,
+        limit = self._config.max_note_length
+        if len(result) > limit:
+            raise ValueError(
+                f"Autonomous post is {len(result)} chars, over the {limit}-char note cap "
+                "(model ignored its length budget); refusing to send."
             )
-            result = _truncate_to_limit(result)
         response = await api_client.post(
             f"{self.url}api/notes/create",
             json={"text": result, "visibility": "public"},

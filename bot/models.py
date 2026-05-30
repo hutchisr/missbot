@@ -188,6 +188,14 @@ class Config(BaseModel):
         default=None, description="Vision model strings (legacy, unused when vision=True)"
     )
     max_tokens: int = Field(gt=0)
+    max_note_length: int = Field(
+        default=3000,
+        gt=0,
+        description="Hard character cap for a single note (matches the Misskey instance's "
+        "maxNoteTextLength, default 3000). The reply/auto models are told this budget so "
+        "they compose a complete in-bounds reply; over-cap output is truncated only as a "
+        "last-resort safety net (Misskey rejects an over-cap note with HTTP 400).",
+    )
     temperature: Optional[float] = Field(
         default=None,
         ge=0.0,

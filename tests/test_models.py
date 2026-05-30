@@ -11,7 +11,7 @@ def test_config_valid(make_config):
     assert cfg.domain == "example.test"
     assert cfg.max_retries == 2
     assert cfg.vision is True
-    assert cfg.max_context == 1
+    assert cfg.max_context == 3
     assert cfg.http_timeout_seconds == 30.0
 
 
