@@ -1,19 +1,16 @@
 """Injection-resistant claim extraction for the world-knowledge store.
 
-The world-knowledge store keeps *claims with provenance*, not bare facts (see
-``bot/memory.py``). Before anything is written, a submitted fact is run through a
-tool-less extraction agent whose output is constrained to a discriminated union:
-either a typed subject/predicate/object ``ExtractedClaim`` or an explicit ``Skip``
-rejection. This mirrors the constrained-output defence used by ``bot/scoring.py``.
+Each incoming user note is run through a tool-less extraction agent whose output is
+constrained to a discriminated union: either a typed subject/predicate/object
+``ExtractedClaim`` or an explicit ``Skip`` rejection (see ``bot/memory.py`` for how the
+resulting claim is stored and ranked by user agreement). This mirrors the
+constrained-output defence used by ``bot/scoring.py``.
 
-This is the admission gate. The agent reads attacker-controlled text as UNTRUSTED
-DATA and can only (a) extract a structured claim about a real, identifiable entity
-or (b) reject it. It cannot emit free-form prose, decide on its own "this is
-interesting", or dictate a claim's trust/truth — those are owned by code. The
-``Skip`` branch is what blocks the "sovereign blob" failure mode: a dense jargon
-"definition" not tied to a tracked entity is rejected here rather than smuggled in
-as a fact. (Even when something *is* admitted, an LLM-sourced claim enters at the
-lowest ``model_quarantine`` tier and can never be promoted — see ``bot/memory.py``.)
+The agent reads attacker-controlled note text as UNTRUSTED DATA and can only (a) extract a
+structured claim about a real, identifiable entity or (b) reject it. It cannot emit
+free-form prose or decide on its own "this is interesting". The ``Skip`` branch blocks the
+"sovereign blob" failure mode: a dense jargon "definition" not tied to a tracked entity is
+rejected here rather than smuggled in as a fact.
 """
 
 import re

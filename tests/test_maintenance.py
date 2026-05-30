@@ -13,18 +13,8 @@ from bot.memory import EntityNeighbor
 @pytest.fixture
 def fake_store() -> AsyncMock:
     store = AsyncMock()
-    store.consolidate.return_value = {
-        "merged_by_name": 2,
-        "merged_by_embedding": 0,
-        "merged_by_llm": 1,
-        "groups_recomputed": 5,
-    }
-    store.detect_contradictions.return_value = {"conflicting_groups": 1, "cleared_groups": 0}
-    store.resolve_disputes.return_value = {"resolved_groups": 1}
-    store.decay.return_value = {"tombstoned": 4}
-    store.retract_source.return_value = 3
-    store.unmerge_entity.return_value = True
-    store.stats.return_value = {"entities": 10, "sources": 4}
+    store.consolidate.return_value = {"merged_by_name": 2, "merged_by_embedding": 0, "merged_by_llm": 1}
+    store.stats.return_value = {"entities": 10, "claims": 40, "subjects": 12, "authors": 8}
     store.entity_neighbors.return_value = [
         EntityNeighbor("Python", "Python (programming language)", 0.94),
         EntityNeighbor("Java", "Java (island)", 0.71),
@@ -55,72 +45,11 @@ def test_consolidate_runs_and_closes(make_config, fake_store):
     assert "merged_by_name" in result.output
 
 
-def test_detect_contradictions_runs(make_config, fake_store):
-    result = _invoke(["detect-contradictions", "-c", "x.yaml"], _memory_cfg(make_config), fake_store)
-    assert result.exit_code == 0, result.output
-    fake_store.detect_contradictions.assert_awaited_once()
-    fake_store.close.assert_awaited_once()
-
-
-def test_resolve_disputes_runs(make_config, fake_store):
-    result = _invoke(["resolve-disputes", "-c", "x.yaml"], _memory_cfg(make_config), fake_store)
-    assert result.exit_code == 0, result.output
-    fake_store.resolve_disputes.assert_awaited_once()
-    fake_store.close.assert_awaited_once()
-
-
-def test_decay_runs(make_config, fake_store):
-    result = _invoke(["decay", "-c", "x.yaml"], _memory_cfg(make_config), fake_store)
-    assert result.exit_code == 0, result.output
-    fake_store.decay.assert_awaited_once()
-    fake_store.close.assert_awaited_once()
-
-
-def test_run_all_runs_full_pass(make_config, fake_store):
-    result = _invoke(["run-all", "-c", "x.yaml"], _memory_cfg(make_config), fake_store)
-    assert result.exit_code == 0, result.output
-    fake_store.consolidate.assert_awaited_once()
-    fake_store.detect_contradictions.assert_awaited_once()
-    fake_store.resolve_disputes.assert_awaited_once()
-    fake_store.decay.assert_awaited_once()
-    assert set(json.loads(result.output)) == {
-        "consolidate",
-        "detect_contradictions",
-        "resolve_disputes",
-        "decay",
-    }
-
-
-def test_retract_source_passes_name_and_kind(make_config, fake_store):
-    result = _invoke(
-        ["retract-source", "-c", "x.yaml", "--name", "evil.example", "--kind", "web"],
-        _memory_cfg(make_config),
-        fake_store,
-    )
-    assert result.exit_code == 0, result.output
-    fake_store.retract_source.assert_awaited_once_with("evil.example", "web")
-    assert "Retracted 3" in result.output
-
-
-def test_unmerge_runs_and_reports(make_config, fake_store):
-    result = _invoke(["unmerge", "-c", "x.yaml", "--id", "42"], _memory_cfg(make_config), fake_store)
-    assert result.exit_code == 0, result.output
-    fake_store.unmerge_entity.assert_awaited_once_with(42)
-    assert "Un-merged entity 42" in result.output
-
-
-def test_unmerge_reports_nothing_to_do(make_config, fake_store):
-    fake_store.unmerge_entity.return_value = False
-    result = _invoke(["unmerge", "-c", "x.yaml", "--id", "7"], _memory_cfg(make_config), fake_store)
-    assert result.exit_code == 0, result.output
-    assert "Nothing to un-merge" in result.output
-
-
 def test_stats_prints_json(make_config, fake_store):
     result = _invoke(["stats", "-c", "x.yaml"], _memory_cfg(make_config), fake_store)
     assert result.exit_code == 0, result.output
     fake_store.stats.assert_awaited_once()
-    assert json.loads(result.output) == {"entities": 10, "sources": 4}
+    assert json.loads(result.output) == {"entities": 10, "claims": 40, "subjects": 12, "authors": 8}
 
 
 def test_calibrate_entities_lists_pairs_and_threshold(make_config, fake_store):

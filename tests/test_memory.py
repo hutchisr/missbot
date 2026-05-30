@@ -3,18 +3,16 @@
 from datetime import datetime, timedelta, timezone
 
 from bot.memory import (
-    PROMOTABLE_TIERS,
     ConflictingClaim,
     RecalledClaim,
     _vector_literal,
-    is_stale,
     merge_aliases,
     normalize_entity_name,
+    normalize_object,
     normalize_predicate,
-    rank_dispute_values,
+    object_group_key,
     render_claim,
     resolve_conflict,
-    tier_rank,
 )
 
 
@@ -37,103 +35,22 @@ def test_render_claim_humanizes_predicate():
     assert render_claim("Python", "latest_version", "3.13") == "Python — latest version: 3.13"
 
 
-def test_quarantine_and_user_tiers_are_not_promotable():
-    # The safety core: LLM (model_quarantine) and plain user claims can never be
-    # corroborated into 'believed' — only secondary/primary tiers count.
-    assert "model_quarantine" not in PROMOTABLE_TIERS
-    assert "user" not in PROMOTABLE_TIERS
-    assert set(PROMOTABLE_TIERS) == {"secondary", "primary"}
-    assert tier_rank("primary") > tier_rank("secondary") > tier_rank("user") > tier_rank("model_quarantine")
-    assert tier_rank("nonsense") == 0
+def _value(object_text: str, agreed_by: int, recency: datetime) -> dict:
+    return {"object_text": object_text, "agreed_by": agreed_by, "recency": recency}
 
 
-def test_is_stale_only_for_volatile_past_ttl():
-    now = datetime.now(timezone.utc)
-    old = now - timedelta(days=3)
-    fresh = now - timedelta(minutes=1)
-    assert is_stale("volatile", old, now, 86400) is True
-    assert is_stale("volatile", fresh, now, 86400) is False
-    assert is_stale("stable", old, now, 86400) is False
-    assert is_stale("slow", old, now, 86400) is False
-    assert is_stale("volatile", None, now, 86400) is False
-
-
-def _claim(status: str, tier: str, recorded_at: datetime, object_text: str, valid_from=None) -> dict:
-    return {
-        "status": status,
-        "trust_tier": tier,
-        "recorded_at": recorded_at,
-        "valid_from": valid_from,
-        "object_text": object_text,
-    }
-
-
-def test_resolve_conflict_prefers_believed_over_asserted():
-    now = datetime.now(timezone.utc)
-    asserted = _claim("asserted", "primary", now, "A")
-    believed = _claim("believed", "user", now, "B")  # weaker tier but believed
-    assert resolve_conflict([asserted, believed])["object_text"] == "B"
-
-
-def test_resolve_conflict_breaks_ties_by_trust_then_recency():
+def test_resolve_conflict_prefers_more_agreement():
     now = datetime.now(timezone.utc)
     older = now - timedelta(days=1)
-    # Same status -> higher trust tier wins.
-    assert (
-        resolve_conflict([_claim("asserted", "user", now, "D"), _claim("asserted", "primary", older, "C")])[
-            "object_text"
-        ]
-        == "C"
-    )
-    # Same status and tier -> most recent valid_from/recorded_at wins.
-    assert (
-        resolve_conflict([_claim("asserted", "secondary", older, "E"), _claim("asserted", "secondary", now, "F")])[
-            "object_text"
-        ]
-        == "F"
-    )
+    # More distinct users assert "A", so it wins even though "B" is more recent.
+    assert resolve_conflict([_value("A", 3, older), _value("B", 1, now)])["object_text"] == "A"
 
 
-def test_resolve_conflict_user_agreement_breaks_ties_within_tier():
+def test_resolve_conflict_breaks_ties_by_recency():
     now = datetime.now(timezone.utc)
     older = now - timedelta(days=1)
-    # Same status+tier: a value more users agree on beats a fresher single-user value.
-    agreed = {**_claim("asserted", "user", older, "G"), "user_corroboration_count": 3}
-    lone = {**_claim("asserted", "user", now, "H"), "user_corroboration_count": 1}
-    assert resolve_conflict([lone, agreed])["object_text"] == "G"
-
-
-def test_user_agreement_never_outranks_a_trusted_tier():
-    now = datetime.now(timezone.utc)
-    older = now - timedelta(days=1)
-    # Even with many users agreeing, a user-tier value can't beat a (fresher-or-not)
-    # secondary one — the agreement term sits *below* trust tier in the sort key.
-    crowd = {**_claim("asserted", "user", now, "I"), "user_corroboration_count": 99}
-    trusted = {**_claim("asserted", "secondary", older, "J"), "user_corroboration_count": 0}
-    assert resolve_conflict([crowd, trusted])["object_text"] == "J"
-
-
-def test_rank_dispute_values_prefers_more_independent_sources():
-    now = datetime.now(timezone.utc)
-    older = now - timedelta(days=1)
-    claims = [
-        {"object_text": "A", "trust_tier": "secondary", "source_id": 1, "valid_from": None, "recorded_at": older},
-        {"object_text": "A", "trust_tier": "secondary", "source_id": 2, "valid_from": None, "recorded_at": older},
-        {"object_text": "B", "trust_tier": "secondary", "source_id": 3, "valid_from": None, "recorded_at": now},
-    ]
-    # Two independent secondary sources beat a single more-recent one.
-    assert rank_dispute_values(claims) == "A"
-
-
-def test_rank_dispute_values_breaks_ties_by_recency():
-    now = datetime.now(timezone.utc)
-    older = now - timedelta(days=1)
-    claims = [
-        {"object_text": "old", "trust_tier": "user", "source_id": 1, "valid_from": None, "recorded_at": older},
-        {"object_text": "new", "trust_tier": "user", "source_id": 2, "valid_from": None, "recorded_at": now},
-    ]
-    # No promotable sources and same tier -> most recent assertion wins.
-    assert rank_dispute_values(claims) == "new"
+    # Equal agreement -> the most recently asserted value wins.
+    assert resolve_conflict([_value("old", 2, older), _value("new", 2, now)])["object_text"] == "new"
 
 
 def test_merge_aliases_unions_dedupes_and_drops_keeper_name():
@@ -172,26 +89,49 @@ def test_normalize_entity_name_keeps_distinct_entities_apart():
     assert normalize_entity_name("Larena et al.") != normalize_entity_name("Maximilian Larena")  # paper vs author
 
 
-def test_recalled_claim_carries_provenance():
-    now = datetime.now(timezone.utc)
+def test_normalize_object_collapses_formatting_variants():
+    # Same value, different case/accents/whitespace -> one key (so they agree).
+    assert normalize_object("Arch Linux") == normalize_object("arch linux")
+    assert normalize_object("Arch  Linux") == normalize_object("Arch Linux")  # collapsed whitespace
+    assert normalize_object("  Arch Linux\n") == normalize_object("Arch Linux")  # surrounding whitespace
+    assert normalize_object("São Paulo") == normalize_object("Sao Paulo")  # accents stripped
+    assert normalize_object("Arch Linux") == "arch linux"
+
+
+def test_normalize_object_keeps_distinct_values_apart():
+    # Deliberately conservative: NO plural fold and NO internal-punctuation stripping, because
+    # object values are heterogeneous and a wrong merge miscounts agreement.
+    assert normalize_object("3.13") != normalize_object("3 13")  # version punctuation preserved
+    assert normalize_object("Windows") != normalize_object("Window")  # plurals NOT folded
+    assert normalize_object("v3.13") != normalize_object("3.13")
+    assert normalize_object("tribes") != normalize_object("tribe")
+
+
+def test_normalize_object_handles_empty():
+    assert normalize_object("") == ""
+    assert normalize_object("   ") == ""
+
+
+def test_object_group_key_uses_entity_then_text():
+    # Linked objects group by entity id (namespaced 'e'); unlinked fall back to the text key ('k').
+    assert object_group_key(5, "anything") == "e5"
+    assert object_group_key(None, "arch linux") == "karch linux"
+    # An entity id and a numeric-looking literal can't collide thanks to the prefixes.
+    assert object_group_key(5, "5") != object_group_key(None, "5")
+    # Two surface forms linked to the same entity share a key; an unlinked variant does not.
+    assert object_group_key(5, "arch linux") == object_group_key(5, "arch")
+    assert object_group_key(5, "arch linux") != object_group_key(None, "arch linux")
+
+
+def test_recalled_claim_shape():
     c = RecalledClaim(
         subject="Python",
         predicate="latest_version",
         object_text="3.13",
-        status="believed",
-        trust_tier="secondary",
-        source_name="python.org",
-        source_kind="web",
-        confidence=0.9,
-        corroboration_count=2,
-        user_corroboration_count=0,
-        volatility="volatile",
-        recorded_at=now,
-        valid_from=None,
+        agreed_by=3,
         similarity=0.88,
-        stale=False,
-        conflicts=[ConflictingClaim("3.12", "blog", "web", "secondary", "asserted")],
+        conflicts=[ConflictingClaim(object_text="3.12", agreed_by=1)],
     )
-    assert c.source_name == "python.org"
-    assert c.corroboration_count == 2
+    assert c.agreed_by == 3
     assert c.conflicts[0].object_text == "3.12"
+    assert c.conflicts[0].agreed_by == 1

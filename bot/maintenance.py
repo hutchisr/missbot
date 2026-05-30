@@ -1,16 +1,11 @@
-"""Maintenance & admin CLI for the world-knowledge store (M4/M5).
+"""Maintenance & admin CLI for the world-knowledge store.
 
 Runnable out-of-process (so it can be a k8s CronJob, separate from the long-running
 bot) via ``python -m bot.maintenance <command> -c /config.yaml``:
 
-    consolidate            merge duplicate entities + recompute corroboration
-    detect-contradictions  flag same-subject+predicate disagreements as `disputed`
-    resolve-disputes       resolve disputes past the grace period (supersede losing values)
-    decay                  soft-retract stale, never-recalled, low-trust claims
-    run-all                consolidate -> detect -> resolve disputes -> decay
-    retract-source         tombstone every claim from a source (and recompute)
-    unmerge                reverse a soft entity-merge (reactivate + restore claims)
-    stats                  print store counts (entities/sources/claims by status & tier)
+    consolidate         merge duplicate entities (name, then embedding, then optional LLM pass)
+    stats               print store counts (entities, claims, distinct subjects/authors)
+    calibrate-entities  print the most-similar entity pairs to help tune entity_match_threshold
 
 Each command builds a one-shot :class:`MemoryStore`, runs, and closes it. Requires
 ``memory_enabled: true`` in the config.
@@ -78,74 +73,15 @@ def cli() -> None:
 @cli.command()
 @_config_option
 def consolidate(config_path: str) -> None:
-    """Merge duplicate entities and recompute corroboration across the store."""
+    """Merge duplicate entities (name, then embedding, then optional LLM pass)."""
     summary = _run(config_path, lambda store: store.consolidate())
     click.echo(json.dumps(summary))
-
-
-@cli.command("detect-contradictions")
-@_config_option
-def detect_contradictions(config_path: str) -> None:
-    """Flag same-subject+predicate disagreements as `disputed` (and clear resolved ones)."""
-    summary = _run(config_path, lambda store: store.detect_contradictions())
-    click.echo(json.dumps(summary))
-
-
-@cli.command("resolve-disputes")
-@_config_option
-def resolve_disputes(config_path: str) -> None:
-    """Autonomously resolve contradictions older than the grace period (supersede losers)."""
-    summary = _run(config_path, lambda store: store.resolve_disputes())
-    click.echo(json.dumps(summary))
-
-
-@cli.command()
-@_config_option
-def decay(config_path: str) -> None:
-    """Soft-retract stale, never-recalled, low-trust claims (autonomous pruning)."""
-    summary = _run(config_path, lambda store: store.decay())
-    click.echo(json.dumps(summary))
-
-
-@cli.command("run-all")
-@_config_option
-def run_all(config_path: str) -> None:
-    """Run the full scheduled pass: consolidate, detect, resolve disputes, then decay."""
-
-    async def _action(store: MemoryStore) -> dict[str, Any]:
-        return {
-            "consolidate": await store.consolidate(),
-            "detect_contradictions": await store.detect_contradictions(),
-            "resolve_disputes": await store.resolve_disputes(),
-            "decay": await store.decay(),
-        }
-
-    click.echo(json.dumps(_run(config_path, _action)))
-
-
-@cli.command("retract-source")
-@_config_option
-@click.option("--name", required=True, help="Source name to retract (e.g. an author handle or web domain).")
-@click.option("--kind", default=None, help="Optional source kind (web|doc|user|model) to disambiguate.")
-def retract_source(config_path: str, name: str, kind: str | None) -> None:
-    """Tombstone every claim from a source and recompute corroboration everywhere."""
-    count = _run(config_path, lambda store: store.retract_source(name, kind))
-    click.echo(f"Retracted {count} claim(s) from source {name!r}" + (f" (kind={kind})" if kind else ""))
-
-
-@cli.command()
-@_config_option
-@click.option("--id", "merged_id", required=True, type=int, help="Entity id to un-merge (reactivate).")
-def unmerge(config_path: str, merged_id: int) -> None:
-    """Reverse a soft entity-merge: reactivate the entity and move its claims back."""
-    ok = _run(config_path, lambda store: store.unmerge_entity(merged_id))
-    click.echo(f"Un-merged entity {merged_id}" if ok else f"Nothing to un-merge for entity {merged_id}")
 
 
 @cli.command()
 @_config_option
 def stats(config_path: str) -> None:
-    """Print store counts (entities, sources, live claims by status and tier)."""
+    """Print store counts (entities, claims, distinct subjects/authors)."""
     click.echo(json.dumps(_run(config_path, lambda store: store.stats()), indent=2))
 
 

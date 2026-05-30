@@ -260,7 +260,7 @@ def _memory_cfg(make_config, **extra):
 
 
 @pytest.mark.anyio
-async def test_run_ingests_note_as_user_tier_claim(make_config, make_note):
+async def test_run_ingests_note_as_claim(make_config, make_note):
     mem = AsyncMock()
     mem.seconds_since_last_write.return_value = None
     agent = ChatAgent(_memory_cfg(make_config), memory=mem)
@@ -276,12 +276,11 @@ async def test_run_ingests_note_as_user_tier_claim(make_config, make_note):
     assert out == "reply"
     mem.add_claim.assert_awaited_once()
     kw = mem.add_claim.await_args.kwargs
-    # The author is the deterministic source, at the (non-promotable) user tier.
-    assert kw["source_kind"] == "user"
-    assert kw["trust_tier"] == "user"
-    assert kw["source_name"] == "alice"
+    # The note's author is attributed as the claim's author (this drives the agreement count).
     assert kw["author"] == "alice"
-    assert kw["source_note_id"] == note.id
+    assert kw["subject"] == "Python"
+    assert kw["predicate"] == "latest_version"
+    assert kw["object_text"] == "3.13"
 
 
 @pytest.mark.anyio

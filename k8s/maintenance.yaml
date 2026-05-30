@@ -6,8 +6,8 @@ metadata:
   name: missbot-maintenance
   namespace: misskey
 spec:
-  # Daily world-knowledge maintenance: consolidate duplicate entities + recompute
-  # corroboration, then flag contradictions. Off-peak, well clear of the bot's traffic.
+  # Daily world-knowledge maintenance: consolidate duplicate entities (merge fragmentation
+  # the write-time linker missed). Off-peak, well clear of the bot's traffic.
   schedule: "17 4 * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
@@ -28,7 +28,7 @@ spec:
               name: maintenance
               # Override the image's `python -m bot` entrypoint to run the maintenance CLI.
               command: ["python", "-m", "bot.maintenance"]
-              args: ["run-all", "-c", "/config.yaml"]
+              args: ["consolidate", "-c", "/config.yaml"]
               env:
                 - name: LOGFIRE_SERVICE_NAME
                   value: missbot-maintenance

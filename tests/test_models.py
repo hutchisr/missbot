@@ -25,6 +25,10 @@ def test_config_max_tokens_must_be_positive(make_config):
         make_config(max_tokens=0)
 
 
+def test_config_max_tokens_optional(make_config):
+    assert make_config(max_tokens=None).max_tokens is None
+
+
 def test_config_auto_post_requires_auto_prompt(make_config):
     with pytest.raises(ValidationError) as exc:
         make_config(auto_post_interval=60)

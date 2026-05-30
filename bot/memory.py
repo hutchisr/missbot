@@ -1,31 +1,26 @@
-"""Evolving world-knowledge store for Missbot (Postgres + pgvector).
+"""World-knowledge store for Missbot (Postgres + pgvector), ranked by user agreement.
 
-This module owns the bot's shared, non-user-specific knowledge. It does **not** store
-bare facts: every row is a *claim* bound to a source and a time ("source S asserted X
-at time T"), so the model and callers always see who said something, when, and how
-well corroborated it is. Nothing here is treated as an oracle.
+This module owns the bot's shared, non-user-specific knowledge as a flat set of *claims*
+— ``(subject, predicate, object)`` triples, each attributed to the user who asserted it.
+The one ranking signal is **agreement**: a value that more *distinct* users independently
+assert outranks one a single user asserts.
 
-Safety core (enforced in code, not convention):
+Model (enforced in code):
 
-1. **No bare facts.** Every claim carries a ``source_id``, ``trust_tier``, and times.
-2. **Model output is quarantined.** LLM-generated claims enter at ``model_quarantine``
-   (the lowest tier) and can never be auto-promoted to ``believed`` — that blocks the
-   confabulation-laundering loop.
-3. **Append-only.** Updates insert a newer claim and set ``superseded_by`` on the old
-   one; we never destructively overwrite a value.
-4. **Promotion requires corroboration.** ``asserted`` -> ``believed`` only when
-   ``>= corroboration_threshold`` *independent* sources of tier ``>= secondary`` agree.
-5. **Conflict resolution is read-time policy** (see :func:`resolve_conflict`), not a
-   write-time guess; all conflicting claims are kept.
-6. **Provenance travels with the answer.** Recall returns claims *with* source, tier,
-   recency, confidence, and corroboration count.
-7. **Volatile facts expire.** Claims carry a volatility; stale volatile claims are
-   flagged on recall so the model re-verifies rather than trusting them.
-8. **Retraction is one query.** :meth:`MemoryStore.retract_source` tombstones every
-   claim from a compromised source and recomputes corroboration everywhere.
+1. **One opinion per user.** A claim is keyed ``UNIQUE(author, subject_entity_id,
+   predicate)`` and written by upsert, so each user holds at most one current value per
+   (subject, predicate); re-asserting overwrites their own row ("changed my mind").
+2. **Agreement = distinct authors.** Recall counts ``COUNT(DISTINCT author)`` per object
+   value within a (subject, predicate) group; the most-agreed value wins (recency breaks
+   ties). The count is computed at read time, never stored as a status.
+3. **Stable grouping.** Subjects resolve to entities (write-time linker); objects group by
+   :func:`object_group_key` (linked entity, else normalized text) so surface variants
+   ("Arch" / "Arch Linux") don't fragment the agreement count.
 
-The embedding model produces *unnormalized* vectors, so all comparisons use cosine
-distance (``<=>``).
+Deliberately *not* modelled (dropped for simplicity): trust tiers, model-output quarantine,
+append-only supersession / bitemporal reads, contradiction/dispute passes, decay, and
+source retraction. The embedding model produces *unnormalized* vectors, so all comparisons
+use cosine distance (``<=>``).
 """
 
 import asyncio
@@ -34,7 +29,6 @@ import re
 import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Optional, Union
 
 import asyncpg
@@ -57,35 +51,12 @@ _LINK_FLOOR = 0.4
 # Pool-acquired connections are proxies, not bare Connections; helpers accept either.
 _Conn = Union[asyncpg.Connection, PoolConnectionProxy]
 
-# --- Trust tiers -----------------------------------------------------------------
-# Higher rank = more trusted. Only claims at tier >= ``secondary`` can be corroborated
-# into ``believed``; ``model_quarantine`` (LLM output) and ``user`` claims never can.
-TRUST_TIERS: dict[str, int] = {
-    "model_quarantine": 0,
-    "user": 1,
-    "secondary": 2,
-    "primary": 3,
-}
-# Tiers eligible for corroboration-based promotion to ``believed`` (rank >= secondary).
-PROMOTABLE_TIERS: tuple[str, ...] = tuple(t for t, r in TRUST_TIERS.items() if r >= TRUST_TIERS["secondary"])
-
-# Read-time conflict ranking: a believed claim beats an asserted one, etc.
-STATUS_RANK: dict[str, int] = {"retracted": -1, "disputed": 0, "asserted": 1, "believed": 2}
-
-VOLATILITIES: frozenset[str] = frozenset({"stable", "slow", "volatile"})
-SOURCE_KINDS: frozenset[str] = frozenset({"web", "doc", "user", "model"})
-
-
-def tier_rank(tier: str) -> int:
-    """Trust rank for a tier name (unknown tiers rank lowest)."""
-    return TRUST_TIERS.get(tier, 0)
-
 
 def normalize_predicate(predicate: str) -> str:
-    """Normalize a predicate to a stable snake_case key for dedup/corroboration.
+    """Normalize a predicate to a stable snake_case key for grouping/agreement.
 
-    Two claims only corroborate or supersede each other when their predicates match
-    exactly, so we canonicalize aggressively (lowercase, non-alphanumeric -> ``_``).
+    Two claims only group together (and so corroborate each other) when their predicates
+    match exactly, so we canonicalize aggressively (lowercase, non-alphanumeric -> ``_``).
     """
     p = re.sub(r"[^a-z0-9]+", "_", (predicate or "").strip().lower()).strip("_")
     return p or "fact"
@@ -111,71 +82,60 @@ def normalize_entity_name(name: str) -> str:
     return " ".join(folded)
 
 
+def normalize_object(object_text: str) -> str:
+    """Canonicalize a claim's object value into the grouping key for the agreement count.
+
+    Two claims agree (count as the same value) only when their objects share this key, so it
+    must fold away the formatting noise two writers can differ on for the *same* value while
+    keeping genuinely different values apart. Deliberately **more conservative** than
+    :func:`normalize_entity_name`: it lowercases, strips accents (NFKD), and collapses internal
+    whitespace runs — but does **not** fold plurals or drop internal punctuation, because object
+    values are heterogeneous (versions like ``3.13``, dates, free phrases) where ``3.13`` vs
+    ``3 13`` or ``Windows`` vs ``Window`` are distinct, and a wrong merge silently miscounts
+    agreement. A folding miss only undercounts agreement (the safe failure); a wrong merge would
+    credit agreement to the wrong value. Synonyms ("Manila" vs "City of Manila") are out of scope
+    here — that needs entity resolution (object linking via ``object_entity_id``), not string
+    normalization.
+    """
+    decomposed = unicodedata.normalize("NFKD", object_text or "")
+    ascii_ish = "".join(c for c in decomposed if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", ascii_ish.lower()).strip()
+
+
+# SQL expression yielding a claim's object grouping value: the linked object entity if present,
+# else the normalized object text. The ``e``/``k`` prefixes namespace the two so an entity id can
+# never collide with a literal value that happens to be numeric. MUST stay in lockstep with
+# :func:`object_group_key` (the Python mirror) — the agreement count groups by both.
+_OBJECT_GROUP_SQL = "COALESCE('e' || object_entity_id::text, 'k' || object_key)"
+
+
+def object_group_key(object_entity_id: Optional[int], object_key: str) -> str:
+    """Grouping key for the agreement count — the Python mirror of :data:`_OBJECT_GROUP_SQL`.
+
+    Two claims count as the same value (so they agree) when they link to the same object entity,
+    or — when neither is linked — when their normalized object text matches. An object is only
+    ever *linked* to an entity that already exists (see :meth:`MemoryStore._match_entity_exact`),
+    so this never invents entities for free-text values; unlinked objects fall back to ``object_key``.
+    """
+    if object_entity_id is not None:
+        return f"e{object_entity_id}"
+    return f"k{object_key}"
+
+
 def render_claim(subject: str, predicate: str, object_text: str) -> str:
     """Human/embedding rendering of a claim's content (no provenance)."""
     return f"{subject} — {predicate.replace('_', ' ')}: {object_text}"
 
 
-def is_stale(volatility: str, reference_time: Optional[datetime], now: datetime, ttl_seconds: int) -> bool:
-    """Whether a volatile claim is past its TTL and should be re-verified.
+def resolve_conflict(values: list[dict]) -> dict:
+    """Pick the winning value among those sharing a (subject, predicate). Pure / DB-free.
 
-    Only ``volatile`` claims expire; ``stable``/``slow`` never go stale here.
+    The value more *distinct users* assert wins (``agreed_by``); ties break by recency
+    (``recency`` — the latest assertion of the value). Callers keep the full set so the
+    losing alternatives surface alongside the winner. Each input dict carries at least
+    ``agreed_by`` (int) and ``recency`` (datetime).
     """
-    if volatility != "volatile" or reference_time is None:
-        return False
-    return (now - reference_time).total_seconds() > ttl_seconds
-
-
-def _conflict_sort_key(claim: dict) -> tuple[int, int, int, datetime]:
-    """Sort key for read-time conflict resolution.
-
-    Prefer (1) higher status (believed > asserted > disputed), then (2) higher trust
-    tier, then (3) more independent *ordinary-user* agreement (``user_corroboration_count``),
-    then (4) the most recent valid_from (falling back to recorded_at).
-
-    The user-agreement term is a deliberately weak signal: it sits *below* trust tier, so
-    it only ever breaks ties *within* a tier — a value many users agree on can outrank a
-    fresher single-user value, but never a trusted (secondary/primary) source. Defaults to
-    0 when absent so callers that don't supply it keep the old (tier, recency) ordering.
-    """
-    ref = claim.get("valid_from") or claim["recorded_at"]
-    return (
-        STATUS_RANK.get(claim["status"], 0),
-        tier_rank(claim["trust_tier"]),
-        int(claim.get("user_corroboration_count", 0)),
-        ref,
-    )
-
-
-def resolve_conflict(claims: list[dict]) -> dict:
-    """Pick the winning claim from a set sharing the same subject+predicate.
-
-    Pure policy (no DB): believed > asserted, then trust tier, then ordinary-user
-    agreement (a within-tier tiebreaker only), then recency. The full set is preserved by
-    the caller so conflicts surface with provenance.
-    """
-    return max(claims, key=_conflict_sort_key)
-
-
-def rank_dispute_values(claims: list[dict]) -> str:
-    """Pick the winning object value among disputed claims (autonomous resolution).
-
-    Pure policy (no DB): group by object value and rank by (1) number of independent
-    tier-≥``secondary`` sources, then (2) the highest trust tier present, then (3) recency
-    (``valid_from`` else ``recorded_at``). Recency is the final tiebreaker so a resolution
-    always exists. Returns the winning value's original-cased text.
-    """
-    by_value: dict[str, dict] = {}
-    for c in claims:
-        key = c["object_text"].strip().lower()
-        v = by_value.setdefault(key, {"object_text": c["object_text"], "sources": set(), "tier": 0, "recency": None})
-        if tier_rank(c["trust_tier"]) >= TRUST_TIERS["secondary"]:
-            v["sources"].add(c["source_id"])
-        v["tier"] = max(v["tier"], tier_rank(c["trust_tier"]))
-        ref = c.get("valid_from") or c["recorded_at"]
-        v["recency"] = ref if v["recency"] is None else max(v["recency"], ref)
-    best = max(by_value.values(), key=lambda v: (len(v["sources"]), v["tier"], v["recency"]))
-    return best["object_text"]
+    return max(values, key=lambda v: (int(v["agreed_by"]), v["recency"]))
 
 
 def merge_aliases(
@@ -208,34 +168,21 @@ def _vector_literal(vec: list[float]) -> str:
 
 @dataclass
 class ConflictingClaim:
-    """An alternative value that disagrees with a recalled claim's winner."""
+    """An alternative value (fewer users assert it) that disagrees with the recalled winner."""
 
     object_text: str
-    source_name: str
-    source_kind: str
-    trust_tier: str
-    status: str
+    agreed_by: int
 
 
 @dataclass
 class RecalledClaim:
-    """A recalled claim with full provenance (what the read path returns)."""
+    """A recalled claim: the most-agreed value for a (subject, predicate), with alternatives."""
 
     subject: str
     predicate: str
     object_text: str
-    status: str
-    trust_tier: str
-    source_name: str
-    source_kind: str
-    confidence: float
-    corroboration_count: int
-    user_corroboration_count: int
-    volatility: str
-    recorded_at: datetime
-    valid_from: Optional[datetime]
+    agreed_by: int
     similarity: float
-    stale: bool
     conflicts: list[ConflictingClaim]
 
 
@@ -245,10 +192,7 @@ class ClaimWriteResult:
 
     stored: bool
     claim_id: Optional[int]
-    status: str
-    promoted: bool
-    duplicate: bool
-    superseded_claim_id: Optional[int]
+    updated: bool
     subject: str
     predicate: str
 
@@ -292,25 +236,25 @@ class MemoryStore:
         conn = await asyncpg.connect(config.postgres_url)
         try:
             await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS knowledge_source (
-                    id                 BIGSERIAL PRIMARY KEY,
-                    name               TEXT NOT NULL,
-                    kind               TEXT NOT NULL,
-                    default_trust_tier TEXT NOT NULL,
-                    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    UNIQUE (name, kind)
-                )
-                """
+            # Fail fast on a pre-existing rich-schema deployment: the minimal store is not
+            # column-compatible with the old claims store (no trust_tier/status/supersession),
+            # so refuse loudly rather than silently break on the first upsert.
+            legacy = await conn.fetchval(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name = 'knowledge_claim' AND column_name = 'trust_tier'"
             )
+            if legacy is not None:
+                raise RuntimeError(
+                    "knowledge_claim has the legacy 'trust_tier' column — this is the old rich claims "
+                    "store, which the minimal agreement-ranked store is not column-compatible with. "
+                    "Drop the knowledge_* tables (the bot re-learns from the timeline) before starting."
+                )
             await conn.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS knowledge_entity (
                     id             BIGSERIAL PRIMARY KEY,
                     canonical_name TEXT NOT NULL,
                     aliases        TEXT[] NOT NULL DEFAULT '{{}}',
-                    type           TEXT,
                     embedding      vector({dim}) NOT NULL,
                     merged_into    BIGINT REFERENCES knowledge_entity(id),
                     merged_at      TIMESTAMPTZ,
@@ -318,60 +262,23 @@ class MemoryStore:
                 )
                 """
             )
-            # Audit/recovery log for entity merges, so a soft-merge is fully reversible.
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS knowledge_entity_merge_log (
-                    id         BIGSERIAL PRIMARY KEY,
-                    keeper_id  BIGINT NOT NULL,
-                    merged_id  BIGINT NOT NULL,
-                    claim_ids  BIGINT[] NOT NULL DEFAULT '{}',
-                    merged_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-                )
-                """
-            )
             await conn.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS knowledge_claim (
-                    id                  BIGSERIAL PRIMARY KEY,
-                    subject_entity_id   BIGINT NOT NULL REFERENCES knowledge_entity(id),
-                    predicate           TEXT NOT NULL,
-                    object_text         TEXT NOT NULL,
-                    object_entity_id    BIGINT REFERENCES knowledge_entity(id),
-                    source_id           BIGINT NOT NULL REFERENCES knowledge_source(id),
-                    trust_tier          TEXT NOT NULL,
-                    confidence          REAL NOT NULL DEFAULT 0.5,
-                    status              TEXT NOT NULL DEFAULT 'asserted',
-                    valid_from          TIMESTAMPTZ,
-                    valid_to            TIMESTAMPTZ,
-                    recorded_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    superseded_by       BIGINT REFERENCES knowledge_claim(id),
-                    superseded_at       TIMESTAMPTZ,
-                    retracted_at        TIMESTAMPTZ,
-                    corroboration_count INTEGER NOT NULL DEFAULT 0,
-                    user_corroboration_count INTEGER NOT NULL DEFAULT 0,
-                    volatility          TEXT NOT NULL DEFAULT 'stable',
-                    embedding           vector({dim}) NOT NULL,
-                    author              TEXT,
-                    source_note_id      TEXT,
-                    last_recalled_at    TIMESTAMPTZ,
-                    disputed_at         TIMESTAMPTZ,
-                    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+                    id                BIGSERIAL PRIMARY KEY,
+                    subject_entity_id BIGINT NOT NULL REFERENCES knowledge_entity(id),
+                    predicate         TEXT NOT NULL,
+                    object_text       TEXT NOT NULL,
+                    object_key        TEXT NOT NULL,
+                    object_entity_id  BIGINT REFERENCES knowledge_entity(id),
+                    author            TEXT NOT NULL,
+                    embedding         vector({dim}) NOT NULL,
+                    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    UNIQUE (author, subject_entity_id, predicate)
                 )
                 """
             )
-            # Columns added after the initial schema — ALTER for already-deployed databases
-            # (CREATE TABLE IF NOT EXISTS won't add them to an existing table).
-            await conn.execute("ALTER TABLE knowledge_claim ADD COLUMN IF NOT EXISTS last_recalled_at TIMESTAMPTZ")
-            await conn.execute("ALTER TABLE knowledge_claim ADD COLUMN IF NOT EXISTS disputed_at TIMESTAMPTZ")
-            await conn.execute(
-                "ALTER TABLE knowledge_claim "
-                "ADD COLUMN IF NOT EXISTS user_corroboration_count INTEGER NOT NULL DEFAULT 0"
-            )
-            await conn.execute(
-                "ALTER TABLE knowledge_entity ADD COLUMN IF NOT EXISTS merged_into BIGINT REFERENCES knowledge_entity(id)"
-            )
-            await conn.execute("ALTER TABLE knowledge_entity ADD COLUMN IF NOT EXISTS merged_at TIMESTAMPTZ")
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS knowledge_entity_embedding_idx "
                 "ON knowledge_entity USING hnsw (embedding vector_cosine_ops)"
@@ -383,11 +290,11 @@ class MemoryStore:
                 "CREATE INDEX IF NOT EXISTS knowledge_claim_embedding_idx "
                 "ON knowledge_claim USING hnsw (embedding vector_cosine_ops)"
             )
+            # Agreement is tallied per (subject, predicate); the UNIQUE(author, subject, predicate)
+            # index also serves author-prefix lookups (the write cooldown).
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS knowledge_claim_sp_idx ON knowledge_claim (subject_entity_id, predicate)"
             )
-            await conn.execute("CREATE INDEX IF NOT EXISTS knowledge_claim_author_idx ON knowledge_claim (author)")
-            await conn.execute("CREATE INDEX IF NOT EXISTS knowledge_claim_source_idx ON knowledge_claim (source_id)")
 
             existing_dim = await conn.fetchval(
                 "SELECT atttypmod FROM pg_attribute "
@@ -408,7 +315,6 @@ class MemoryStore:
         assert pool is not None
         http = httpx.AsyncClient(timeout=httpx.Timeout(config.http_timeout_seconds))
         store = cls(pool, http, config)
-        await store._migrate_legacy_global_memory()
         logfire.info("World-knowledge store ready", embedding_model=config.embedding_model, embedding_dim=dim)
         return store
 
@@ -434,21 +340,21 @@ class MemoryStore:
 
     # --- Write path --------------------------------------------------------------
 
-    async def _get_or_create_source(self, conn: _Conn, name: str, kind: str, tier: str) -> int:
-        """Return the id of a source, creating it (with ``tier``) if new.
+    async def _match_entity_exact(self, conn: _Conn, name: str) -> Optional[int]:
+        """Id of the live entity whose canonical_name or an alias equals ``name`` (case-insensitive).
 
-        The trust tier is fixed at creation: a source's tier never silently changes on
-        a later write (that would let an attacker upgrade their own trust by re-asserting).
+        The cheap, deterministic, embedding-free, LLM-free half of resolution. Used as the fast
+        path in :meth:`_resolve_entity` and as the *only* linker for claim **objects** (link-only:
+        an object becomes an entity edge only when it already names a known entity, never by
+        creating one — so free-text objects like "born 1990" never pollute the entity table).
         """
         row = await conn.fetchval(
-            "INSERT INTO knowledge_source (name, kind, default_trust_tier) VALUES ($1, $2, $3) "
-            "ON CONFLICT (name, kind) DO UPDATE SET name = EXCLUDED.name RETURNING id",
+            "SELECT id FROM knowledge_entity "
+            "WHERE merged_into IS NULL AND (lower(canonical_name) = lower($1) "
+            "OR EXISTS (SELECT 1 FROM unnest(aliases) a WHERE lower(a) = lower($1))) LIMIT 1",
             name,
-            kind,
-            tier,
         )
-        assert row is not None  # INSERT ... RETURNING always yields the id
-        return int(row)
+        return int(row) if row is not None else None
 
     async def _resolve_entity(self, name: str, name_vec_literal: str) -> Optional[int]:
         """Decide which existing entity a subject maps to, or None to create a new one.
@@ -460,14 +366,9 @@ class MemoryStore:
         is made with NO DB transaction held — the caller creates the entity in its own txn.
         """
         async with self._pool.acquire() as conn:
-            exact = await conn.fetchval(
-                "SELECT id FROM knowledge_entity "
-                "WHERE merged_into IS NULL AND (lower(canonical_name) = lower($1) "
-                "OR EXISTS (SELECT 1 FROM unnest(aliases) a WHERE lower(a) = lower($1))) LIMIT 1",
-                name,
-            )
+            exact = await self._match_entity_exact(conn, name)
             if exact is not None:
-                return int(exact)
+                return exact
             candidates = await conn.fetch(
                 "SELECT id, canonical_name, embedding <=> $1::vector AS dist FROM knowledge_entity "
                 "WHERE merged_into IS NULL ORDER BY dist LIMIT $2",
@@ -494,41 +395,21 @@ class MemoryStore:
             return int(nearest["id"])
         return None
 
-    @logfire.instrument(extract_args=["subject", "predicate", "trust_tier", "author", "source_note_id"])
-    async def add_claim(
-        self,
-        *,
-        subject: str,
-        predicate: str,
-        object_text: str,
-        source_name: str,
-        source_kind: str,
-        trust_tier: str,
-        author: Optional[str] = None,
-        source_note_id: Optional[str] = None,
-        volatility: str = "stable",
-        confidence: float = 0.5,
-        valid_from: Optional[datetime] = None,
-    ) -> ClaimWriteResult:
-        """Insert a claim with provenance; supersede stale same-source values; corroborate.
+    @logfire.instrument(extract_args=["subject", "predicate", "author"])
+    async def add_claim(self, *, subject: str, predicate: str, object_text: str, author: str) -> ClaimWriteResult:
+        """Record that ``author`` asserts ``object_text`` for (``subject``, ``predicate``).
 
-        - LLM-sourced claims must pass ``trust_tier='model_quarantine'`` and can never be
-          promoted to ``believed`` (they are not in ``PROMOTABLE_TIERS``).
-        - A new value for the same subject+predicate from the *same source* supersedes that
-          source's prior value (append-only update).
-        - An identical/near-identical value from the same source is skipped as a duplicate.
-        - After insert, the matching subject+predicate+object group is re-evaluated for
-          corroboration-based promotion across *independent* tier-``>= secondary`` sources.
+        **Per-author upsert:** each user holds at most one current value per (subject,
+        predicate); re-asserting a new value overwrites their own row ("changed my mind"). So
+        ``COUNT(DISTINCT author)`` per value — the agreement count tallied at recall — reflects
+        who *currently* asserts it. The subject is resolved (or created) as an entity; the object
+        is linked to an existing entity only on an exact name/alias match, otherwise it stays a
+        literal grouped by its normalized text.
         """
         subject = subject.strip()
         predicate = normalize_predicate(predicate)
         object_text = object_text.strip()
-        if trust_tier not in TRUST_TIERS:
-            raise ValueError(f"unknown trust_tier {trust_tier!r}")
-        if source_kind not in SOURCE_KINDS:
-            raise ValueError(f"unknown source_kind {source_kind!r}")
-        if volatility not in VOLATILITIES:
-            volatility = "stable"
+        object_key = normalize_object(object_text)
 
         # Independent embeddings — run them concurrently (every claim write pays both).
         name_emb, claim_emb = await asyncio.gather(
@@ -543,7 +424,6 @@ class MemoryStore:
 
         async with self._pool.acquire() as conn:
             async with conn.transaction():
-                source_id = await self._get_or_create_source(conn, source_name, source_kind, trust_tier)
                 if resolved_entity_id is not None:
                     subject_entity_id = resolved_entity_id
                 else:
@@ -555,326 +435,158 @@ class MemoryStore:
                     assert created is not None  # INSERT ... RETURNING always yields the id
                     subject_entity_id = int(created)
 
-                # Existing live claims from this same source for this subject+predicate.
-                existing = await conn.fetch(
-                    "SELECT id, object_text, embedding <=> $4::vector AS dist FROM knowledge_claim "
-                    "WHERE source_id = $1 AND subject_entity_id = $2 AND predicate = $3 "
-                    "AND retracted_at IS NULL AND superseded_by IS NULL",
-                    source_id,
+                # Link the object to an entity only if it *exactly* names a known one (link-only,
+                # no creation, no embedding/LLM) — entity-valued objects group by identity while
+                # free-text objects stay literal. A cheap indexed lookup inside the txn.
+                object_entity_id = await self._match_entity_exact(conn, object_text)
+
+                # Upsert this author's value for (subject, predicate). xmax <> 0 means the row
+                # already existed and we updated it (the author changed their mind).
+                row = await conn.fetchrow(
+                    "INSERT INTO knowledge_claim "
+                    "(subject_entity_id, predicate, object_text, object_key, object_entity_id, author, embedding) "
+                    "VALUES ($1, $2, $3, $4, $5, $6, $7::vector) "
+                    "ON CONFLICT (author, subject_entity_id, predicate) DO UPDATE SET "
+                    "object_text = EXCLUDED.object_text, object_key = EXCLUDED.object_key, "
+                    "object_entity_id = EXCLUDED.object_entity_id, embedding = EXCLUDED.embedding, "
+                    "updated_at = now() "
+                    "RETURNING id, (xmax <> 0) AS updated",
                     subject_entity_id,
                     predicate,
+                    object_text,
+                    object_key,
+                    object_entity_id,
+                    author,
                     claim_vec,
                 )
-                supersede_ids: list[int] = []
-                for row in existing:
-                    same_value = row["object_text"].strip().lower() == object_text.lower()
-                    near_dup = (1.0 - float(row["dist"])) >= self._config.global_dedup_threshold
-                    if same_value or near_dup:
-                        logfire.info("Skipping duplicate claim", subject=subject, predicate=predicate)
-                        return ClaimWriteResult(
-                            stored=False,
-                            claim_id=int(row["id"]),
-                            status="asserted",
-                            promoted=False,
-                            duplicate=True,
-                            superseded_claim_id=None,
-                            subject=subject,
-                            predicate=predicate,
-                        )
-                    supersede_ids.append(int(row["id"]))
+                assert row is not None  # INSERT ... RETURNING always yields a row
 
-                claim_id = int(
-                    await conn.fetchval(
-                        "INSERT INTO knowledge_claim "
-                        "(subject_entity_id, predicate, object_text, source_id, trust_tier, confidence, "
-                        " status, valid_from, volatility, embedding, author, source_note_id) "
-                        "VALUES ($1, $2, $3, $4, $5, $6, 'asserted', $7, $8, $9::vector, $10, $11) RETURNING id",
-                        subject_entity_id,
-                        predicate,
-                        object_text,
-                        source_id,
-                        trust_tier,
-                        float(confidence),
-                        valid_from,
-                        volatility,
-                        claim_vec,
-                        author,
-                        source_note_id,
-                    )
-                )
-
-                superseded_claim_id: Optional[int] = None
-                if supersede_ids:
-                    await conn.execute(
-                        "UPDATE knowledge_claim SET superseded_by = $1, superseded_at = now() WHERE id = ANY($2)",
-                        claim_id,
-                        supersede_ids,
-                    )
-                    superseded_claim_id = supersede_ids[-1]
-                    # A superseded value may have been holding up a corroboration group.
-                    for old in existing:
-                        await self._recompute_corroboration(conn, subject_entity_id, predicate, old["object_text"])
-
-                promoted = await self._recompute_corroboration(conn, subject_entity_id, predicate, object_text)
-
-        if promoted:
-            logfire.info(
-                "Claim promoted to believed (corroborated)",
-                subject=subject,
-                predicate=predicate,
-                trust_tier=trust_tier,
-            )
-        status = "believed" if promoted else "asserted"
         return ClaimWriteResult(
             stored=True,
-            claim_id=claim_id,
-            status=status,
-            promoted=promoted,
-            duplicate=False,
-            superseded_claim_id=superseded_claim_id,
+            claim_id=int(row["id"]),
+            updated=bool(row["updated"]),
             subject=subject,
             predicate=predicate,
         )
-
-    async def _recompute_corroboration(
-        self, conn: _Conn, subject_entity_id: int, predicate: str, object_text: str
-    ) -> bool:
-        """Recount independent tier->=secondary sources for a value and (de)promote.
-
-        A value asserted by ``>= corroboration_threshold`` *distinct* promotable-tier
-        sources becomes ``believed``; if it drops below that (e.g. after retraction) it
-        falls back to ``asserted``. ``model_quarantine``/``user`` claims are never touched,
-        so an LLM-sourced claim can never reach ``believed``. Also recomputes the weak
-        ``user_corroboration_count`` (distinct ordinary-user sources for the value) on every
-        live claim of the value — a non-promoting signal surfaced on recall. Returns True if
-        the value is believed afterwards.
-        """
-        count = await conn.fetchval(
-            "SELECT count(DISTINCT source_id) FROM knowledge_claim "
-            "WHERE subject_entity_id = $1 AND predicate = $2 AND lower(object_text) = lower($3) "
-            "AND retracted_at IS NULL AND superseded_by IS NULL AND status <> 'disputed' "
-            "AND trust_tier = ANY($4)",
-            subject_entity_id,
-            predicate,
-            object_text,
-            list(PROMOTABLE_TIERS),
-        )
-        n = int(count or 0)
-        promote = n >= self._config.corroboration_threshold
-        await conn.execute(
-            "UPDATE knowledge_claim SET corroboration_count = $4, "
-            "status = CASE WHEN $5 THEN 'believed' ELSE 'asserted' END "
-            "WHERE subject_entity_id = $1 AND predicate = $2 AND lower(object_text) = lower($3) "
-            "AND retracted_at IS NULL AND superseded_by IS NULL AND trust_tier = ANY($6) "
-            "AND status IN ('asserted', 'believed')",
-            subject_entity_id,
-            predicate,
-            object_text,
-            n,
-            promote,
-            list(PROMOTABLE_TIERS),
-        )
-
-        # Weak "ordinary users agree" signal, recomputed alongside the promotable count:
-        # distinct *user*-tier sources asserting this exact value. It never promotes (these
-        # claims stay below 'secondary') — it's surfaced on recall and used only as a
-        # within-tier conflict tiebreaker. Trusted users enter at 'primary' and feed the
-        # real corroboration count above instead, so they're excluded here by the tier
-        # filter. (Social-credit weighting of these votes is a planned hardening.)
-        user_count = await conn.fetchval(
-            "SELECT count(DISTINCT source_id) FROM knowledge_claim "
-            "WHERE subject_entity_id = $1 AND predicate = $2 AND lower(object_text) = lower($3) "
-            "AND retracted_at IS NULL AND superseded_by IS NULL AND status <> 'disputed' "
-            "AND trust_tier = 'user'",
-            subject_entity_id,
-            predicate,
-            object_text,
-        )
-        await conn.execute(
-            "UPDATE knowledge_claim SET user_corroboration_count = $4 "
-            "WHERE subject_entity_id = $1 AND predicate = $2 AND lower(object_text) = lower($3) "
-            "AND retracted_at IS NULL AND superseded_by IS NULL",
-            subject_entity_id,
-            predicate,
-            object_text,
-            int(user_count or 0),
-        )
-        return promote
 
     async def seconds_since_last_write(self, author: str) -> Optional[float]:
         """Seconds since ``author``'s most recent claim write, or None if never."""
         async with self._pool.acquire() as conn:
             last = await conn.fetchval(
-                "SELECT EXTRACT(EPOCH FROM (now() - max(recorded_at))) FROM knowledge_claim WHERE author = $1",
+                "SELECT EXTRACT(EPOCH FROM (now() - max(updated_at))) FROM knowledge_claim WHERE author = $1",
                 author,
             )
         return float(last) if last is not None else None
 
-    @logfire.instrument(extract_args=["source_name", "source_kind"])
-    async def retract_source(self, source_name: str, source_kind: Optional[str] = None) -> int:
-        """Tombstone every claim from a source and recompute corroboration everywhere.
-
-        Killing a compromised source removes its influence in one operation (invariant 8):
-        its claims are marked ``retracted`` and any ``believed`` value that depended on it
-        is re-evaluated (and demoted if it no longer clears the threshold). Returns the
-        number of claims retracted.
-        """
-        async with self._pool.acquire() as conn:
-            async with conn.transaction():
-                if source_kind is not None:
-                    source_ids = [
-                        int(r["id"])
-                        for r in await conn.fetch(
-                            "SELECT id FROM knowledge_source WHERE name = $1 AND kind = $2", source_name, source_kind
-                        )
-                    ]
-                else:
-                    source_ids = [
-                        int(r["id"])
-                        for r in await conn.fetch("SELECT id FROM knowledge_source WHERE name = $1", source_name)
-                    ]
-                if not source_ids:
-                    return 0
-                affected = await conn.fetch(
-                    "UPDATE knowledge_claim SET status = 'retracted', retracted_at = now() "
-                    "WHERE source_id = ANY($1) AND retracted_at IS NULL "
-                    "RETURNING subject_entity_id, predicate, object_text",
-                    source_ids,
-                )
-                seen: set[tuple[int, str, str]] = set()
-                for row in affected:
-                    key = (int(row["subject_entity_id"]), row["predicate"], row["object_text"].lower())
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    await self._recompute_corroboration(
-                        conn, int(row["subject_entity_id"]), row["predicate"], row["object_text"]
-                    )
-        return len(affected)
-
     # --- Read path ---------------------------------------------------------------
 
     @logfire.instrument(extract_args=["query"])
-    async def search_claims(self, query: str, k: int, as_of: Optional[datetime] = None) -> list[RecalledClaim]:
-        """Recall claims relevant to a query, conflict-resolved and provenance-attached.
+    async def search_claims(self, query: str, k: int) -> list[RecalledClaim]:
+        """Recall the most-agreed value for each relevant (subject, predicate).
 
-        Embedding recall produces a candidate set; candidates are grouped by
-        subject+predicate, the winner of each group is chosen by :func:`resolve_conflict`,
-        and disagreeing alternatives ride along as ``conflicts``. Retracted and superseded
-        claims are excluded from the default (current) view. Pass ``as_of`` to recover the
-        value believed as of a past instant (bitemporal read). Volatile winners past their
-        TTL are flagged ``stale``.
+        Embedding recall over claim text surfaces candidate (subject, predicate) groups; for
+        each, the **agreement count** — ``COUNT(DISTINCT author)`` per value over *all* live
+        claims for that group (not just the candidate pool, which would undercount) — picks the
+        winner via :func:`resolve_conflict` (recency breaks ties), with the losing values riding
+        along as ``conflicts``. Results are ordered by recall similarity and capped at ``k``.
         """
         vec = _vector_literal(await self.embed(query))
-        min_sim = self._config.global_recall_min_similarity
-        max_dist = 1.0 - min_sim
-        # Pull a wider candidate pool than k so conflict groups are complete before we
-        # collapse each to a single winner.
+        max_dist = 1.0 - self._config.global_recall_min_similarity
+        # Pull a wider candidate pool than k so each relevant group's nearest member surfaces.
         candidate_limit = max(k * 4, 20)
 
-        if as_of is None:
-            visibility = "c.retracted_at IS NULL AND c.superseded_by IS NULL"
-            params: list = [vec, max_dist, candidate_limit]
-        else:
-            visibility = (
-                "c.recorded_at <= $4 "
-                "AND (c.retracted_at IS NULL OR c.retracted_at > $4) "
-                "AND (c.superseded_at IS NULL OR c.superseded_at > $4)"
-            )
-            params = [vec, max_dist, candidate_limit, as_of]
-
         async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
-                f"""
-                SELECT c.id, e.canonical_name AS subject, c.predicate, c.object_text, c.status,
-                       c.trust_tier, c.confidence, c.corroboration_count, c.user_corroboration_count, c.volatility,
-                       c.valid_from, c.recorded_at, s.name AS source_name, s.kind AS source_kind,
+            candidates = await conn.fetch(
+                """
+                SELECT c.subject_entity_id, e.canonical_name AS subject, c.predicate,
                        c.embedding <=> $1::vector AS dist
                 FROM knowledge_claim c
                 JOIN knowledge_entity e ON e.id = c.subject_entity_id
-                JOIN knowledge_source s ON s.id = c.source_id
-                WHERE {visibility} AND c.embedding <=> $1::vector <= $2
+                WHERE c.embedding <=> $1::vector <= $2
                 ORDER BY dist LIMIT $3
                 """,
-                *params,
+                vec,
+                max_dist,
+                candidate_limit,
+            )
+            if not candidates:
+                return []
+            # Best similarity + display name per candidate (subject, predicate) group.
+            best_sim: dict[tuple[int, str], float] = {}
+            subject_name: dict[int, str] = {}
+            for r in candidates:
+                sid = int(r["subject_entity_id"])
+                subject_name[sid] = r["subject"]
+                gkey = (sid, r["predicate"])
+                sim = 1.0 - float(r["dist"])
+                if sim > best_sim.get(gkey, -1.0):
+                    best_sim[gkey] = sim
+
+            # Tally agreement (distinct authors per value) across ALL live claims of the
+            # candidate subjects — the candidate pool alone would undercount agreement.
+            agg = await conn.fetch(
+                f"""
+                SELECT subject_entity_id, predicate,
+                       count(DISTINCT author) AS agreed_by,
+                       max(updated_at) AS recency,
+                       (array_agg(object_text ORDER BY updated_at DESC))[1] AS object_text
+                FROM knowledge_claim
+                WHERE subject_entity_id = ANY($1)
+                GROUP BY subject_entity_id, predicate, {_OBJECT_GROUP_SQL}
+                """,
+                list({sid for sid, _ in best_sim}),
             )
 
-        # Group candidates by subject+predicate so conflicting values resolve together.
-        groups: dict[tuple[str, str], list[dict]] = {}
-        for row in rows:
-            d = dict(row)
-            key = (d["subject"].strip().lower(), d["predicate"])
-            groups.setdefault(key, []).append(d)
+        # One entry per distinct value within a (subject, predicate) group.
+        values_by_group: dict[tuple[int, str], list[dict]] = {}
+        for r in agg:
+            gkey = (int(r["subject_entity_id"]), r["predicate"])
+            values_by_group.setdefault(gkey, []).append(
+                {"object_text": r["object_text"], "agreed_by": int(r["agreed_by"]), "recency": r["recency"]}
+            )
 
-        now = datetime.now(timezone.utc)
-        ttl = self._config.volatile_ttl_seconds
-        # Each entry pairs the recalled claim with its winning row id, so we can record usage
-        # (last_recalled_at) on the claim actually chosen for the model.
-        entries: list[tuple[RecalledClaim, int]] = []
-        for members in groups.values():
-            winner = resolve_conflict(members)
+        claims: list[RecalledClaim] = []
+        for gkey, sim in best_sim.items():
+            values = values_by_group.get(gkey)
+            if not values:
+                continue
+            winner = resolve_conflict(values)
             conflicts = [
-                ConflictingClaim(
-                    object_text=m["object_text"],
-                    source_name=m["source_name"],
-                    source_kind=m["source_kind"],
-                    trust_tier=m["trust_tier"],
-                    status=m["status"],
-                )
-                for m in members
-                if m["object_text"].strip().lower() != winner["object_text"].strip().lower()
+                ConflictingClaim(object_text=v["object_text"], agreed_by=v["agreed_by"])
+                for v in values
+                if v is not winner
             ]
-            best_dist = min(float(m["dist"]) for m in members)
-            claim = RecalledClaim(
-                subject=winner["subject"],
-                predicate=winner["predicate"],
-                object_text=winner["object_text"],
-                status=winner["status"],
-                trust_tier=winner["trust_tier"],
-                source_name=winner["source_name"],
-                source_kind=winner["source_kind"],
-                confidence=float(winner["confidence"]),
-                corroboration_count=int(winner["corroboration_count"]),
-                user_corroboration_count=int(winner["user_corroboration_count"]),
-                volatility=winner["volatility"],
-                recorded_at=winner["recorded_at"],
-                valid_from=winner["valid_from"],
-                similarity=1.0 - best_dist,
-                stale=is_stale(winner["volatility"], winner["valid_from"] or winner["recorded_at"], now, ttl),
-                conflicts=conflicts,
-            )
-            entries.append((claim, int(winner["id"])))
-
-        entries.sort(key=lambda e: e[0].similarity, reverse=True)
-        top = entries[:k]
-
-        # Record usage so the decay pass can prune never-recalled claims. Stamp only the
-        # winning claim of each returned group — not the losing alternatives, or a perpetual
-        # low-trust loser would have its decay clock reset every time the winner is recalled.
-        # Current reads only — an as-of (historical) read shouldn't count as current use.
-        if as_of is None and top:
-            recalled_ids = [winner_id for _, winner_id in top]
-            async with self._pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE knowledge_claim SET last_recalled_at = now() WHERE id = ANY($1)", recalled_ids
+            claims.append(
+                RecalledClaim(
+                    subject=subject_name[gkey[0]],
+                    predicate=gkey[1],
+                    object_text=winner["object_text"],
+                    agreed_by=winner["agreed_by"],
+                    similarity=sim,
+                    conflicts=conflicts,
                 )
+            )
 
-        return [claim for claim, _ in top]
+        claims.sort(key=lambda c: c.similarity, reverse=True)
+        return claims[:k]
 
     # --- Maintenance (M4) --------------------------------------------------------
 
     async def _merge_entity(self, conn: _Conn, keep: int, dup: int) -> None:
-        """Fold entity ``dup`` into ``keep`` reversibly: repoint claims, union aliases, log, soft-mark.
+        """Fold entity ``dup`` into ``keep``: repoint its claims, union aliases, soft-mark it merged.
 
-        The duplicate row is **not deleted** — it is marked ``merged_into = keep`` (so it
-        drops out of resolution/recall/consolidation but stays auditable), and the repointed
-        claim ids are recorded in ``knowledge_entity_merge_log`` so :meth:`unmerge_entity`
-        can fully reverse it. This is the one autonomous structural op, so it's recoverable.
+        The duplicate row is **not deleted** — it is marked ``merged_into = keep`` so it drops out
+        of resolution/recall/consolidation but stays auditable. Claims pointing at ``dup`` (as
+        subject or object) are repointed to ``keep``. If an author asserted the same predicate
+        under both names, the dup-side row is dropped first (the ``UNIQUE(author, subject,
+        predicate)`` constraint allows one opinion per author per group), keeping the keep-side value.
         """
-        moved = await conn.fetch(
-            "SELECT id FROM knowledge_claim WHERE subject_entity_id = $1 OR object_entity_id = $1", dup
+        await conn.execute(
+            "DELETE FROM knowledge_claim WHERE subject_entity_id = $1 "
+            "AND (author, predicate) IN (SELECT author, predicate FROM knowledge_claim WHERE subject_entity_id = $2)",
+            dup,
+            keep,
         )
-        claim_ids = [int(r["id"]) for r in moved]
         await conn.execute("UPDATE knowledge_claim SET subject_entity_id = $1 WHERE subject_entity_id = $2", keep, dup)
         await conn.execute("UPDATE knowledge_claim SET object_entity_id = $1 WHERE object_entity_id = $2", keep, dup)
         krow = await conn.fetchrow("SELECT canonical_name, aliases FROM knowledge_entity WHERE id = $1", keep)
@@ -885,12 +597,6 @@ class MemoryStore:
         )
         await conn.execute("UPDATE knowledge_entity SET aliases = $1 WHERE id = $2", new_aliases, keep)
         await conn.execute("UPDATE knowledge_entity SET merged_into = $1, merged_at = now() WHERE id = $2", keep, dup)
-        await conn.execute(
-            "INSERT INTO knowledge_entity_merge_log (keeper_id, merged_id, claim_ids) VALUES ($1, $2, $3)",
-            keep,
-            dup,
-            claim_ids,
-        )
         logfire.info("Merged duplicate entity", keep_id=keep, dup_id=dup, dup_name=drow["canonical_name"])
 
     async def _merge_by_name(self, conn: _Conn) -> int:
@@ -1000,15 +706,14 @@ class MemoryStore:
 
     @logfire.instrument()
     async def consolidate(self) -> dict[str, int]:
-        """Merge duplicate entities (name, then embedding, then LLM pass), then recompute.
+        """Merge duplicate entities: a name pass, then embedding, then an optional LLM pass.
 
         Pass 1 (:meth:`_merge_by_name`) collapses entities with an identical normalized name
         key — high precision, no embeddings. Pass 2 (:meth:`_merge_by_embedding`) is a
         conservative embedding fallback at ``entity_merge_threshold``. Pass 3
         (:meth:`_merge_by_llm`, when a linker is wired and ``entity_merge_llm``) heals
-        fragmentation the deterministic passes miss. All merges are soft/reversible. Then
-        every live promotable subject+predicate+object group is re-evaluated, so a merge that
-        newly clears the corroboration threshold promotes to ``believed`` (or demotes).
+        fragmentation the deterministic passes miss. Merges repoint claims to the keeper, so
+        agreement counts re-tally automatically on the next recall — no recompute needed.
         """
         # Deterministic passes are atomic; the LLM pass makes decisions outside any
         # transaction (each merge is its own short txn) so no transaction is held across an
@@ -1020,244 +725,13 @@ class MemoryStore:
 
         merged_by_llm = await self._merge_by_llm() if self._config.entity_merge_llm else 0
 
-        async with self._pool.acquire() as conn:
-            async with conn.transaction():
-                groups = await conn.fetch(
-                    "SELECT DISTINCT subject_entity_id, predicate, object_text FROM knowledge_claim "
-                    "WHERE retracted_at IS NULL AND superseded_by IS NULL AND status <> 'disputed' "
-                    "AND trust_tier = ANY($1)",
-                    list(PROMOTABLE_TIERS),
-                )
-                for g in groups:
-                    await self._recompute_corroboration(conn, g["subject_entity_id"], g["predicate"], g["object_text"])
-
         summary = {
             "merged_by_name": merged_by_name,
             "merged_by_embedding": merged_by_embedding,
             "merged_by_llm": merged_by_llm,
-            "groups_recomputed": len(groups),
         }
         logfire.info("Consolidation complete", summary=summary)
         return summary
-
-    @logfire.instrument()
-    async def detect_contradictions(self) -> dict[str, int]:
-        """Flag same-subject+predicate disagreements as ``disputed`` (and self-heal).
-
-        For each live subject+predicate group: if two or more distinct object values
-        coexist it's a contradiction — every live claim in the group is marked
-        ``disputed`` (never deleted), which both demotes any ``believed`` value and drops
-        the group from corroboration counting until it's resolved. If a previously-disputed
-        group now has a single value, the flag is cleared back to ``asserted`` and the value
-        re-evaluated for promotion. Overlapping validity is approximated as "both live"
-        (claims rarely set ``valid_to``). It records ``disputed_at`` so the autonomous
-        ``resolve_disputes`` pass can act after a grace period; here it only flags, it does
-        not pick a winner.
-        """
-        conflicting = 0
-        cleared = 0
-        async with self._pool.acquire() as conn:
-            async with conn.transaction():
-                groups = await conn.fetch(
-                    "SELECT subject_entity_id, predicate, "
-                    "count(DISTINCT lower(object_text)) AS values, "
-                    "count(*) FILTER (WHERE status = 'disputed') AS disputed "
-                    "FROM knowledge_claim WHERE retracted_at IS NULL AND superseded_by IS NULL "
-                    "GROUP BY subject_entity_id, predicate"
-                )
-                for g in groups:
-                    if g["values"] >= 2:
-                        # Mark disputed and stamp disputed_at, preserving any existing
-                        # timestamp (COALESCE) so the grace period runs from first dispute.
-                        # The `disputed_at IS NULL` arm also backfills claims disputed before
-                        # the column existed, so they become eligible for resolution.
-                        await conn.execute(
-                            "UPDATE knowledge_claim SET status = 'disputed', disputed_at = COALESCE(disputed_at, now()) "
-                            "WHERE subject_entity_id = $1 AND predicate = $2 AND retracted_at IS NULL "
-                            "AND superseded_by IS NULL AND (status <> 'disputed' OR disputed_at IS NULL)",
-                            g["subject_entity_id"],
-                            g["predicate"],
-                        )
-                        conflicting += 1
-                        logfire.info(
-                            "Contradiction flagged",
-                            subject_entity_id=g["subject_entity_id"],
-                            predicate=g["predicate"],
-                            distinct_values=g["values"],
-                        )
-                    elif g["disputed"] > 0:
-                        # Conflict resolved (one value remains) — clear the flag and re-promote.
-                        await conn.execute(
-                            "UPDATE knowledge_claim SET status = 'asserted', disputed_at = NULL "
-                            "WHERE subject_entity_id = $1 AND predicate = $2 AND retracted_at IS NULL "
-                            "AND superseded_by IS NULL AND status = 'disputed'",
-                            g["subject_entity_id"],
-                            g["predicate"],
-                        )
-                        obj = await conn.fetchval(
-                            "SELECT object_text FROM knowledge_claim WHERE subject_entity_id = $1 "
-                            "AND predicate = $2 AND retracted_at IS NULL AND superseded_by IS NULL LIMIT 1",
-                            g["subject_entity_id"],
-                            g["predicate"],
-                        )
-                        if obj is not None:
-                            await self._recompute_corroboration(conn, g["subject_entity_id"], g["predicate"], obj)
-                        cleared += 1
-
-        summary = {"conflicting_groups": conflicting, "cleared_groups": cleared}
-        logfire.info("Contradiction detection complete", summary=summary)
-        return summary
-
-    @logfire.instrument()
-    async def resolve_disputes(self) -> dict[str, int]:
-        """Autonomously resolve contradictions that have stayed disputed past the grace period.
-
-        For each disputed subject+predicate group whose dispute is older than
-        ``dispute_grace_seconds``, :func:`rank_dispute_values` picks the best-supported value
-        (independent sources, then trust tier, then recency). Claims asserting the losing
-        values are **superseded** by the winning claim (archived, recoverable via an as-of
-        read, and no longer re-flagged by ``detect_contradictions``); the winning value's
-        claims are un-disputed and re-evaluated for promotion. Self-correcting: a later claim
-        for a losing value re-opens the dispute. No human in the loop.
-        """
-        grace = self._config.dispute_grace_seconds
-        resolved = 0
-        async with self._pool.acquire() as conn:
-            async with conn.transaction():
-                groups = await conn.fetch(
-                    "SELECT subject_entity_id, predicate FROM knowledge_claim "
-                    "WHERE retracted_at IS NULL AND superseded_by IS NULL AND status = 'disputed' "
-                    "AND disputed_at IS NOT NULL "
-                    "GROUP BY subject_entity_id, predicate "
-                    "HAVING min(disputed_at) < now() - make_interval(secs => $1)",
-                    float(grace),
-                )
-                for g in groups:
-                    claims = await conn.fetch(
-                        "SELECT id, object_text, trust_tier, source_id, valid_from, recorded_at FROM knowledge_claim "
-                        "WHERE subject_entity_id = $1 AND predicate = $2 AND retracted_at IS NULL "
-                        "AND superseded_by IS NULL",
-                        g["subject_entity_id"],
-                        g["predicate"],
-                    )
-                    if not claims:
-                        continue
-                    winner = rank_dispute_values([dict(c) for c in claims]).strip().lower()
-                    winner_ids = [c["id"] for c in claims if c["object_text"].strip().lower() == winner]
-                    loser_ids = [c["id"] for c in claims if c["object_text"].strip().lower() != winner]
-                    if not winner_ids:
-                        continue
-                    if loser_ids:
-                        await conn.execute(
-                            "UPDATE knowledge_claim SET superseded_by = $1, superseded_at = now() WHERE id = ANY($2)",
-                            winner_ids[0],
-                            loser_ids,
-                        )
-                    await conn.execute(
-                        "UPDATE knowledge_claim SET status = 'asserted', disputed_at = NULL WHERE id = ANY($1)",
-                        winner_ids,
-                    )
-                    winning_value = next(c["object_text"] for c in claims if c["id"] == winner_ids[0])
-                    await self._recompute_corroboration(conn, g["subject_entity_id"], g["predicate"], winning_value)
-                    resolved += 1
-                    logfire.info(
-                        "Dispute resolved",
-                        subject_entity_id=g["subject_entity_id"],
-                        predicate=g["predicate"],
-                        superseded=len(loser_ids),
-                    )
-
-        summary = {"resolved_groups": resolved}
-        logfire.info("Dispute resolution complete", summary=summary)
-        return summary
-
-    @logfire.instrument()
-    async def decay(self) -> dict[str, int]:
-        """Autonomously prune low-value claims (soft-retract, never delete).
-
-        Tombstones (``retracted_at``) claims that are low-trust (tier < secondary, i.e.
-        ``model_quarantine``/``user``), neither ``believed`` nor ``disputed``, and neither
-        recorded nor recalled within ``decay_ttl_seconds``. Secondary/primary, believed,
-        disputed (left to ``resolve_disputes``), and recently-used claims are never touched.
-        Low-trust claims never count toward corroboration, so no recompute is needed.
-        Soft-retract keeps the row auditable and recoverable (append-only).
-        """
-        low_tiers = [t for t, r in TRUST_TIERS.items() if r < TRUST_TIERS["secondary"]]
-        async with self._pool.acquire() as conn:
-            result = await conn.execute(
-                "UPDATE knowledge_claim SET retracted_at = now() "
-                # Leave 'disputed' claims to resolve_disputes — decaying one side of a live
-                # contradiction would silently decide it by attrition.
-                "WHERE retracted_at IS NULL AND superseded_by IS NULL AND status NOT IN ('believed', 'disputed') "
-                "AND trust_tier = ANY($1) "
-                "AND recorded_at < now() - make_interval(secs => $2) "
-                "AND (last_recalled_at IS NULL OR last_recalled_at < now() - make_interval(secs => $2))",
-                low_tiers,
-                float(self._config.decay_ttl_seconds),
-            )
-        tombstoned = int(result.split()[-1]) if result else 0
-        summary = {"tombstoned": tombstoned}
-        logfire.info("Decay complete", summary=summary)
-        return summary
-
-    @logfire.instrument(extract_args=["merged_id"])
-    async def unmerge_entity(self, merged_id: int) -> bool:
-        """Reverse a soft-merge: reactivate ``merged_id`` and move its claims back from the keeper.
-
-        Uses the latest ``knowledge_entity_merge_log`` row for ``merged_id`` to repoint exactly
-        the claims that were folded in, clears the ``merged_into`` marker, drops the merged
-        name from the keeper's aliases, and recomputes corroboration for both entities. Returns
-        False if there's nothing to un-merge (no log row, or already active).
-        """
-        async with self._pool.acquire() as conn:
-            async with conn.transaction():
-                ent = await conn.fetchrow("SELECT merged_into FROM knowledge_entity WHERE id = $1", merged_id)
-                log = await conn.fetchrow(
-                    "SELECT keeper_id, claim_ids FROM knowledge_entity_merge_log "
-                    "WHERE merged_id = $1 ORDER BY merged_at DESC LIMIT 1",
-                    merged_id,
-                )
-                if ent is None or ent["merged_into"] is None or log is None:
-                    return False
-                keeper_id = int(log["keeper_id"])
-                claim_ids = [int(x) for x in (log["claim_ids"] or [])]
-                if claim_ids:
-                    await conn.execute(
-                        "UPDATE knowledge_claim SET subject_entity_id = $1 "
-                        "WHERE id = ANY($2) AND subject_entity_id = $3",
-                        merged_id,
-                        claim_ids,
-                        keeper_id,
-                    )
-                    await conn.execute(
-                        "UPDATE knowledge_claim SET object_entity_id = $1 WHERE id = ANY($2) AND object_entity_id = $3",
-                        merged_id,
-                        claim_ids,
-                        keeper_id,
-                    )
-                await conn.execute(
-                    "UPDATE knowledge_entity SET merged_into = NULL, merged_at = NULL WHERE id = $1", merged_id
-                )
-                merged_name = await conn.fetchval(
-                    "SELECT canonical_name FROM knowledge_entity WHERE id = $1", merged_id
-                )
-                keeper_aliases = await conn.fetchval("SELECT aliases FROM knowledge_entity WHERE id = $1", keeper_id)
-                if merged_name is not None and keeper_aliases is not None:
-                    pruned = [a for a in keeper_aliases if a.lower() != merged_name.lower()]
-                    await conn.execute("UPDATE knowledge_entity SET aliases = $1 WHERE id = $2", pruned, keeper_id)
-                # Claims moved between the two entities, so re-evaluate both their groups.
-                for eid in (keeper_id, merged_id):
-                    groups = await conn.fetch(
-                        "SELECT DISTINCT predicate, object_text FROM knowledge_claim "
-                        "WHERE subject_entity_id = $1 AND retracted_at IS NULL AND superseded_by IS NULL "
-                        "AND status <> 'disputed' AND trust_tier = ANY($2)",
-                        eid,
-                        list(PROMOTABLE_TIERS),
-                    )
-                    for g in groups:
-                        await self._recompute_corroboration(conn, eid, g["predicate"], g["object_text"])
-        logfire.info("Un-merged entity", merged_id=merged_id, keeper_id=keeper_id, claims_restored=len(claim_ids))
-        return True
 
     async def entity_neighbors(self, limit: int = 50, min_similarity: float = 0.5) -> list[EntityNeighbor]:
         """Most-similar entity pairs in the store, for calibrating ``entity_match_threshold``.
@@ -1299,96 +773,17 @@ class MemoryStore:
         return pairs
 
     async def stats(self) -> dict[str, object]:
-        """Snapshot counts for observability (entities, sources, claims by status/tier)."""
+        """Snapshot counts for observability (entities, claims, distinct subjects/authors)."""
         async with self._pool.acquire() as conn:
             entities = await conn.fetchval("SELECT count(*) FROM knowledge_entity WHERE merged_into IS NULL")
             merged_entities = await conn.fetchval("SELECT count(*) FROM knowledge_entity WHERE merged_into IS NOT NULL")
-            sources = await conn.fetchval("SELECT count(*) FROM knowledge_source")
-            live = "retracted_at IS NULL AND superseded_by IS NULL"
-            by_status = await conn.fetch(
-                f"SELECT status, count(*) AS n FROM knowledge_claim WHERE {live} GROUP BY status ORDER BY status"
-            )
-            by_tier = await conn.fetch(
-                f"SELECT trust_tier, count(*) AS n FROM knowledge_claim WHERE {live} GROUP BY trust_tier"
-            )
-            retracted = await conn.fetchval("SELECT count(*) FROM knowledge_claim WHERE retracted_at IS NOT NULL")
-            superseded = await conn.fetchval("SELECT count(*) FROM knowledge_claim WHERE superseded_by IS NOT NULL")
+            claims = await conn.fetchval("SELECT count(*) FROM knowledge_claim")
+            subjects = await conn.fetchval("SELECT count(DISTINCT subject_entity_id) FROM knowledge_claim")
+            authors = await conn.fetchval("SELECT count(DISTINCT author) FROM knowledge_claim")
         return {
             "entities": int(entities or 0),
             "merged_entities": int(merged_entities or 0),
-            "sources": int(sources or 0),
-            "live_by_status": {r["status"]: int(r["n"]) for r in by_status},
-            "live_by_tier": {r["trust_tier"]: int(r["n"]) for r in by_tier},
-            "retracted": int(retracted or 0),
-            "superseded": int(superseded or 0),
+            "claims": int(claims or 0),
+            "subjects": int(subjects or 0),
+            "authors": int(authors or 0),
         }
-
-    # --- Migration ---------------------------------------------------------------
-
-    async def _migrate_legacy_global_memory(self) -> None:
-        """Backfill rows from the legacy ``global_memory`` table as low-tier claims.
-
-        One-time, idempotent: runs only when a ``global_memory`` table exists and the new
-        claim table is still empty. Each old fact becomes a claim on a generic
-        ``(legacy memory)`` entity with predicate ``note``, attributed to its original
-        author (``user`` tier) or to ``model`` (``model_quarantine``) when authorless. The
-        original ``global_memory`` table is left intact as a backup; drop it manually once
-        the migration is verified.
-        """
-        async with self._pool.acquire() as conn:
-            has_legacy = await conn.fetchval("SELECT to_regclass('public.global_memory')")
-            if has_legacy is None:
-                return
-            already = await conn.fetchval("SELECT EXISTS (SELECT 1 FROM knowledge_claim)")
-            if already:
-                return
-            rows = await conn.fetch(
-                "SELECT fact, embedding::text AS embedding, embedding_model, author, source_note_id, created_at "
-                "FROM global_memory ORDER BY id"
-            )
-            if not rows:
-                return
-
-            name_vec = _vector_literal(await self.embed("legacy memory"))
-            async with conn.transaction():
-                entity_id = int(
-                    await conn.fetchval(
-                        "INSERT INTO knowledge_entity (canonical_name, embedding) VALUES ($1, $2::vector) RETURNING id",
-                        "(legacy memory)",
-                        name_vec,
-                    )
-                )
-                migrated = 0
-                for row in rows:
-                    author = row["author"]
-                    if author:
-                        src_name, src_kind, tier = author, "user", "user"
-                    else:
-                        src_name, src_kind, tier = "model", "model", "model_quarantine"
-                    source_id = await self._get_or_create_source(conn, src_name, src_kind, tier)
-                    # Reuse the old embedding only if it came from the current model (same
-                    # vector space); otherwise re-embed the fact text under the new model.
-                    if row["embedding_model"] == self._embed_model:
-                        claim_vec = row["embedding"]
-                    else:
-                        claim_vec = _vector_literal(await self.embed(row["fact"]))
-                    # Seed last_recalled_at = now() so the imported facts get a fresh decay
-                    # window: they carry their original (old) recorded_at, so without this the
-                    # decay pass running later in the same `run-all` would immediately
-                    # tombstone the whole migrated corpus.
-                    await conn.execute(
-                        "INSERT INTO knowledge_claim "
-                        "(subject_entity_id, predicate, object_text, source_id, trust_tier, status, "
-                        " recorded_at, last_recalled_at, volatility, embedding, author, source_note_id) "
-                        "VALUES ($1, 'note', $2, $3, $4, 'asserted', $5, now(), 'stable', $6::vector, $7, $8)",
-                        entity_id,
-                        row["fact"],
-                        source_id,
-                        tier,
-                        row["created_at"],
-                        claim_vec,
-                        author,
-                        row["source_note_id"],
-                    )
-                    migrated += 1
-            logfire.info("Migrated legacy global_memory rows into claims", count=migrated)

@@ -280,8 +280,6 @@ class ChatAgent:
         self._config = config
         self._redis = redis_client
         self._memory = memory
-        # Authors whose note claims enter at the promotable 'primary' tier (trusted source).
-        self._trusted_user_ids: set[str] = set(config.trusted_user_ids or [])
 
         _chain = _model_chain
         model = _chain(config.llm_models)
@@ -319,10 +317,7 @@ class ChatAgent:
             self._entity_linker = build_entity_linker(config)
             memory.entity_linker = self._entity_linker
 
-        # Pass the extractor only when it exists, so remember_fact is exposed only when a
-        # fact can actually be structured into a claim.
-        extractor = self._extract_claim if self._extract_agent is not None else None
-        tools = build_tools(config, redis_client=redis_client, memory=memory, extractor=extractor)
+        tools = build_tools(config, redis_client=redis_client, memory=memory)
         gates = gate_names(config)
         for gate, servers in sorted(gates.items()):
             tools.append(_make_enable_gate_tool(gate, servers))
@@ -409,13 +404,14 @@ class ChatAgent:
         (``max_tokens`` — otherwise unused), any configured sampling/anti-repetition
         knobs, and a per-call timeout.
 
-        Sampling params are only included when set in config, so unset ones keep the
-        provider default (and aren't sent to models that reject them).
+        ``max_tokens`` and the sampling params are only included when set in config, so
+        unset ones keep the provider default (and aren't sent to models that reject them).
         """
         settings: dict[str, Any] = {
             "timeout": timeout,
-            "max_tokens": self._config.max_tokens,
         }
+        if self._config.max_tokens is not None:
+            settings["max_tokens"] = self._config.max_tokens
         if self._config.temperature is not None:
             settings["temperature"] = self._config.temperature
         if self._config.top_p is not None:
@@ -611,18 +607,16 @@ class ChatAgent:
         return result.output
 
     async def _maybe_ingest_note(self, note: Note, context: Optional[list[Note]] = None) -> None:
-        """Learn a world-fact claim from the author's note, sourced to the author.
+        """Learn a world-fact claim from the author's note, attributed to the author.
 
-        Deterministic provenance: the source is the note's author (kind=user, `user`
-        tier), set by code — not by anything the model says. A `user`-tier claim can
-        never be promoted to 'believed' on its own, but it's attributable and retractable
-        by author. The author's handle is passed to the extractor so a self-statement
-        ("I use Arch") resolves to a claim about them, and the prior thread (``context``)
-        is supplied as reference-only material so cross-note references resolve (e.g. "her
-        name is Olive" after "I have a pet lizard"). Durable personal facts are allowed,
-        but the extractor skips sensitive info and a ``looks_sensitive`` backstop drops any
-        obvious PII (email/phone/IDs) that slips through. Rate-limited per author by
-        ``global_write_cooldown``. Never raises — must not break the reply.
+        The claim's ``author`` is the note's author (set by code, not by anything the model
+        says), so distinct authors asserting the same value raise its agreement count. The
+        author's handle is passed to the extractor so a self-statement ("I use Arch") resolves
+        to a claim about them, and the prior thread (``context``) is supplied as reference-only
+        material so cross-note references resolve (e.g. "her name is Olive" after "I have a pet
+        lizard"). Durable personal facts are allowed, but the extractor skips sensitive info and
+        a ``looks_sensitive`` backstop drops any obvious PII (email/phone/IDs) that slips through.
+        Rate-limited per author by ``global_write_cooldown``. Never raises — must not break the reply.
         """
         if (
             self._memory is None
@@ -659,21 +653,11 @@ class ChatAgent:
             if looks_sensitive(extracted.object) or looks_sensitive(extracted.subject):
                 logfire.info("Note claim dropped (sensitive-PII backstop)", author=author)
                 return
-            # Trusted authors (configured by stable id) are a promotable 'primary' source;
-            # everyone else stays at the non-promotable 'user' tier. Source kind is 'user'
-            # either way, so retraction-by-handle and the user/primary distinction both hold.
-            tier = "primary" if note.userId in self._trusted_user_ids else "user"
             await self._memory.add_claim(
                 subject=extracted.subject,
                 predicate=extracted.predicate,
                 object_text=extracted.object,
-                source_name=author,
-                source_kind="user",
-                trust_tier=tier,
                 author=author,
-                source_note_id=note.id,
-                volatility=extracted.volatility,
-                confidence=extracted.confidence,
             )
         except Exception:
             logfire.exception("Note claim ingestion failed (reply unaffected)", author=author)

@@ -23,7 +23,7 @@ llm_models:
   #   vision: false  # opt this string-form model out of vision routing
 # Pass images directly to the main LLM (requires a multimodal model)
 vision: true
-max_tokens: 512  # hard cap on reply/auto-post length; enforced via model_settings
+max_tokens: 512  # optional hard cap on reply/auto-post length, enforced via model_settings; omit to leave unbounded (truncated only at max_note_length)
 max_retries: 1
 http_timeout_seconds: 30
 # Sampling / anti-repetition knobs for the reply + auto-post models. Each is only

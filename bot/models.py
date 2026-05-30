@@ -187,7 +187,13 @@ class Config(BaseModel):
     vision_models: Optional[List[str]] = Field(
         default=None, description="Vision model strings (legacy, unused when vision=True)"
     )
-    max_tokens: int = Field(gt=0)
+    max_tokens: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description="Hard cap on reply/auto-post length, wired into the reply/auto models' "
+        "model_settings. When unset, the model generates unboundedly and over-length output "
+        "is truncated only at the Misskey note cap (max_note_length).",
+    )
     max_note_length: int = Field(
         default=3000,
         gt=0,
@@ -317,8 +323,8 @@ class Config(BaseModel):
     memory_enabled: bool = Field(
         default=False,
         description="Enable the persistent world-knowledge store (Postgres + pgvector). Off by default; "
-        "requires postgres_url and embedding_model. Adds the remember_fact / search_memory tools. The store "
-        "keeps claims-with-provenance (source, trust tier, time, corroboration), never bare facts.",
+        "requires postgres_url and embedding_model. Adds the search_memory tool and ingests user notes as "
+        "claims. Recall ranks values by user agreement (how many distinct users assert each value).",
     )
     postgres_url: Optional[str] = Field(
         default=None,
@@ -364,24 +370,10 @@ class Config(BaseModel):
         ge=0,
         description="Minimum seconds between global memory writes per author. Bounds memory poisoning rate.",
     )
-    global_dedup_threshold: float = Field(
-        default=0.95,
-        ge=0.0,
-        le=1.0,
-        description="If a new claim from the same source is at least this cosine-similar to an existing "
-        "(non-retracted) claim with the same subject+predicate, the write is skipped as a near-duplicate.",
-    )
     max_fact_length: int = Field(
         default=500,
         gt=0,
         description="Maximum character length of a single submitted fact/claim; longer writes are rejected.",
-    )
-    corroboration_threshold: int = Field(
-        default=2,
-        gt=0,
-        description="Number of independent sources of tier >= secondary that must assert the same "
-        "subject+predicate+object before a claim is promoted from 'asserted' to 'believed'. Model-generated "
-        "(model_quarantine) claims never count toward this and are never promoted.",
     )
     entity_match_threshold: float = Field(
         default=0.82,
@@ -403,28 +395,8 @@ class Config(BaseModel):
         default=True,
         description="In the `consolidate` maintenance pass, after the deterministic name/embedding passes, run "
         "an LLM merge pass that offers each entity's near-neighbours to the entity-link classifier and folds in "
-        "confirmed same-entity matches. Heals existing fragmentation the deterministic passes miss. Merges are "
-        "soft (reversible via `unmerge`). Requires a model; set false to skip the extra LLM calls per run.",
-    )
-    volatile_ttl_seconds: int = Field(
-        default=86400,
-        gt=0,
-        description="A claim marked 'volatile' older than this (by valid_from, else recorded_at) is flagged "
-        "stale on recall so the model re-verifies it live rather than trusting it.",
-    )
-    decay_ttl_seconds: int = Field(
-        default=2592000,  # 30 days
-        gt=0,
-        description="Autonomous pruning (the `decay` maintenance pass): a low-trust claim (tier < secondary) "
-        "that has not been recorded or recalled within this window is soft-retracted (tombstoned, not deleted). "
-        "Promotable/believed/recently-recalled claims are never decayed.",
-    )
-    dispute_grace_seconds: int = Field(
-        default=604800,  # 7 days
-        gt=0,
-        description="Autonomous dispute resolution (the `resolve-disputes` maintenance pass): a contradiction "
-        "must stay disputed at least this long (giving corroborating evidence time to arrive) before the pass "
-        "picks the best-supported value and supersedes the rest.",
+        "confirmed same-entity matches. Heals existing fragmentation the deterministic passes miss. Requires a "
+        "model; set false to skip the extra LLM calls per run.",
     )
     memory_extract_models: List[Union[str, CustomOpenAIModel]] = Field(
         default_factory=list,
@@ -434,19 +406,10 @@ class Config(BaseModel):
     )
     memory_ingest_notes: bool = Field(
         default=True,
-        description="When memory is enabled, auto-ingest each incoming user note as a claim attributed to "
-        "its author at the 'user' trust tier (deterministic provenance; never promotable to 'believed' on "
-        "its own). The extractor's Skip branch drops chatter/opinions/personal details, and writes are "
-        "rate-limited per author by global_write_cooldown. Set false to disable note learning.",
-    )
-    trusted_user_ids: List[str] = Field(
-        default_factory=list,
-        description="When memory is enabled, note claims ingested from these user ids enter at the 'primary' "
-        "trust tier instead of 'user' — i.e. the author is treated as a trusted/promotable source: their claims "
-        "count toward corroboration and win read-time conflicts by tier. Matched by stable user id (like "
-        "social_credit_unrestricted_user_ids), not handle, since ids aren't spoofable across federation. A single "
-        "trusted user is still only 'asserted'; two promotable sources asserting the same value reach 'believed' "
-        "(corroboration_threshold). The extraction admission gate and sensitive-PII backstop still apply.",
+        description="When memory is enabled, auto-ingest each incoming user note as a claim attributed to its "
+        "author (so distinct authors asserting the same value raise its agreement count). The extractor's Skip "
+        "branch drops chatter/opinions/personal details, and writes are rate-limited per author by "
+        "global_write_cooldown. Set false to disable note learning.",
     )
     debug: Optional[bool] = None
 
