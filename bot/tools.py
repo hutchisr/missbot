@@ -43,6 +43,10 @@ def _render_recalled_claim(claim: RecalledClaim) -> str:
         f"corroborated_by={claim.corroboration_count}, "
         f"recorded={claim.recorded_at.date().isoformat()}"
     )
+    # Weak community signal: only shown once at least two distinct users independently
+    # assert the value. It's not a promotion — the model should weigh it as soft support.
+    if claim.user_corroboration_count >= 2:
+        meta += f", users_agree={claim.user_corroboration_count}"
     line = f"- {claim.subject} — {claim.predicate.replace('_', ' ')}: {claim.object_text} [{meta}]"
     if claim.stale:
         line += " [STALE volatile fact — re-verify before relying on it]"

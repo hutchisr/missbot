@@ -94,6 +94,25 @@ def test_resolve_conflict_breaks_ties_by_trust_then_recency():
     )
 
 
+def test_resolve_conflict_user_agreement_breaks_ties_within_tier():
+    now = datetime.now(timezone.utc)
+    older = now - timedelta(days=1)
+    # Same status+tier: a value more users agree on beats a fresher single-user value.
+    agreed = {**_claim("asserted", "user", older, "G"), "user_corroboration_count": 3}
+    lone = {**_claim("asserted", "user", now, "H"), "user_corroboration_count": 1}
+    assert resolve_conflict([lone, agreed])["object_text"] == "G"
+
+
+def test_user_agreement_never_outranks_a_trusted_tier():
+    now = datetime.now(timezone.utc)
+    older = now - timedelta(days=1)
+    # Even with many users agreeing, a user-tier value can't beat a (fresher-or-not)
+    # secondary one — the agreement term sits *below* trust tier in the sort key.
+    crowd = {**_claim("asserted", "user", now, "I"), "user_corroboration_count": 99}
+    trusted = {**_claim("asserted", "secondary", older, "J"), "user_corroboration_count": 0}
+    assert resolve_conflict([crowd, trusted])["object_text"] == "J"
+
+
 def test_rank_dispute_values_prefers_more_independent_sources():
     now = datetime.now(timezone.utc)
     older = now - timedelta(days=1)
@@ -165,6 +184,7 @@ def test_recalled_claim_carries_provenance():
         source_kind="web",
         confidence=0.9,
         corroboration_count=2,
+        user_corroboration_count=0,
         volatility="volatile",
         recorded_at=now,
         valid_from=None,

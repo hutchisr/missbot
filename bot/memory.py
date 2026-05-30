@@ -126,21 +126,33 @@ def is_stale(volatility: str, reference_time: Optional[datetime], now: datetime,
     return (now - reference_time).total_seconds() > ttl_seconds
 
 
-def _conflict_sort_key(claim: dict) -> tuple[int, int, datetime]:
+def _conflict_sort_key(claim: dict) -> tuple[int, int, int, datetime]:
     """Sort key for read-time conflict resolution.
 
     Prefer (1) higher status (believed > asserted > disputed), then (2) higher trust
-    tier, then (3) the most recent valid_from (falling back to recorded_at).
+    tier, then (3) more independent *ordinary-user* agreement (``user_corroboration_count``),
+    then (4) the most recent valid_from (falling back to recorded_at).
+
+    The user-agreement term is a deliberately weak signal: it sits *below* trust tier, so
+    it only ever breaks ties *within* a tier — a value many users agree on can outrank a
+    fresher single-user value, but never a trusted (secondary/primary) source. Defaults to
+    0 when absent so callers that don't supply it keep the old (tier, recency) ordering.
     """
     ref = claim.get("valid_from") or claim["recorded_at"]
-    return (STATUS_RANK.get(claim["status"], 0), tier_rank(claim["trust_tier"]), ref)
+    return (
+        STATUS_RANK.get(claim["status"], 0),
+        tier_rank(claim["trust_tier"]),
+        int(claim.get("user_corroboration_count", 0)),
+        ref,
+    )
 
 
 def resolve_conflict(claims: list[dict]) -> dict:
     """Pick the winning claim from a set sharing the same subject+predicate.
 
-    Pure policy (no DB): believed > asserted, then trust tier, then recency. The full
-    set is preserved by the caller so conflicts surface with provenance.
+    Pure policy (no DB): believed > asserted, then trust tier, then ordinary-user
+    agreement (a within-tier tiebreaker only), then recency. The full set is preserved by
+    the caller so conflicts surface with provenance.
     """
     return max(claims, key=_conflict_sort_key)
 
@@ -218,6 +230,7 @@ class RecalledClaim:
     source_kind: str
     confidence: float
     corroboration_count: int
+    user_corroboration_count: int
     volatility: str
     recorded_at: datetime
     valid_from: Optional[datetime]
@@ -336,6 +349,7 @@ class MemoryStore:
                     superseded_at       TIMESTAMPTZ,
                     retracted_at        TIMESTAMPTZ,
                     corroboration_count INTEGER NOT NULL DEFAULT 0,
+                    user_corroboration_count INTEGER NOT NULL DEFAULT 0,
                     volatility          TEXT NOT NULL DEFAULT 'stable',
                     embedding           vector({dim}) NOT NULL,
                     author              TEXT,
@@ -350,6 +364,10 @@ class MemoryStore:
             # (CREATE TABLE IF NOT EXISTS won't add them to an existing table).
             await conn.execute("ALTER TABLE knowledge_claim ADD COLUMN IF NOT EXISTS last_recalled_at TIMESTAMPTZ")
             await conn.execute("ALTER TABLE knowledge_claim ADD COLUMN IF NOT EXISTS disputed_at TIMESTAMPTZ")
+            await conn.execute(
+                "ALTER TABLE knowledge_claim "
+                "ADD COLUMN IF NOT EXISTS user_corroboration_count INTEGER NOT NULL DEFAULT 0"
+            )
             await conn.execute(
                 "ALTER TABLE knowledge_entity ADD COLUMN IF NOT EXISTS merged_into BIGINT REFERENCES knowledge_entity(id)"
             )
@@ -626,8 +644,10 @@ class MemoryStore:
         A value asserted by ``>= corroboration_threshold`` *distinct* promotable-tier
         sources becomes ``believed``; if it drops below that (e.g. after retraction) it
         falls back to ``asserted``. ``model_quarantine``/``user`` claims are never touched,
-        so an LLM-sourced claim can never reach ``believed``. Returns True if the value
-        is believed afterwards.
+        so an LLM-sourced claim can never reach ``believed``. Also recomputes the weak
+        ``user_corroboration_count`` (distinct ordinary-user sources for the value) on every
+        live claim of the value — a non-promoting signal surfaced on recall. Returns True if
+        the value is believed afterwards.
         """
         count = await conn.fetchval(
             "SELECT count(DISTINCT source_id) FROM knowledge_claim "
@@ -653,6 +673,31 @@ class MemoryStore:
             n,
             promote,
             list(PROMOTABLE_TIERS),
+        )
+
+        # Weak "ordinary users agree" signal, recomputed alongside the promotable count:
+        # distinct *user*-tier sources asserting this exact value. It never promotes (these
+        # claims stay below 'secondary') — it's surfaced on recall and used only as a
+        # within-tier conflict tiebreaker. Trusted users enter at 'primary' and feed the
+        # real corroboration count above instead, so they're excluded here by the tier
+        # filter. (Social-credit weighting of these votes is a planned hardening.)
+        user_count = await conn.fetchval(
+            "SELECT count(DISTINCT source_id) FROM knowledge_claim "
+            "WHERE subject_entity_id = $1 AND predicate = $2 AND lower(object_text) = lower($3) "
+            "AND retracted_at IS NULL AND superseded_by IS NULL AND status <> 'disputed' "
+            "AND trust_tier = 'user'",
+            subject_entity_id,
+            predicate,
+            object_text,
+        )
+        await conn.execute(
+            "UPDATE knowledge_claim SET user_corroboration_count = $4 "
+            "WHERE subject_entity_id = $1 AND predicate = $2 AND lower(object_text) = lower($3) "
+            "AND retracted_at IS NULL AND superseded_by IS NULL",
+            subject_entity_id,
+            predicate,
+            object_text,
+            int(user_count or 0),
         )
         return promote
 
@@ -742,7 +787,7 @@ class MemoryStore:
             rows = await conn.fetch(
                 f"""
                 SELECT c.id, e.canonical_name AS subject, c.predicate, c.object_text, c.status,
-                       c.trust_tier, c.confidence, c.corroboration_count, c.volatility,
+                       c.trust_tier, c.confidence, c.corroboration_count, c.user_corroboration_count, c.volatility,
                        c.valid_from, c.recorded_at, s.name AS source_name, s.kind AS source_kind,
                        c.embedding <=> $1::vector AS dist
                 FROM knowledge_claim c
@@ -790,6 +835,7 @@ class MemoryStore:
                 source_kind=winner["source_kind"],
                 confidence=float(winner["confidence"]),
                 corroboration_count=int(winner["corroboration_count"]),
+                user_corroboration_count=int(winner["user_corroboration_count"]),
                 volatility=winner["volatility"],
                 recorded_at=winner["recorded_at"],
                 valid_from=winner["valid_from"],

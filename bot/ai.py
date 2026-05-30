@@ -280,6 +280,8 @@ class ChatAgent:
         self._config = config
         self._redis = redis_client
         self._memory = memory
+        # Authors whose note claims enter at the promotable 'primary' tier (trusted source).
+        self._trusted_user_ids: set[str] = set(config.trusted_user_ids or [])
 
         _chain = _model_chain
         model = _chain(config.llm_models)
@@ -657,13 +659,17 @@ class ChatAgent:
             if looks_sensitive(extracted.object) or looks_sensitive(extracted.subject):
                 logfire.info("Note claim dropped (sensitive-PII backstop)", author=author)
                 return
+            # Trusted authors (configured by stable id) are a promotable 'primary' source;
+            # everyone else stays at the non-promotable 'user' tier. Source kind is 'user'
+            # either way, so retraction-by-handle and the user/primary distinction both hold.
+            tier = "primary" if note.userId in self._trusted_user_ids else "user"
             await self._memory.add_claim(
                 subject=extracted.subject,
                 predicate=extracted.predicate,
                 object_text=extracted.object,
                 source_name=author,
                 source_kind="user",
-                trust_tier="user",
+                trust_tier=tier,
                 author=author,
                 source_note_id=note.id,
                 volatility=extracted.volatility,

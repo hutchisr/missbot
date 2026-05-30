@@ -439,6 +439,15 @@ class Config(BaseModel):
         "its own). The extractor's Skip branch drops chatter/opinions/personal details, and writes are "
         "rate-limited per author by global_write_cooldown. Set false to disable note learning.",
     )
+    trusted_user_ids: List[str] = Field(
+        default_factory=list,
+        description="When memory is enabled, note claims ingested from these user ids enter at the 'primary' "
+        "trust tier instead of 'user' — i.e. the author is treated as a trusted/promotable source: their claims "
+        "count toward corroboration and win read-time conflicts by tier. Matched by stable user id (like "
+        "social_credit_unrestricted_user_ids), not handle, since ids aren't spoofable across federation. A single "
+        "trusted user is still only 'asserted'; two promotable sources asserting the same value reach 'believed' "
+        "(corroboration_threshold). The extraction admission gate and sensitive-PII backstop still apply.",
+    )
     debug: Optional[bool] = None
 
     @model_validator(mode="after")

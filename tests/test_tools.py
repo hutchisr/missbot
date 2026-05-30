@@ -520,6 +520,7 @@ async def test_search_memory_fences_claims_with_provenance(make_config):
             source_kind="web",
             confidence=0.9,
             corroboration_count=2,
+            user_corroboration_count=0,
             volatility="volatile",
             recorded_at=now,
             valid_from=None,
