@@ -1,5 +1,7 @@
 # Missbot
 
+<!-- This file is the project doc; CLAUDE.md is just `@AGENTS.md`. Edit AGENTS.md, not CLAUDE.md. -->
+
 Misskey/Fediverse chatbot using Pydantic AI with LLM fallback, WebSocket streaming, an optional Redis-backed social credit system, and an optional Postgres/pgvector world-knowledge store (claims ranked by user agreement).
 
 ## Commands
@@ -32,6 +34,13 @@ docker build -t missbot . && docker run -v /path/to/config.yaml:/config.yaml mis
 # Kubernetes
 mise run build      # Build and push Docker image
 mise run deploy     # Apply K8s manifests and restart
+
+# Production cluster (kubectl context: mercury)
+# World-knowledge DB is CloudNativePG, NOT local. Connect via the primary pod with peer auth
+# as the postgres OS user (the `grok` app user fails peer auth; never put the password on the
+# command line — the safety classifier blocks it, and you don't need it):
+kubectl exec -n cnpg pg-cluster-1 -- psql -U postgres -d grok -tAc "SELECT count(*) FROM knowledge_claim"
+# Bot pod + maintenance CronJob live in the `misskey` namespace (missbot-*), not `default`.
 ```
 
 **Important:** Always use `uv run` or `.venv/bin/python` — never bare `python`.
@@ -105,7 +114,7 @@ Global (non-user-specific) knowledge backed by Postgres + the `pgvector` extensi
 
 **Safety properties (enforced in code):** writes are per-author (one opinion each, so a single user can't inflate agreement by repeating) and rate-limited per author by `global_write_cooldown`; the agreement count is `COUNT(DISTINCT author)`, computed at read time, never a stored status; recalled claims reach the model fenced as untrusted data (`_fence_untrusted` in `bot/tools.py`); the extractor admission gate + `looks_sensitive` PII backstop still apply. The embedding model emits **unnormalized** vectors, so all comparisons use cosine distance (`<=>`).
 
-**Maintenance.** Run out-of-process via `python -m bot.maintenance` (the `missbot-maintenance` k8s CronJob runs `consolidate` daily). *Consolidation* (`consolidate`) folds duplicate entities into the lowest-id keeper (repointing claims as subject and object, unioning aliases, soft-marking the dup `merged_into`) in three passes — a high-precision **name** pass (`normalize_entity_name`: accent/case/punctuation/plural normalization only), a conservative **embedding** pass at `entity_merge_threshold`, and (when `entity_merge_llm` + a linker is wired) an **LLM** pass. On repoint a dup-side claim that would collide with a keep-side claim from the same author+predicate is dropped first (the `UNIQUE` constraint). No corroboration recompute is needed — agreement re-tallies on the next recall. `stats` prints store counts; `calibrate-entities` lists the most-similar entity pairs to tune `entity_match_threshold`. Merge decisions are traced to Logfire.
+**Maintenance.** Run out-of-process via `python -m bot.maintenance` (the `missbot-maintenance` k8s CronJob runs `consolidate` daily). *Consolidation* (`consolidate`) folds duplicate entities into the lowest-id keeper (repointing claims as subject and object, unioning aliases, soft-marking the dup `merged_into`) in three passes — a high-precision **name** pass (`normalize_entity_name`: accent/case/punctuation/plural normalization only), a conservative **embedding** pass at `entity_merge_threshold`, and (when `entity_merge_llm` + a linker is wired) an **LLM** pass. On repoint a dup-side claim that would collide with a keep-side claim from the same author+predicate is dropped first (the `UNIQUE` constraint). A final **object-link backfill** pass (`_backfill_object_links`) then links any unlinked claim object that now exactly names a live entity (canonical/alias, case-insensitive) — healing the write-time-only staleness where a claim's object names an entity created/aliased after the claim was written; exact-match and link-only, so zero overcount risk, and run last so it sees merged-in aliases. No corroboration recompute is needed — agreement re-tallies on the next recall. `stats` prints store counts; `calibrate-entities` lists the most-similar entity pairs to tune `entity_match_threshold`. Merge decisions are traced to Logfire.
 
 ### MCP servers
 Each entry in `mcp_servers` takes:

@@ -17,7 +17,7 @@ def test_config_valid(make_config):
 
 def test_config_missing_required_field():
     with pytest.raises(ValidationError):
-        Config(domain="example.test")  # type: ignore[call-arg]
+        Config(domain="example.test")  # type: ignore[call-arg]  # ty: ignore[missing-argument]
 
 
 def test_config_max_tokens_must_be_positive(make_config):
@@ -47,7 +47,7 @@ def test_config_auto_reply_interval_must_be_positive(make_config):
 
 
 def test_user_extra_fields_allowed():
-    u = User(id="1", username="alice", unknown_field="ok")  # type: ignore[call-arg]
+    u = User(id="1", username="alice", unknown_field="ok")  # type: ignore[call-arg]  # ty: ignore[unknown-argument]
     assert u.username == "alice"
 
 
@@ -69,7 +69,7 @@ def test_note_nested_reply(make_user):
 def test_note_visibility_literal_validation(make_user):
     user = make_user()
     with pytest.raises(ValidationError):
-        Note(id="n", text="t", userId=user.id, user=user, visibility="bogus")  # type: ignore[arg-type]
+        Note(id="n", text="t", userId=user.id, user=user, visibility="bogus")  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
 
 
 def test_mifile_optional_fields():
@@ -109,7 +109,7 @@ def test_config_custom_endpoint_without_base_url_passes_through_string(make_conf
 def test_custom_openai_model_vision_defaults_true():
     spec = CustomOpenAIModel(
         model="Qwen/Qwen3",
-        base_url="https://example.modal.run/v1",  # type: ignore[arg-type]
+        base_url="https://example.modal.run/v1",  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
     )
     assert spec.vision is True
 

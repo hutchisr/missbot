@@ -77,6 +77,7 @@ async def test_run_skips_model_override_when_no_images(make_config, make_note):
     ):
         await agent.run(note)
 
+    assert run_mock.await_args is not None
     assert "model" not in run_mock.await_args.kwargs
 
 
@@ -97,6 +98,7 @@ async def test_run_drops_images_when_no_vision_model(make_config, make_note):
     ):
         await agent.run(note)
 
+    assert run_mock.await_args is not None
     prompt = run_mock.await_args.args[0]
     # Image was dropped — prompt collapses to a single string, no ImageUrl.
     assert isinstance(prompt, str)
@@ -115,6 +117,7 @@ async def test_run_flags_unrestricted_for_privileged_author(make_config, make_no
     ):
         await agent.run(note)
 
+    assert run_mock.await_args is not None
     assert run_mock.await_args.kwargs["deps"].social_credit_unrestricted is True
 
 
@@ -130,6 +133,7 @@ async def test_run_restricted_for_non_privileged_author(make_config, make_note, 
     ):
         await agent.run(note)
 
+    assert run_mock.await_args is not None
     assert run_mock.await_args.kwargs["deps"].social_credit_unrestricted is False
 
 
@@ -357,6 +361,7 @@ async def test_run_note_ingestion_passes_speaker_to_extractor(make_config, make_
         await agent.run(note)
 
     # The author's handle is plumbed into the extraction prompt so "I" resolves to them.
+    assert extract_mock.await_args is not None
     prompt = extract_mock.await_args.args[0]
     assert "@alice" in prompt
     mem.add_claim.assert_awaited_once()
@@ -399,6 +404,7 @@ async def test_run_note_ingestion_supplies_thread_context(make_config, make_note
         await agent.run(note, context=[parent])
 
     # The prior note rides along as reference context so "her" can resolve to the lizard.
+    assert extract_mock.await_args is not None
     prompt = extract_mock.await_args.args[0]
     assert "I have a pet lizard" in prompt
     assert "her name is Olive" in prompt

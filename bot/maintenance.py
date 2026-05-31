@@ -3,7 +3,7 @@
 Runnable out-of-process (so it can be a k8s CronJob, separate from the long-running
 bot) via ``python -m bot.maintenance <command> -c /config.yaml``:
 
-    consolidate         merge duplicate entities (name, then embedding, then optional LLM pass)
+    consolidate         merge duplicate entities (name/embedding/LLM), then backfill object links
     stats               print store counts (entities, claims, distinct subjects/authors)
     calibrate-entities  print the most-similar entity pairs to help tune entity_match_threshold
 
@@ -73,7 +73,7 @@ def cli() -> None:
 @cli.command()
 @_config_option
 def consolidate(config_path: str) -> None:
-    """Merge duplicate entities (name, then embedding, then optional LLM pass)."""
+    """Merge duplicate entities (name/embedding/LLM), then backfill stale object links."""
     summary = _run(config_path, lambda store: store.consolidate())
     click.echo(json.dumps(summary))
 

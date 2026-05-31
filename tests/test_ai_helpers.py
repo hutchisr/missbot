@@ -101,7 +101,7 @@ def test_resolve_model_spec_passes_through_strings():
 def test_resolve_model_spec_builds_openai_chat_model():
     spec = CustomOpenAIModel(
         model="Qwen/Qwen3",
-        base_url="https://example.modal.run/v1",  # type: ignore[arg-type]
+        base_url="https://example.modal.run/v1",  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
         api_key="literal-key",
     )
     model = _resolve_model_spec(spec)
@@ -116,7 +116,7 @@ def test_resolve_model_spec_reads_api_key_from_env(monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("MODAL_API_KEY", "env-key")
     spec = CustomOpenAIModel(
         model="Qwen/Qwen3",
-        base_url="https://example.modal.run/v1",  # type: ignore[arg-type]
+        base_url="https://example.modal.run/v1",  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
         api_key_env="MODAL_API_KEY",
     )
     model = _resolve_model_spec(spec)
@@ -138,7 +138,7 @@ def test_spec_supports_vision_respects_dict_flag():
     assert _spec_supports_vision(spec) is False
     spec_default = CustomOpenAIModel(
         model="Qwen/Qwen3",
-        base_url="https://example.modal.run/v1",  # type: ignore[arg-type]
+        base_url="https://example.modal.run/v1",  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
     )
     assert _spec_supports_vision(spec_default) is True
 

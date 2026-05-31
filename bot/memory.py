@@ -653,6 +653,35 @@ class MemoryStore:
                 merged += 1
         return merged
 
+    async def _backfill_object_links(self, conn: _Conn) -> int:
+        """Link unlinked claim objects that now *exactly* name a live entity. Returns the count.
+
+        Object links are computed write-time-only (:meth:`add_claim`) against the entities that
+        exist at that instant and are **never** otherwise revisited — so a claim whose object names
+        an entity created (or aliased, via a merge) *after* the claim was written stays unlinked
+        forever, fragmenting the agreement count against sibling claims that did link. This pass
+        heals that staleness using the *same* exact-match rule the write path applies
+        (:meth:`_match_entity_exact`: case-insensitive canonical-name/alias hit, live entities only,
+        lowest id on ties): no embeddings, no LLM, link-only (never creates). Because it is exact
+        match it carries zero overcount risk — it can only fold a stale literal back onto the entity
+        the write path would have linked it to. Run last in :meth:`consolidate`, after merges have
+        unioned duplicate names into keeper aliases (which exposes more exact matches).
+        """
+        match = (
+            "SELECT id FROM knowledge_entity e WHERE e.merged_into IS NULL "
+            "AND (lower(e.canonical_name) = lower(c.object_text) "
+            "OR EXISTS (SELECT 1 FROM unnest(e.aliases) a WHERE lower(a) = lower(c.object_text))) "
+            "ORDER BY e.id LIMIT 1"
+        )
+        # The EXISTS guard keeps the UPDATE to rows that actually match (so the rowcount reflects
+        # real backfills, and a non-matching row is never rewritten to NULL).
+        status = await conn.execute(
+            f"UPDATE knowledge_claim c SET object_entity_id = ({match}) "
+            f"WHERE c.object_entity_id IS NULL AND EXISTS ({match})"
+        )
+        # asyncpg returns a command tag like "UPDATE 3"; the trailing int is the affected rowcount.
+        return int(status.rsplit(" ", 1)[-1]) if status else 0
+
     async def _merge_by_llm(self) -> int:
         """Heal fragmentation the deterministic passes miss, via the entity linker (LLM).
 
@@ -706,7 +735,7 @@ class MemoryStore:
 
     @logfire.instrument()
     async def consolidate(self) -> dict[str, int]:
-        """Merge duplicate entities: a name pass, then embedding, then an optional LLM pass.
+        """Merge duplicate entities (name, then embedding, then optional LLM), then backfill links.
 
         Pass 1 (:meth:`_merge_by_name`) collapses entities with an identical normalized name
         key — high precision, no embeddings. Pass 2 (:meth:`_merge_by_embedding`) is a
@@ -714,6 +743,8 @@ class MemoryStore:
         (:meth:`_merge_by_llm`, when a linker is wired and ``entity_merge_llm``) heals
         fragmentation the deterministic passes miss. Merges repoint claims to the keeper, so
         agreement counts re-tally automatically on the next recall — no recompute needed.
+        Finally :meth:`_backfill_object_links` exact-matches any unlinked claim object onto a
+        live entity (heals write-time link staleness; run last so it sees the merged aliases).
         """
         # Deterministic passes are atomic; the LLM pass makes decisions outside any
         # transaction (each merge is its own short txn) so no transaction is held across an
@@ -725,10 +756,17 @@ class MemoryStore:
 
         merged_by_llm = await self._merge_by_llm() if self._config.entity_merge_llm else 0
 
+        # Backfill last: merges above may have unioned duplicate names into keeper aliases,
+        # exposing more exact object matches than existed at the claims' write time.
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                object_links_backfilled = await self._backfill_object_links(conn)
+
         summary = {
             "merged_by_name": merged_by_name,
             "merged_by_embedding": merged_by_embedding,
             "merged_by_llm": merged_by_llm,
+            "object_links_backfilled": object_links_backfilled,
         }
         logfire.info("Consolidation complete", summary=summary)
         return summary

@@ -20,7 +20,7 @@ def _ctx(**deps):
 
 
 def test_mcp_server_config_defaults():
-    cfg = MCPServerConfig(name="tavily", url="https://tavily.example/mcp")  # type: ignore[arg-type]
+    cfg = MCPServerConfig(name="tavily", url="https://tavily.example/mcp")  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
     assert cfg.enabled is True
     assert cfg.headers == {}
     assert cfg.blocked_tools == []
@@ -31,13 +31,13 @@ def test_mcp_server_config_defaults():
 
 def test_mcp_server_config_requires_url():
     with pytest.raises(ValidationError):
-        MCPServerConfig(name="x")  # type: ignore[call-arg]
+        MCPServerConfig(name="x")  # type: ignore[call-arg]  # ty: ignore[missing-argument]
 
 
 def test_allow_block_filter_strips_prefix_before_matching():
     cfg = MCPServerConfig(
         name="tavily",
-        url="https://tavily.example/mcp",  # type: ignore[arg-type]
+        url="https://tavily.example/mcp",  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
         tool_prefix="tavily",
         allowed_tools=["search", "extract"],
         blocked_tools=["extract"],
@@ -53,7 +53,7 @@ def test_allow_block_filter_strips_prefix_before_matching():
 def test_allow_block_filter_without_prefix():
     cfg = MCPServerConfig(
         name="x",
-        url="https://x.example/mcp",  # type: ignore[arg-type]
+        url="https://x.example/mcp",  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
         blocked_tools=["danger"],
     )
     f = _make_allow_block_filter(cfg)
