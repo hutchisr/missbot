@@ -411,6 +411,14 @@ class Config(BaseModel):
         "branch drops chatter/opinions/personal details, and writes are rate-limited per author by "
         "global_write_cooldown. Set false to disable note learning.",
     )
+    memory_ingest_bot_replies: bool = Field(
+        default=True,
+        description="When memory is enabled, also ingest the bot's own replies as claims, attributed to the "
+        "bot author. The bot author is excluded from the agreement count, so its claims are recalled but never "
+        "inflate corroboration — a human asserting the same value always outranks a bot-only one. Lets the bot "
+        "persist facts it states that no user asserted. Same extractor gate, PII backstop, and write cooldown "
+        "as note ingestion. Set false to disable.",
+    )
     debug: Optional[bool] = None
 
     @model_validator(mode="after")
