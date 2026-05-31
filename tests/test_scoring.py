@@ -68,3 +68,21 @@ def test_build_scoring_prompt_fences_untrusted_input():
 
 def test_build_scoring_prompt_uses_a_fresh_nonce_each_call():
     assert build_scoring_prompt("x") != build_scoring_prompt("x")
+
+
+def test_build_scoring_prompt_includes_thread_context():
+    prompt = build_scoring_prompt(
+        "yeah whatever, idiot",
+        context=["bot: great point!", "alice: thanks, you're the best"],
+    )
+    assert "yeah whatever, idiot" in prompt  # target message being scored
+    assert "you're the best" in prompt  # prior thread supplied for reference
+    # Context is reference-only — only the target message is classified.
+    assert "judge only the target" in prompt.lower()
+    assert "untrusted data" in prompt.lower()
+
+
+def test_build_scoring_prompt_without_context_matches_plain_form():
+    # No context (or empty context) keeps the original single-fence prompt shape.
+    assert "CONTEXT" not in build_scoring_prompt("hello")
+    assert "CONTEXT" not in build_scoring_prompt("hello", context=[])

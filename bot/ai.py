@@ -510,19 +510,37 @@ class ChatAgent:
         # swallowed and can never cancel the reply.
         result, _, _ = await asyncio.gather(
             self._agent.run(prompt, **run_kwargs),
-            _guarded(self._maybe_score_message(note), "Message scoring"),
+            _guarded(self._maybe_score_message(note, context), "Message scoring"),
             _guarded(self._maybe_ingest_note(note, context), "Note ingestion"),
         )
         return result.output
 
-    async def _maybe_score_message(self, note: Note) -> None:
+    def _render_context_lines(self, context: Optional[list[Note]]) -> list[str]:
+        """Render the prior thread chronologically as reference-only "handle: text" lines.
+
+        ``context`` is newest-first (as built for ``message_history``), so reverse it.
+        Empty notes are dropped; the bot's own notes use the configured bot handle. Shared
+        by the note-ingestion and scoring side tasks so both see the same thread rendering.
+        """
+        lines: list[str] = []
+        for c in reversed(context or []):
+            ctext = (c.text or "").strip()
+            if not ctext:
+                continue
+            handle = self._config.bot_username if c.userId == self._config.bot_user_id else _user_handle(c.user)
+            lines.append(f"{handle}: {ctext}")
+        return lines
+
+    async def _maybe_score_message(self, note: Note, context: Optional[list[Note]] = None) -> None:
         """Classify the author's message and apply a bounded score delta.
 
         Applies to every author (privileged users included — the privileged flag
         only gates the manual adjust tool, not automatic scoring). Uses the isolated
         classifier (no tools, constrained output) so the score is decided by code,
-        not by anything the user can put in their message. Rate limited per user.
-        Never raises — scoring must not break the reply path.
+        not by anything the user can put in their message. The prior thread (``context``)
+        is passed to the classifier as reference-only material so tone is judged in context
+        (a curt reply read as hostile vs. friendly ribbing depending on what it answers).
+        Rate limited per user. Never raises — scoring must not break the reply path.
         """
         if self._score_agent is None or self._redis is None:
             return
@@ -542,7 +560,7 @@ class ChatAgent:
             # We still never re-raise — the reply must not break.
             try:
                 scored = await self._score_agent.run(
-                    build_scoring_prompt(text),
+                    build_scoring_prompt(text, context=self._render_context_lines(context) or None),
                     model_settings={"timeout": 60.0},
                 )
             except Exception:
@@ -642,15 +660,7 @@ class ChatAgent:
         if not text:
             return
         author = normalize_username(_user_handle(note.user))
-        # Render the prior thread chronologically as reference-only context. `context` is
-        # newest-first (as built for message_history), so reverse it.
-        context_lines: list[str] = []
-        for c in reversed(context or []):
-            ctext = (c.text or "").strip()
-            if not ctext:
-                continue
-            handle = self._config.bot_username if c.userId == self._config.bot_user_id else _user_handle(c.user)
-            context_lines.append(f"{handle}: {ctext}")
+        context_lines = self._render_context_lines(context)
         try:
             cooldown = self._config.global_write_cooldown
             if cooldown > 0:
