@@ -409,71 +409,7 @@ async def test_run_note_ingestion_supplies_thread_context(make_config, make_note
     assert "I have a pet lizard" in prompt
     assert "her name is Olive" in prompt
     assert "@alice" in prompt
-
-
-def _bot_reply_cfg(make_config):
-    # Memory on, but user-note ingestion off, so only the bot-reply path writes.
-    return make_config(
-        memory_enabled=True,
-        postgres_url="postgresql://x/y",
-        embedding_model="m",
-        embedding_dim=4,
-        memory_ingest_notes=False,
-    )
-
-
-@pytest.mark.anyio
-async def test_run_ingests_bot_reply_as_bot_author(make_config, make_note):
-    mem = AsyncMock()
-    mem.seconds_since_last_write.return_value = None
-    agent = ChatAgent(_bot_reply_cfg(make_config), memory=mem)
-    note = make_note(text="who made you?")
-    claim = ExtractedClaim(subject="grok", predicate="built_by", object="anemone")
-
-    with (
-        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="I was built by anemone"))),
-        patch.object(
-            agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=claim))
-        ) as extract_mock,
-    ):
-        await agent.run(note)
-        # Bot-reply ingestion is fire-and-forget; drain the background task(s).
-        for task in list(agent._bg_tasks):
-            await task
-
-    # The extractor saw the bot's own reply, and the claim was stored under the bot author —
-    # which search_claims excludes from the agreement count.
-    assert extract_mock.await_args is not None
-    assert "I was built by anemone" in extract_mock.await_args.args[0]
     mem.add_claim.assert_awaited_once()
-    assert mem.add_claim.await_args is not None
-    assert mem.add_claim.await_args.kwargs["author"] == "grok"  # conftest bot_username
-
-
-@pytest.mark.anyio
-async def test_run_skips_bot_reply_ingestion_when_disabled(make_config, make_note):
-    mem = AsyncMock()
-    mem.seconds_since_last_write.return_value = None
-    cfg = make_config(
-        memory_enabled=True,
-        postgres_url="postgresql://x/y",
-        embedding_model="m",
-        embedding_dim=4,
-        memory_ingest_notes=False,
-        memory_ingest_bot_replies=False,
-    )
-    agent = ChatAgent(cfg, memory=mem)
-    note = make_note(text="who made you?")
-
-    with (
-        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="I was built by anemone"))),
-        patch.object(agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=Skip(reason="x")))),
-    ):
-        await agent.run(note)
-        for task in list(agent._bg_tasks):
-            await task
-
-    mem.add_claim.assert_not_awaited()
 
 
 # --- Write-time entity linking ---

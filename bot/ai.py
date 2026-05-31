@@ -1,7 +1,7 @@
 import asyncio
 import os
 from collections import deque
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Optional, Union
@@ -297,9 +297,6 @@ class ChatAgent:
         self._config = config
         self._redis = redis_client
         self._memory = memory
-        # Strong refs for fire-and-forget background tasks (bot-reply ingestion); asyncio holds
-        # only weakrefs, so without this the task can be GC'd mid-run.
-        self._bg_tasks: set[asyncio.Task[None]] = set()
 
         _chain = _model_chain
         model = _chain(config.llm_models)
@@ -333,8 +330,6 @@ class ChatAgent:
             )
             self._entity_linker = build_entity_linker(config)
             memory.entity_linker = self._entity_linker
-            # The bot's own claims are stored but excluded from the agreement count.
-            memory.bot_author = normalize_username(config.bot_username)
 
         tools = build_tools(config, redis_client=redis_client, memory=memory)
         gates = gate_names(config)
@@ -518,13 +513,7 @@ class ChatAgent:
             _guarded(self._maybe_score_message(note, context), "Message scoring"),
             _guarded(self._maybe_ingest_note(note, context), "Note ingestion"),
         )
-        reply = result.output
-        # Also learn from the bot's own reply (attributed to the bot author, which is excluded
-        # from the agreement count). Fire-and-forget — it depends on the finished reply, so it
-        # can't share the gather above, and must not add latency to sending the reply.
-        if reply and reply.strip():
-            self._spawn_bg(self._maybe_ingest_bot_reply(reply, context))
-        return reply
+        return result.output
 
     def _render_context_lines(self, context: Optional[list[Note]]) -> list[str]:
         """Render the prior thread chronologically as reference-only "handle: text" lines.
@@ -671,59 +660,21 @@ class ChatAgent:
         if not text:
             return
         author = normalize_username(_user_handle(note.user))
-        await self._store_claim_from_text(text, author=author, speaker=author, context=context)
-
-    async def _maybe_ingest_bot_reply(self, reply: str, context: Optional[list[Note]] = None) -> None:
-        """Learn a world-fact claim from the bot's own reply, attributed to the bot author.
-
-        Lets the bot persist facts it states that no user explicitly asserted. The claim is stored
-        under the bot's handle, but that author is **excluded from the agreement count** at recall
-        (see :meth:`MemoryStore.search_claims`), so bot claims are recalled yet never inflate
-        corroboration — a human asserting the same value always outranks a bot-only one. Same
-        extractor admission gate, PII backstop, and per-author write cooldown as note ingestion.
-        Gated by ``memory_ingest_bot_replies``; never raises.
-        """
-        if (
-            self._memory is None
-            or self._extract_agent is None
-            or not self._config.memory_enabled
-            or not self._config.memory_ingest_bot_replies
-        ):
-            return
-        text = (reply or "").strip()
-        if not text:
-            return
-        bot_author = normalize_username(self._config.bot_username)
-        # speaker is the bot's handle so a self-statement ("I was built by …") resolves to the bot.
-        await self._store_claim_from_text(text, author=bot_author, speaker=self._config.bot_username, context=context)
-
-    async def _store_claim_from_text(
-        self, text: str, *, author: str, speaker: str, context: Optional[list[Note]]
-    ) -> None:
-        """Extract one claim from ``text`` and upsert it as ``author``'s. Shared by both ingest paths.
-
-        ``speaker`` is the handle passed to the extractor so first-person statements resolve to the
-        right subject; ``author`` is what the claim is stored under (and what agreement counts). The
-        prior thread (``context``) is supplied as reference-only material so cross-note references
-        resolve. Rate-limited per author by ``global_write_cooldown``. Never raises — must not break
-        the reply.
-        """
-        assert self._memory is not None and self._extract_agent is not None
         context_lines = self._render_context_lines(context)
         try:
             cooldown = self._config.global_write_cooldown
             if cooldown > 0:
                 since = await self._memory.seconds_since_last_write(author)
                 if since is not None and since < cooldown:
-                    logfire.debug("Claim ingestion skipped (write cooldown)", author=author)
+                    logfire.debug("Note ingestion skipped (write cooldown)", author=author)
                     return
-            extracted = await self._extract_claim(text, speaker=speaker, context=context_lines or None)
+            extracted = await self._extract_claim(text, speaker=author, context=context_lines or None)
             if not isinstance(extracted, ExtractedClaim):
                 return
             # Backstop behind the extractor's sensitivity judgement: never store obvious
             # PII, even if the model judged it storable.
             if looks_sensitive(extracted.object) or looks_sensitive(extracted.subject):
-                logfire.info("Claim dropped (sensitive-PII backstop)", author=author)
+                logfire.info("Note claim dropped (sensitive-PII backstop)", author=author)
                 return
             await self._memory.add_claim(
                 subject=extracted.subject,
@@ -732,19 +683,7 @@ class ChatAgent:
                 author=author,
             )
         except Exception:
-            logfire.exception("Claim ingestion failed (reply unaffected)", author=author)
-
-    def _spawn_bg(self, coro: Coroutine[object, object, None]) -> None:
-        """Schedule a best-effort coroutine in the background without blocking the caller.
-
-        Used for work that depends on the finished reply (so it can't share the reply's
-        ``gather``) but must not add reply latency — e.g. ingesting the bot's own reply. The task
-        is kept referenced until done so it isn't GC'd mid-flight; the coroutine swallows its own
-        errors.
-        """
-        task = asyncio.create_task(coro)
-        self._bg_tasks.add(task)
-        task.add_done_callback(self._bg_tasks.discard)
+            logfire.exception("Note claim ingestion failed (reply unaffected)", author=author)
 
     async def _get_social_credit_score(self, username: str) -> Optional[int]:
         """Fetch the user's social credit score from Redis."""
