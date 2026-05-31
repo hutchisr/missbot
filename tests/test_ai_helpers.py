@@ -1,11 +1,12 @@
 """Tests for pure helper functions in bot.ai."""
 
 import pytest
-from pydantic_ai import ImageUrl
+from pydantic_ai import ImageUrl, ModelRetry
 from pydantic_ai.models.openai import OpenAIChatModel
 
 from bot.ai import (
     _build_user_content,
+    _enforce_length,
     _image_urls_for,
     _resolve_model_spec,
     _spec_supports_vision,
@@ -140,3 +141,18 @@ def test_spec_supports_vision_respects_dict_flag():
         base_url="https://example.modal.run/v1",  # type: ignore[arg-type]
     )
     assert _spec_supports_vision(spec_default) is True
+
+
+def test_enforce_length_passes_through_within_budget():
+    validate = _enforce_length(10)
+    assert validate("") == ""
+    assert validate("exactly10!") == "exactly10!"  # len == limit is allowed
+
+
+def test_enforce_length_retries_over_budget():
+    validate = _enforce_length(10)
+    with pytest.raises(ModelRetry) as exc:
+        validate("this is far too long")
+    # The overage and the limit are surfaced so the model can self-correct.
+    assert "20" in str(exc.value)
+    assert "10" in str(exc.value)

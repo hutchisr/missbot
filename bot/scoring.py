@@ -63,10 +63,11 @@ def build_scoring_spec(categories: Sequence[ScoreCategory]) -> ScoringSpec:
     names = tuple(c.name for c in categories)
     cat_lines = "\n".join(f"- {c.name}: {c.description}" for c in categories)
     instructions = f"{_PROMPT_PREAMBLE}\n{cat_lines}\n\n{_PROMPT_CRITICAL}"
-    # pydantic-ai accepts a Literal special form as output_type at runtime and
-    # constrains output to those values. The names are only known at runtime, so the
-    # static checker can't validate the subscript — it's correct at runtime.
-    output_type = Literal[names]  # type: ignore[valid-type]
+    # pydantic-ai accepts a Literal special form as output_type at runtime and constrains
+    # output to those values. The names are only known at runtime; call __getitem__ directly
+    # so the checker doesn't reject the non-literal subscript (Literal[names] is invalid as a
+    # static type form). Result is typed Any (ScoringSpec.output_type).
+    output_type = Literal.__getitem__(names)
     deltas = {c.name: c.delta for c in categories}
     return ScoringSpec(output_type=output_type, deltas=deltas, instructions=instructions)
 

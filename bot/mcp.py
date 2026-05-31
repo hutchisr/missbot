@@ -1,16 +1,17 @@
 """Streamable-HTTP MCP server integration.
 
-Builds :class:`MCPServerStreamableHTTP` toolsets from :class:`MCPServerConfig`
-entries, applying allow/block filtering and (optionally) wrapping them in a
-filter that hides the whole server until a gate flag on ``ctx.deps`` is set.
+Builds :class:`MCPToolset` toolsets from :class:`MCPServerConfig` entries (streamable
+HTTP is the default transport for HTTP URLs), applying the tool-name prefix and
+allow/block filtering and (optionally) wrapping them in a filter that hides the whole
+server until a gate flag on ``ctx.deps`` is set.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 from pydantic_ai import RunContext, ToolDefinition
-from pydantic_ai.mcp import MCPServerStreamableHTTP
+from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.toolsets import AbstractToolset
 
 from .models import Config, MCPServerConfig
@@ -55,16 +56,17 @@ def build_mcp_toolsets(config: Config) -> list[AbstractToolset["AgentDeps"]]:
     for cfg in config.mcp_servers:
         if not cfg.enabled:
             continue
-        server: AbstractToolset["AgentDeps"] = cast(
-            AbstractToolset["AgentDeps"],
-            MCPServerStreamableHTTP(
-                url=str(cfg.url),
-                headers=cfg.headers or None,
-                tool_prefix=cfg.tool_prefix,
-                timeout=cfg.timeout,
-                id=cfg.name,
-            ),
+        # MCPToolset has no tool_prefix arg; apply the prefix via .prefixed() (same
+        # ``{prefix}_`` scheme the old server used and that _strip_prefix expects). The
+        # prefix must wrap before the filters so they see the prefixed tool names.
+        server: AbstractToolset["AgentDeps"] = MCPToolset(
+            str(cfg.url),
+            headers=cfg.headers or None,
+            init_timeout=cfg.timeout,
+            id=cfg.name,
         )
+        if cfg.tool_prefix:
+            server = server.prefixed(cfg.tool_prefix)
         if cfg.allowed_tools is not None or cfg.blocked_tools:
             server = server.filtered(_make_allow_block_filter(cfg))
         if cfg.gate:

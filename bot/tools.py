@@ -2,9 +2,9 @@
 
 import json
 import secrets
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, cast
 from urllib.parse import urlparse
 
 import httpx
@@ -307,7 +307,9 @@ def build_tools(
                 limit = max(1, min(50, limit))  # Clamp to 1-50
 
                 # Get recent history entries
-                entries = await _redis.lrange(f"history:{username}", 0, limit - 1)  # type: ignore[misc]
+                # redis-py types lrange as ``Awaitable[list] | list``; the async client always
+                # returns the awaitable, so cast before awaiting (the union isn't awaitable).
+                entries = await cast("Awaitable[list]", _redis.lrange(f"history:{username}", 0, limit - 1))
 
                 if not entries:
                     return f"No social credit history found for @{username}."

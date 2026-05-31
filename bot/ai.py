@@ -1,14 +1,14 @@
 import asyncio
 import os
 from collections import deque
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Optional, Union
 
 import httpx
 
-from pydantic_ai import Agent, ImageUrl, RunContext
+from pydantic_ai import Agent, ImageUrl, ModelRetry, RunContext
 from pydantic_ai.exceptions import ModelAPIError
 from pydantic_ai.messages import (
     ModelMessage,
@@ -21,6 +21,7 @@ from pydantic_ai.models import Model
 from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.settings import ModelSettings
 import logfire
 from redis.asyncio import Redis
 
@@ -30,6 +31,7 @@ from .extract import (
     ClaimExtraction,
     EntityMatch,
     ExtractedClaim,
+    Skip,
     build_entity_link_prompt,
     build_extraction_prompt,
     looks_sensitive,
@@ -80,7 +82,9 @@ def _cost_prefer_provider(self: ModelResponse):
 
 
 if _original_cost is not None:
-    ModelResponse.cost = _cost_prefer_provider  # type: ignore[method-assign]
+    # setattr (not a direct assignment) so the type checker doesn't reject monkeypatching
+    # a method slot with our differently-typed override.
+    setattr(ModelResponse, "cost", _cost_prefer_provider)
 
 
 def _resolve_model_spec(spec: Union[str, CustomOpenAIModel]) -> Union[str, Model]:
@@ -229,9 +233,7 @@ def build_entity_linker(config: Config) -> Optional[EntityLinker]:
     chain = _model_chain(config.memory_extract_models or config.llm_models)
     if chain is None:
         return None
-    agent: Agent[None, EntityMatch] = Agent(
-        chain, output_type=EntityMatch, instructions=[ENTITY_LINK_INSTRUCTIONS], retries=2
-    )
+    agent = Agent[None, EntityMatch](chain, output_type=EntityMatch, instructions=[ENTITY_LINK_INSTRUCTIONS], retries=2)
 
     async def link(subject: str, candidates: list[tuple[int, str]]) -> Optional[int]:
         if not candidates:
@@ -247,20 +249,17 @@ def build_entity_linker(config: Config) -> Optional[EntityLinker]:
     return link
 
 
-# Characters reserved on a reply for the mention prefix the bot prepends before
-# sending (up to ``max_reply_mentions`` handles, e.g. ``@user@remote.example``).
-# Telling the model a budget below the raw cap keeps the final note — mentions
-# included — within the platform limit. There is no truncation backstop: an
-# over-cap note is refused (bot/bot.py:send_note), so the budget must hold.
+# Chars reserved for the mention prefix the bot prepends (up to ``max_reply_mentions``
+# handles). Budgeting the reply below the raw cap keeps the final note within the platform
+# limit; ``_enforce_length`` enforces it (no truncation backstop — over-cap notes are refused).
 _MENTION_HEADROOM = 280
 
 
 def _length_instruction(char_limit: int) -> str:
     """Instruction telling a reply/auto model its hard character budget.
 
-    There is no post-hoc truncation: a note over the platform cap is refused, so
-    the model must compose a complete reply within the budget rather than rely on
-    its output being trimmed.
+    No post-hoc truncation: an over-cap note is refused, so the model must compose a
+    complete reply within the budget (also enforced by ``_enforce_length``).
     """
     return (
         f"Hard length limit: your entire reply must be at most {char_limit} characters. "
@@ -268,6 +267,24 @@ def _length_instruction(char_limit: int) -> str:
         "mid-sentence, so plan a complete, self-contained answer that fits — do not begin "
         "anything you cannot finish within the budget. Prefer concision; stop when done."
     )
+
+
+def _enforce_length(char_limit: int) -> Callable[[str], str]:
+    """Output validator hard-gating a reply/auto note to ``char_limit`` (pairs with
+    ``_length_instruction``). An over-budget output raises ``ModelRetry``, so pydantic-ai
+    re-runs the model (up to the agent's ``retries``) instead of shipping a note that
+    ``send_note`` would refuse (bot/bot.py:send_note).
+    """
+
+    def validate(output: str) -> str:
+        if len(output) > char_limit:
+            raise ModelRetry(
+                f"Your reply was {len(output)} characters, over the {char_limit}-character "
+                f"limit. Rewrite a complete, self-contained reply within {char_limit} characters."
+            )
+        return output
+
+    return validate
 
 
 class ChatAgent:
@@ -294,23 +311,20 @@ class ChatAgent:
         else:
             self._vision_model = _chain(vision_specs)
 
-        # Claim-extraction agent: turns a free-text fact into a typed claim (or rejects
-        # it) before anything is written to the world-knowledge store. Tool-less and
-        # constrained output, so untrusted text can only pick a branch, never free-form a
-        # stored fact (see bot/extract.py). Only built when memory is enabled.
         # Claim-extraction agent (the admission gate): turns free-text into a typed claim or
-        # rejects it. Built only when memory is enabled. The entity linker is built by the
-        # shared factory and wired into the store (it prevents write-time fragmentation).
+        # rejects it — tool-less + constrained output, so untrusted text can only pick a branch
+        # (bot/extract.py). Built only when memory is enabled; the entity linker is wired into
+        # the store to prevent write-time fragmentation.
         self._extract_agent: Optional[Agent[None, ClaimExtraction]] = None
         self._entity_linker: Optional[EntityLinker] = None
         if memory is not None and config.memory_enabled:
             extract_model = _chain(config.memory_extract_models) if config.memory_extract_models else model
-            # pydantic-ai accepts a Union as output_type at runtime and constrains the
-            # model to one of its member shapes, but pyright can't match a union special
-            # form to the Agent() overloads (same situation as the scoring agent below).
-            self._extract_agent = Agent(
+            # Subscript Agent[...] explicitly and pass the union members as a list (pydantic-ai's
+            # multi-output spec): the type checker can't infer the OutputDataT type var back out
+            # of a bare ``Union`` value passed to output_type.
+            self._extract_agent = Agent[None, ClaimExtraction](
                 extract_model,
-                output_type=ClaimExtraction,  # type: ignore[reportArgumentType]
+                output_type=[ExtractedClaim, Skip],
                 instructions=[EXTRACTION_INSTRUCTIONS],
                 retries=2,
             )
@@ -356,6 +370,8 @@ class ChatAgent:
             toolsets=mcp_toolsets or None,
             retries=3,
         )
+        # Hard-gate the reply to the budget the instruction states (see _enforce_length).
+        self._agent.output_validator(_enforce_length(reply_char_budget))
 
         self._auto_agent: Optional[Agent[Any, str]] = None
         self._auto_history: deque[str] = deque(maxlen=10)
@@ -367,12 +383,12 @@ class ChatAgent:
                 tools=auto_tools,
                 retries=3,
             )
+            # No mention prefix on auto posts, so the budget is the full note cap.
+            self._auto_agent.output_validator(_enforce_length(config.max_note_length))
 
-        # Isolated, tool-less classifier for automatic message scoring. It treats
-        # the message as untrusted data and can only emit a fixed category, which
-        # is mapped to a bounded delta in code — see bot/scoring.py. Classification
-        # is a simple labeling task, so it can use a cheaper, separate model chain
-        # (config.score_models); falls back to the main reply model when unset.
+        # Isolated, tool-less classifier for auto-scoring: treats the message as untrusted
+        # data and emits only a fixed category, mapped to a bounded delta in code (bot/scoring.py).
+        # Uses config.score_models when set (a cheaper model is fine), else the reply model.
         self._score_agent: Optional[Agent[None, str]] = None
         self._score_model: Optional[Union[str, Model]] = None
         self._score_spec: Optional[ScoringSpec] = None
@@ -381,9 +397,8 @@ class ChatAgent:
             # Categories, deltas, and instructions are derived from config here, so the
             # operator owns the buckets while code still owns the numbers.
             self._score_spec = build_scoring_spec(config.social_credit_categories)
-            # pydantic-ai accepts a Literal output_type at runtime and constrains the
-            # output to those values, but pyright can't match a Literal special form to
-            # the Agent() overloads (it widens OutputDataT to str). Runtime is correct.
+            # pydantic-ai constrains output to the Literal's values at runtime, but pyright
+            # can't match the Literal special form to the Agent() overloads (hence type: ignore).
             self._score_agent = Agent(  # type: ignore[reportCallIssue, reportAttributeAccessIssue]
                 self._score_model,
                 output_type=self._score_spec.output_type,  # type: ignore[reportArgumentType]
@@ -399,7 +414,7 @@ class ChatAgent:
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self._agent.__aexit__(exc_type, exc, tb)
 
-    def _generation_settings(self, timeout: float) -> dict[str, Any]:
+    def _generation_settings(self, timeout: float) -> ModelSettings:
         """Model settings for the reply/auto agents: the configured token cap
         (``max_tokens`` — otherwise unused), any configured sampling/anti-repetition
         knobs, and a per-call timeout.
@@ -407,7 +422,7 @@ class ChatAgent:
         ``max_tokens`` and the sampling params are only included when set in config, so
         unset ones keep the provider default (and aren't sent to models that reject them).
         """
-        settings: dict[str, Any] = {
+        settings: ModelSettings = {
             "timeout": timeout,
         }
         if self._config.max_tokens is not None:
@@ -431,10 +446,9 @@ class ChatAgent:
         if not note.text and not current_images:
             raise ValueError("Note has no text or supported images")
 
-        # Pick the model chain. If the prompt has images but no model in the
-        # main chain is vision-capable, drop the images and run text-only —
-        # otherwise the whole fallback fails with "no endpoints support image
-        # input" and the user gets nothing.
+        # Pick the model chain. If the prompt has images but no model is vision-capable,
+        # drop the images and run text-only — else the whole fallback fails ("no endpoints
+        # support image input") and the user gets nothing.
         run_model: Optional[Union[str, Model]] = None
         if current_images:
             if not self._has_vision_model:
@@ -492,9 +506,8 @@ class ChatAgent:
         if run_model is not None:
             run_kwargs["model"] = run_model
         # Score the author's message and learn any world-fact it asserts, both in parallel
-        # with generating the reply so they add no user-facing latency. Each side task is
-        # wrapped so any error in it (including work before its own try/except) is swallowed
-        # and can never cancel the reply.
+        # with the reply (no added latency). Each side task is _guarded, so its errors are
+        # swallowed and can never cancel the reply.
         result, _, _ = await asyncio.gather(
             self._agent.run(prompt, **run_kwargs),
             _guarded(self._maybe_score_message(note), "Message scoring"),
