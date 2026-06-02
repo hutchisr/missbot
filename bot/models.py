@@ -13,6 +13,7 @@ class User(BaseModel):
     username: str
     host: Optional[str] = None
     location: Optional[str] = None
+    isBot: Optional[bool] = None
 
 
 class MiFile(BaseModel):
@@ -309,6 +310,11 @@ class Config(BaseModel):
         default=True,
         description="Ignore direct/private messages (Misskey 'specified' visibility) instead of replying. "
         "The bot is designed for public-timeline threads; set false to also respond to DMs.",
+    )
+    ignore_bots: bool = Field(
+        default=True,
+        description="Ignore mentions from accounts flagged as bots (Misskey user `isBot`) instead of "
+        "replying. Prevents bot-to-bot loops; set false to also respond to other bots.",
     )
     max_reply_mentions: int = Field(
         default=5,

@@ -64,6 +64,10 @@ class Bot:
         if self._config.ignore_direct_messages and note.visibility == "specified":
             logfire.info("Ignoring direct message", note_id=note.id)
             return
+        # Don't engage with other bots by default — bot-to-bot exchanges loop endlessly.
+        if self._config.ignore_bots and note.user.isBot:
+            logfire.info("Ignoring bot account", note_id=note.id, user_id=note.user.id)
+            return
         if not self._note_has_prompt_content(note):
             logfire.info("Skipping note without text or supported images", note_id=note.id)
             return

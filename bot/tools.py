@@ -12,6 +12,7 @@ import logfire
 from pydantic_ai import RunContext
 from redis.asyncio import Redis
 
+from .extract import ClaimExtraction, ExtractedClaim, Skip, looks_sensitive
 from .memory import MemoryStore, RecalledClaim
 from .models import Config
 
@@ -102,10 +103,13 @@ def build_tools(
     config: Config,
     redis_client: Optional[Redis] = None,
     memory: Optional[MemoryStore] = None,
+    extractor: Optional[Callable[..., Awaitable[Optional[ClaimExtraction]]]] = None,
 ) -> list[Callable[..., object]]:
     """Create tool functions for the given config.
 
     Tools are returned as plain functions and can be passed to Agent(..., tools=...).
+    ``extractor`` (``ChatAgent._extract_claim``) is the admission gate ``remember_fact`` uses to
+    structure a submitted fact into a typed claim; when None, ``remember_fact`` isn't exposed.
     """
     tools: list[Callable[..., object]] = []
 
@@ -367,11 +371,68 @@ def build_tools(
             ]
         )
 
-    # World-knowledge store (Postgres + pgvector). Shared across all users, so writes
-    # carry provenance, are rate-limited per author, enter at the quarantined model tier,
-    # and recalled claims are returned to the model as untrusted data with provenance.
+    # World-knowledge store (Postgres + pgvector). Recall ranks values by user agreement;
+    # the bot can also save its own facts via remember_fact (stored under the bot author,
+    # excluded from the agreement count). Recalled claims reach the model as untrusted data.
     if memory is not None and config.memory_enabled:
         _memory: MemoryStore = memory
+
+        if extractor is not None:
+            _extract = extractor
+            _bot_author = normalize_username(config.bot_username)
+
+            @logfire.instrument(extract_args=["fact"])
+            async def remember_fact(fact: str) -> str:
+                """Save a durable, generally-useful fact to the shared world-knowledge store.
+
+                Use this when you want to remember a lasting fact about a real, identifiable
+                subject (instance lore, an established fact about a person/place/project) so you
+                can recall it in future conversations — NOT for chit-chat, opinions, or
+                personal/private details about the user you're talking to. Keep each fact short,
+                self-contained, and about one clearly named subject.
+
+                The fact is stored under your own name and is deliberately excluded from the
+                agreement count, so it is recalled as background but never outranks what users
+                independently assert.
+
+                Args:
+                    fact: A single concise fact to remember.
+                """
+                fact = (fact or "").strip()
+                if not fact:
+                    return "Error: nothing to remember (empty fact)."
+                if len(fact) > config.max_fact_length:
+                    return f"Error: fact too long ({len(fact)} chars); keep it under {config.max_fact_length}."
+                try:
+                    # Per-author cooldown bounds how fast the bot can flood the store.
+                    if config.global_write_cooldown > 0:
+                        since = await _memory.seconds_since_last_write(_bot_author)
+                        if since is not None and since < config.global_write_cooldown:
+                            wait = int(config.global_write_cooldown - since)
+                            return f"Saving facts too quickly; try again in about {wait}s."
+                    # Admission gate: structure the fact into a typed claim (speaker is the bot, so
+                    # a first-person statement resolves to it), or reject it.
+                    extracted = await _extract(fact, speaker=config.bot_username, context=None)
+                    if isinstance(extracted, Skip):
+                        return f"Not stored — that isn't durable world knowledge ({extracted.reason})."
+                    if not isinstance(extracted, ExtractedClaim):
+                        return "Couldn't structure that into a storable claim; not saved."
+                    # PII backstop: never store obvious personal data even if the gate allowed it.
+                    if looks_sensitive(extracted.object) or looks_sensitive(extracted.subject):
+                        return "Not stored — that looks like personal or private information."
+                    result = await _memory.add_claim(
+                        subject=extracted.subject,
+                        predicate=extracted.predicate,
+                        object_text=extracted.object,
+                        author=_bot_author,
+                    )
+                except Exception:
+                    logfire.exception("Error storing claim via remember_fact")
+                    return "Error saving to memory."
+                verb = "Updated" if result.updated else "Saved"
+                return f"{verb}: {result.subject} / {result.predicate.replace('_', ' ')}."
+
+            tools.append(remember_fact)
 
         @logfire.instrument(extract_args=["query"])
         async def search_memory(query: str) -> str:

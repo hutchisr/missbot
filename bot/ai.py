@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -121,6 +122,23 @@ def _user_handle(user: User) -> str:
     return user.username
 
 
+# Mirrors bot/bot.py:_strip_leading_mentions — the `@handle` prefix send_note prepends to
+# every reply. Stripped when a prior bot note is reconstructed as assistant history so it
+# doesn't prime the model to open with the same mention (and copy the rest verbatim).
+_LEADING_MENTIONS_RE = re.compile(r"^(?:@[\w\-]+(?:@[\w\-.]+)?(?:\s+|$))+")
+
+
+def _strip_leading_mentions(text: str) -> str:
+    return _LEADING_MENTIONS_RE.sub("", text)
+
+
+def _normalize_for_repeat(text: str) -> str:
+    """Canonicalize a reply for verbatim-repeat detection: drop the leading mention
+    prefix, collapse whitespace, lowercase. Two replies that differ only by who they
+    mention or by spacing normalize equal."""
+    return " ".join(_strip_leading_mentions(text.strip()).split()).lower()
+
+
 def _image_urls_for(note: Note, vision: bool) -> list[ImageUrl]:
     """Extract ImageUrl objects for a note's visual attachments.
 
@@ -175,6 +193,10 @@ class AgentDeps:
     """When True, social credit may be adjusted for any user, not just `username`."""
     enabled_gates: set[str] = field(default_factory=set)
     """Gates opened during this run by `enable_<gate>` meta-tools."""
+    previous_bot_reply: Optional[str] = None
+    """The bot's most recent reply in this thread, if any. Used by the verbatim-repeat
+    output validator to reject a reply that just parrots the prior turn (a failure mode of
+    weaker fallback models when the new message is a thin same-topic follow-up)."""
 
 
 def _make_enable_gate_tool(gate: str, servers: list[str]):
@@ -330,8 +352,13 @@ class ChatAgent:
             )
             self._entity_linker = build_entity_linker(config)
             memory.entity_linker = self._entity_linker
+            # The bot's own claims (via remember_fact) are stored but excluded from agreement.
+            memory.bot_author = normalize_username(config.bot_username)
 
-        tools = build_tools(config, redis_client=redis_client, memory=memory)
+        # Pass the extractor only when memory + the extract agent exist, so remember_fact is
+        # exposed only when it can structure a submitted fact into a typed claim.
+        extractor = self._extract_claim if self._extract_agent is not None else None
+        tools = build_tools(config, redis_client=redis_client, memory=memory, extractor=extractor)
         gates = gate_names(config)
         for gate, servers in sorted(gates.items()):
             tools.append(_make_enable_gate_tool(gate, servers))
@@ -372,6 +399,8 @@ class ChatAgent:
         )
         # Hard-gate the reply to the budget the instruction states (see _enforce_length).
         self._agent.output_validator(_enforce_length(reply_char_budget))
+        # Reject a reply that just parrots the bot's prior turn in the same thread.
+        self._agent.output_validator(self._reject_verbatim_repeat)
 
         self._auto_agent: Optional[Agent[Any, str]] = None
         self._auto_history: deque[str] = deque(maxlen=10)
@@ -413,6 +442,20 @@ class ChatAgent:
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self._agent.__aexit__(exc_type, exc, tb)
+
+    def _reject_verbatim_repeat(self, ctx: RunContext[AgentDeps], output: str) -> str:
+        """Output validator: reject a reply identical to the bot's previous turn in this
+        thread. Weaker fallback models sometimes re-emit their prior (often long) assistant
+        message verbatim when the new user note is a thin same-topic follow-up; the ModelRetry
+        pushes the model (within the agent's retry budget) to actually answer the latest note."""
+        prev = ctx.deps.previous_bot_reply
+        if prev and _normalize_for_repeat(output) == _normalize_for_repeat(prev):
+            raise ModelRetry(
+                "Your draft is identical to your previous reply in this thread, but the user "
+                "has since said something new. Respond to their latest message instead of "
+                "repeating your last reply."
+            )
+        return output
 
     def _generation_settings(self, timeout: float) -> ModelSettings:
         """Model settings for the reply/auto agents: the configured token cap
@@ -463,8 +506,12 @@ class ChatAgent:
         if context:
             for c in reversed(context):
                 if c.userId == bot_user_id:
-                    # Bot's own previous messages become assistant responses
-                    message_history.append(ModelResponse(parts=[TextPart(content=c.text or "")]))
+                    # Bot's own previous messages become assistant responses. Strip the
+                    # leading @mention prefix send_note prepended, so the history doesn't
+                    # prime the model to re-open (and copy) its prior reply verbatim.
+                    message_history.append(
+                        ModelResponse(parts=[TextPart(content=_strip_leading_mentions((c.text or "").strip()))])
+                    )
                 else:
                     # Other users' messages become user prompts (with any attached images)
                     message_history.append(
@@ -491,11 +538,18 @@ class ChatAgent:
         # Lift the author-only restriction when the note's author is a designated
         # privileged user (e.g. the operator), configured by user id.
         unrestricted = note.user.id in self._config.social_credit_unrestricted_user_ids
+        # The bot's most recent reply in this thread (context is nearest-parent first), used by
+        # the verbatim-repeat output validator. None when the bot hasn't spoken in the thread.
+        previous_bot_reply = next(
+            (c.text for c in (context or []) if c.userId == bot_user_id and (c.text or "").strip()),
+            None,
+        )
         deps = AgentDeps(
             username=handle,
             source_note_id=note.id,
             social_credit_score=score,
             social_credit_unrestricted=unrestricted,
+            previous_bot_reply=previous_bot_reply,
         )
 
         run_kwargs: dict[str, Any] = {

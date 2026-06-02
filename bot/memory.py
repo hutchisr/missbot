@@ -219,6 +219,10 @@ class MemoryStore:
         self._embed_headers = {"Authorization": f"Bearer {key}"} if key else {}
         # Optional write-time entity-linking classifier, injected by the bot wiring.
         self.entity_linker: Optional[EntityLinker] = None
+        # Author whose claims are stored and recalled but excluded from the agreement count
+        # (the bot itself, via remember_fact), injected by the bot wiring. None in
+        # maintenance/headless contexts, where every author counts. See `search_claims`.
+        self.bot_author: Optional[str] = None
 
     @classmethod
     async def create(cls, config: Config) -> "MemoryStore":
@@ -486,9 +490,10 @@ class MemoryStore:
 
         Embedding recall over claim text surfaces candidate (subject, predicate) groups; for
         each, the **agreement count** — ``COUNT(DISTINCT author)`` per value over *all* live
-        claims for that group (not just the candidate pool, which would undercount) — picks the
-        winner via :func:`resolve_conflict` (recency breaks ties), with the losing values riding
-        along as ``conflicts``. Results are ordered by recall similarity and capped at ``k``.
+        claims for that group (not just the candidate pool, which would undercount), excluding
+        ``self.bot_author`` — picks the winner via :func:`resolve_conflict` (recency breaks ties),
+        with the losing values riding along as ``conflicts``. Results are ordered by recall
+        similarity and capped at ``k``.
         """
         vec = _vector_literal(await self.embed(query))
         max_dist = 1.0 - self._config.global_recall_min_similarity
@@ -524,10 +529,15 @@ class MemoryStore:
 
             # Tally agreement (distinct authors per value) across ALL live claims of the
             # candidate subjects — the candidate pool alone would undercount agreement.
+            # The bot author (when set) is excluded via ``IS DISTINCT FROM`` — which counts every
+            # (non-null) author when ``bot_author`` is None, so maintenance/headless recall is
+            # unaffected. Bot-authored claims (from remember_fact) still group and surface
+            # (recency/object aggregate over all asserters); they just don't inflate corroboration,
+            # so a human asserting the same value always outranks a bot-only one.
             agg = await conn.fetch(
                 f"""
                 SELECT subject_entity_id, predicate,
-                       count(DISTINCT author) AS agreed_by,
+                       count(DISTINCT author) FILTER (WHERE author IS DISTINCT FROM $2) AS agreed_by,
                        max(updated_at) AS recency,
                        (array_agg(object_text ORDER BY updated_at DESC))[1] AS object_text
                 FROM knowledge_claim
@@ -535,6 +545,7 @@ class MemoryStore:
                 GROUP BY subject_entity_id, predicate, {_OBJECT_GROUP_SQL}
                 """,
                 list({sid for sid, _ in best_sim}),
+                self.bot_author,
             )
 
         # One entry per distinct value within a (subject, predicate) group.
