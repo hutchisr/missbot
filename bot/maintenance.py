@@ -3,8 +3,9 @@
 Runnable out-of-process (so it can be a k8s CronJob, separate from the long-running
 bot) via ``python -m bot.maintenance <command> -c /config.yaml``:
 
-    consolidate         merge duplicate entities (name/embedding/LLM), then backfill object links
-    stats               print store counts (entities, claims, distinct subjects/authors)
+    consolidate         merge duplicate entities (name/embedding/LLM), then backfill relationship links
+    stats               print store counts (entities, edges, distinct sources/authors)
+    reembed             regenerate ALL embeddings with the configured model (model swap / seed cleanup)
     calibrate-entities  print the most-similar entity pairs to help tune entity_match_threshold
 
 Each command builds a one-shot :class:`MemoryStore`, runs, and closes it. Requires
@@ -31,18 +32,20 @@ def load_config(path: str) -> Config:
         return Config(**yaml.safe_load(f))
 
 
-def _run(config_path: str, action: Callable[[MemoryStore], Awaitable[Any]]) -> Any:
+def _run(config_path: str, action: Callable[[MemoryStore], Awaitable[Any]], *, skip_dim_check: bool = False) -> Any:
     """Build a MemoryStore from config, run ``action`` against it, then close it.
 
     The entity linker is wired in so the consolidation LLM merge pass works here in the
-    headless CronJob (which has no ChatAgent).
+    headless CronJob (which has no ChatAgent). ``skip_dim_check`` is for the ``reembed`` command,
+    which is about to re-dimension and repopulate the vectors, so the startup dimension guard
+    (which would otherwise abort on a model/dim change) must be suppressed.
     """
 
     async def _main() -> Any:
         config = load_config(config_path)
         if not config.memory_enabled:
             raise click.ClickException("memory_enabled must be true in the config to run maintenance")
-        store = await MemoryStore.create(config)
+        store = await MemoryStore.create(config, skip_dim_check=skip_dim_check)
         store.entity_linker = build_entity_linker(config)
         try:
             return await action(store)
@@ -73,7 +76,7 @@ def cli() -> None:
 @cli.command()
 @_config_option
 def consolidate(config_path: str) -> None:
-    """Merge duplicate entities (name/embedding/LLM), then backfill stale object links."""
+    """Merge duplicate entities (name/embedding/LLM), then backfill stale relationship links."""
     summary = _run(config_path, lambda store: store.consolidate())
     click.echo(json.dumps(summary))
 
@@ -81,8 +84,23 @@ def consolidate(config_path: str) -> None:
 @cli.command()
 @_config_option
 def stats(config_path: str) -> None:
-    """Print store counts (entities, claims, distinct subjects/authors)."""
+    """Print store counts (entities, edges, distinct sources/authors)."""
     click.echo(json.dumps(_run(config_path, lambda store: store.stats()), indent=2))
+
+
+@cli.command()
+@_config_option
+@click.option("--batch-size", default=64, show_default=True, help="Embeddings requested per API call.")
+def reembed(config_path: str, batch_size: int) -> None:
+    """Regenerate ALL embeddings (entity names + relation questions) with the configured model.
+
+    Use after changing `embedding_model`, or to upgrade migration-seeded relation vectors to clean
+    question vectors. Re-embeds in place and is resumable. If the model's vector dimension changed,
+    it re-dimensions the columns first — note the bot itself fails to start on a dimension mismatch,
+    so for a dim change run this while the bot is down (it can start once embeddings are rebuilt).
+    """
+    summary = _run(config_path, lambda store: store.reembed_all(batch_size=batch_size), skip_dim_check=True)
+    click.echo(json.dumps(summary, indent=2))
 
 
 @cli.command("calibrate-entities")

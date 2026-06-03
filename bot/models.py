@@ -336,7 +336,8 @@ class Config(BaseModel):
         default=False,
         description="Enable the persistent world-knowledge store (Postgres + pgvector). Off by default; "
         "requires postgres_url and embedding_model. Adds the search_memory tool and ingests user notes as "
-        "claims. Recall ranks values by user agreement (how many distinct users assert each value).",
+        "graph edges (entity-predicate-value facts). Recall ranks values by user agreement (how many "
+        "distinct users assert each value).",
     )
     postgres_url: Optional[str] = Field(
         default=None,
@@ -351,8 +352,18 @@ class Config(BaseModel):
     embedding_dim: int = Field(
         default=1024,
         gt=0,
-        description="Embedding vector dimension; must match the embedding_model's output and the "
-        "pgvector column. pplx-embed-v1-0.6b is 1024. Changing this requires re-embedding all rows.",
+        description="Embedding vector dimension; must match what the model returns (see "
+        "embedding_dimensions for Matryoshka models) and the pgvector column. pplx-embed-v1-0.6b is 1024. "
+        "Note pgvector HNSW indexes support at most 2000 dimensions on a plain `vector` column. Changing "
+        "this requires re-embedding all rows (`python -m bot.maintenance reembed`).",
+    )
+    embedding_dimensions: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description="When set, sent as the OpenAI `dimensions` request parameter to truncate a Matryoshka "
+        "(MRL) model's output to this size (e.g. pplx-embed-v1-4b returns its native 2560 unless you ask "
+        "for fewer). Must equal embedding_dim (the stored column size). Leave unset for models whose native "
+        "output already equals embedding_dim.",
     )
     embedding_base_url: AnyHttpUrl = Field(
         default=AnyHttpUrl("https://openrouter.ai/api/v1"),
@@ -369,7 +380,7 @@ class Config(BaseModel):
     global_recall_k: int = Field(
         default=5,
         gt=0,
-        description="Max number of claims returned per search_memory call (after conflict resolution).",
+        description="Max number of facts (graph edges) returned per search_memory call (after conflict resolution).",
     )
     global_recall_min_similarity: float = Field(
         default=0.3,
@@ -391,7 +402,7 @@ class Config(BaseModel):
         default=0.82,
         ge=0.0,
         le=1.0,
-        description="Cosine-similarity floor for linking a claim's subject to an existing entity at write time. "
+        description="Cosine-similarity floor for linking an edge's source to an existing entity at write time. "
         "Below this (and with no exact name/alias match) a new entity is created instead.",
     )
     entity_merge_threshold: float = Field(
@@ -418,7 +429,7 @@ class Config(BaseModel):
     )
     memory_ingest_notes: bool = Field(
         default=True,
-        description="When memory is enabled, auto-ingest each incoming user note as a claim attributed to its "
+        description="When memory is enabled, auto-ingest each incoming user note as a graph edge attributed to its "
         "author (so distinct authors asserting the same value raise its agreement count). The extractor's Skip "
         "branch drops chatter/opinions/personal details, and writes are rate-limited per author by "
         "global_write_cooldown. Set false to disable note learning.",
@@ -448,4 +459,9 @@ class Config(BaseModel):
                 raise ValueError("postgres_url is required when memory_enabled is true")
             if not self.embedding_model:
                 raise ValueError("embedding_model is required when memory_enabled is true")
+        if self.embedding_dimensions is not None and self.embedding_dimensions != self.embedding_dim:
+            raise ValueError(
+                f"embedding_dimensions ({self.embedding_dimensions}) must equal embedding_dim ({self.embedding_dim}) "
+                "— it only tells the embeddings API to truncate to the stored column size."
+            )
         return self

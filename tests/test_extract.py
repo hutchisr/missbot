@@ -21,7 +21,7 @@ def test_extraction_union_has_both_branches():
 
 
 def test_extracted_claim_defaults():
-    c = ExtractedClaim(subject="Python", predicate="latest_version", object="3.13")
+    c = ExtractedClaim(subject="Python", predicate="latest version", object="3.13")
     assert c.kind == "claim"
     assert c.volatility == "stable"
     assert c.confidence == 0.5

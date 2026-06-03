@@ -30,8 +30,8 @@ class ExtractedClaim(BaseModel):
         "pronoun ('it'/'they') or a vague referent ('someone', 'my friend', 'this thing').",
     )
     predicate: str = Field(
-        description="The attribute or relation asserted, as a short snake_case key "
-        "(e.g. 'latest_version', 'capital_of', 'founded_year').",
+        description="The attribute or relation asserted, as a short natural-language phrase in "
+        "lowercase words (e.g. 'latest version', 'capital of', 'founded year') — not snake_case.",
     )
     object: str = Field(
         description="The value of the predicate for the subject, as a concise literal.",
@@ -77,7 +77,8 @@ EXTRACTION_INSTRUCTIONS = (
     "- subject: the entity the fact is about — a concrete name or handle. Resolve first-person "
     "references ('I', 'me', 'my') to the speaker's handle when one is provided. Never use a bare "
     "pronoun or a vague referent ('someone', 'my friend', 'this thing') with no concrete identity.\n"
-    "- predicate: a short snake_case attribute/relation key.\n"
+    "- predicate: a short attribute/relation as a natural-language phrase in lowercase words "
+    "(e.g. 'latest version', 'capital of'), not snake_case.\n"
     "- object: the value, as a concise literal.\n"
     "- volatility: how fast that value changes.\n"
     "- confidence: how sure you are the text actually asserts it.\n\n"

@@ -269,7 +269,7 @@ async def test_run_ingests_note_as_claim(make_config, make_note):
     mem.seconds_since_last_write.return_value = None
     agent = ChatAgent(_memory_cfg(make_config), memory=mem)
     note = make_note(text="Python's latest version is 3.13")  # author = alice
-    claim = ExtractedClaim(subject="Python", predicate="latest_version", object="3.13")
+    claim = ExtractedClaim(subject="Python", predicate="latest version", object="3.13")
 
     with (
         patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
@@ -278,12 +278,12 @@ async def test_run_ingests_note_as_claim(make_config, make_note):
         out = await agent.run(note)
 
     assert out == "reply"
-    mem.add_claim.assert_awaited_once()
-    kw = mem.add_claim.await_args.kwargs
+    mem.add_edge.assert_awaited_once()
+    kw = mem.add_edge.await_args.kwargs
     # The note's author is attributed as the claim's author (this drives the agreement count).
     assert kw["author"] == "alice"
     assert kw["subject"] == "Python"
-    assert kw["predicate"] == "latest_version"
+    assert kw["predicate"] == "latest version"
     assert kw["object_text"] == "3.13"
 
 
@@ -305,7 +305,7 @@ async def test_run_note_ingestion_respects_write_cooldown(make_config, make_note
 
     # Cooldown short-circuits before paying for an extraction call.
     extract_mock.assert_not_awaited()
-    mem.add_claim.assert_not_awaited()
+    mem.add_edge.assert_not_awaited()
 
 
 @pytest.mark.anyio
@@ -323,7 +323,7 @@ async def test_run_note_ingestion_skips_when_extractor_rejects(make_config, make
     ):
         await agent.run(note)
 
-    mem.add_claim.assert_not_awaited()
+    mem.add_edge.assert_not_awaited()
 
 
 @pytest.mark.anyio
@@ -341,7 +341,7 @@ async def test_run_note_ingestion_disabled_by_flag(make_config, make_note):
 
     # Flag off => the ingestion path returns before extracting or writing.
     extract_mock.assert_not_awaited()
-    mem.add_claim.assert_not_awaited()
+    mem.add_edge.assert_not_awaited()
 
 
 @pytest.mark.anyio
@@ -364,8 +364,8 @@ async def test_run_note_ingestion_passes_speaker_to_extractor(make_config, make_
     assert extract_mock.await_args is not None
     prompt = extract_mock.await_args.args[0]
     assert "@alice" in prompt
-    mem.add_claim.assert_awaited_once()
-    assert mem.add_claim.await_args.kwargs["subject"] == "alice"
+    mem.add_edge.assert_awaited_once()
+    assert mem.add_edge.await_args.kwargs["subject"] == "alice"
 
 
 @pytest.mark.anyio
@@ -383,7 +383,7 @@ async def test_run_note_ingestion_drops_sensitive_pii(make_config, make_note):
     ):
         await agent.run(note)
 
-    mem.add_claim.assert_not_awaited()
+    mem.add_edge.assert_not_awaited()
 
 
 @pytest.mark.anyio
@@ -409,7 +409,7 @@ async def test_run_note_ingestion_supplies_thread_context(make_config, make_note
     assert "I have a pet lizard" in prompt
     assert "her name is Olive" in prompt
     assert "@alice" in prompt
-    mem.add_claim.assert_awaited_once()
+    mem.add_edge.assert_awaited_once()
 
 
 # --- Write-time entity linking ---

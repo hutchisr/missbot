@@ -144,6 +144,23 @@ def test_memory_enabled_with_required_fields_ok(make_config):
     assert cfg.embedding_model == "perplexity/pplx-embed-v1-0.6b"
 
 
+def test_embedding_dimensions_must_equal_embedding_dim(make_config):
+    with pytest.raises(ValidationError) as exc:
+        make_config(embedding_dim=1024, embedding_dimensions=2560)
+    assert "embedding_dimensions" in str(exc.value)
+
+
+def test_embedding_dimensions_equal_is_ok(make_config):
+    cfg = make_config(
+        memory_enabled=True,
+        postgres_url="postgres://u:p@db/x",
+        embedding_model="perplexity/pplx-embed-v1-4b",
+        embedding_dim=1024,
+        embedding_dimensions=1024,
+    )
+    assert cfg.embedding_dimensions == 1024
+
+
 def test_score_categories_default(make_config):
     cfg = make_config()
     names = [c.name for c in cfg.social_credit_categories]
