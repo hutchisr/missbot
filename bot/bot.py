@@ -71,6 +71,20 @@ class Bot:
         if not self._note_has_prompt_content(note):
             logfire.info("Skipping note without text or supported images", note_id=note.id)
             return
+        # Ignore authors below the configured social credit floor entirely: the note never
+        # reaches the LLM, no reply is sent, and the author isn't scored or ingested.
+        threshold = self._config.social_credit_ignore_threshold
+        if threshold is not None:
+            score = await self._agent.get_author_score(note)
+            if score is not None and score < threshold:
+                logfire.info(
+                    "Ignoring low-social-credit author",
+                    note_id=note.id,
+                    user_id=note.user.id,
+                    score=score,
+                    threshold=threshold,
+                )
+                return
         context: list[Note] = []
         if note.replyId:
             reply_id = note.replyId

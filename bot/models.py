@@ -293,6 +293,12 @@ class Config(BaseModel):
         description="Minimum seconds between automatic social credit changes for a given user. "
         "Bounds how fast a user can farm score even if every message is rated positively.",
     )
+    social_credit_ignore_threshold: Optional[int] = Field(
+        default=None,
+        description="When set (and Redis is configured), authors whose social credit score is below "
+        "this value are ignored entirely: the note is never passed to the LLM and no reply is sent "
+        "(nor are they scored or ingested). Leave unset to never ignore on score.",
+    )
     score_models: List[Union[str, CustomOpenAIModel]] = Field(
         default_factory=list,
         description="Models for the social-credit message classifier (same forms as llm_models). "

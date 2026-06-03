@@ -739,6 +739,10 @@ class ChatAgent:
         except Exception:
             logfire.exception("Note claim ingestion failed (reply unaffected)", author=author)
 
+    async def get_author_score(self, note: Note) -> Optional[int]:
+        """Fetch the note author's social credit score (None if unset/no Redis)."""
+        return await self._get_social_credit_score(_user_handle(note.user))
+
     async def _get_social_credit_score(self, username: str) -> Optional[int]:
         """Fetch the user's social credit score from Redis."""
         if not self._redis:

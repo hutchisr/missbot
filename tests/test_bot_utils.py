@@ -282,6 +282,73 @@ async def test_on_mention_handles_dm_when_enabled(make_config, make_note):
 
 
 @pytest.mark.anyio
+async def test_on_mention_ignores_author_below_score_threshold(make_config, make_note):
+    """An author scoring below social_credit_ignore_threshold is dropped — no run, no reply."""
+    bot = Bot(config=make_config(social_credit_ignore_threshold=-50))
+    note = make_note(text="i am a menace")
+
+    with (
+        patch.object(bot._agent, "get_author_score", AsyncMock(return_value=-60)),
+        patch.object(bot._agent, "run", AsyncMock()) as run_mock,
+        patch.object(bot, "send_note", AsyncMock()) as send_note_mock,
+    ):
+        await bot.on_mention(note)
+
+    run_mock.assert_not_awaited()
+    send_note_mock.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_on_mention_replies_to_author_at_or_above_threshold(make_config, make_note):
+    """Scores at/above the threshold are processed normally."""
+    bot = Bot(config=make_config(social_credit_ignore_threshold=-50))
+    note = make_note(text="hello")
+
+    with (
+        patch.object(bot._agent, "get_author_score", AsyncMock(return_value=-50)),
+        patch.object(bot._agent, "run", AsyncMock(return_value="reply")) as run_mock,
+        patch.object(bot, "send_note", AsyncMock()) as send_note_mock,
+    ):
+        await bot.on_mention(note)
+
+    run_mock.assert_awaited_once_with(note=note, context=[])
+    send_note_mock.assert_awaited_once_with("reply", in_reply_to=note)
+
+
+@pytest.mark.anyio
+async def test_on_mention_does_not_ignore_unscored_author(make_config, make_note):
+    """An author with no score yet (None) is never ignored, even with a threshold set."""
+    bot = Bot(config=make_config(social_credit_ignore_threshold=0))
+    note = make_note(text="first time here")
+
+    with (
+        patch.object(bot._agent, "get_author_score", AsyncMock(return_value=None)),
+        patch.object(bot._agent, "run", AsyncMock(return_value="reply")) as run_mock,
+        patch.object(bot, "send_note", AsyncMock()) as send_note_mock,
+    ):
+        await bot.on_mention(note)
+
+    run_mock.assert_awaited_once_with(note=note, context=[])
+    send_note_mock.assert_awaited_once_with("reply", in_reply_to=note)
+
+
+@pytest.mark.anyio
+async def test_on_mention_skips_score_check_when_threshold_unset(make_config, make_note):
+    """With no threshold configured the score is never fetched."""
+    bot = Bot(config=make_config())
+    note = make_note(text="hi")
+
+    with (
+        patch.object(bot._agent, "get_author_score", AsyncMock()) as score_mock,
+        patch.object(bot._agent, "run", AsyncMock(return_value="reply")),
+        patch.object(bot, "send_note", AsyncMock()),
+    ):
+        await bot.on_mention(note)
+
+    score_mock.assert_not_awaited()
+
+
+@pytest.mark.anyio
 async def test_on_auto_reply_updates_timestamp_and_triggers_reply(make_config, fake_redis, make_note):
     cfg = make_config(auto_reply_interval=5, auto_reply_jitter=0)
     bot = Bot(config=cfg, redis_client=fake_redis)
