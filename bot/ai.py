@@ -730,7 +730,7 @@ class ChatAgent:
             if looks_sensitive(extracted.object) or looks_sensitive(extracted.subject):
                 logfire.info("Note claim dropped (sensitive-PII backstop)", author=author)
                 return
-            await self._memory.add_edge(
+            await self._memory.add_claim(
                 subject=extracted.subject,
                 predicate=extracted.predicate,
                 object_text=extracted.object,

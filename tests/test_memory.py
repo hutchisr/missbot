@@ -6,9 +6,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from bot.memory import (
-    ConflictingEdge,
+    ConflictingClaim,
     MemoryStore,
-    RecalledEdge,
+    RecalledClaim,
     _vector_literal,
     merge_aliases,
     normalize_entity_name,
@@ -115,7 +115,7 @@ def test_normalize_value_collapses_formatting_variants():
 
 def test_normalize_value_keeps_distinct_values_apart():
     # Deliberately conservative: NO plural fold and NO internal-punctuation stripping, because
-    # edge values are heterogeneous and a wrong merge miscounts agreement.
+    # claim values are heterogeneous and a wrong merge miscounts agreement.
     assert normalize_value("3.13") != normalize_value("3 13")  # version punctuation preserved
     assert normalize_value("Windows") != normalize_value("Window")  # plurals NOT folded
     assert normalize_value("v3.13") != normalize_value("3.13")
@@ -128,7 +128,7 @@ def test_normalize_value_handles_empty():
 
 
 def test_value_group_key_uses_entity_then_text():
-    # Relationship edges group by destination entity id (namespaced 'e'); attribute edges fall
+    # Relationship claims group by destination entity id (namespaced 'e'); attribute claims fall
     # back to the normalized literal key ('k').
     assert value_group_key(5, "anything") == "e5"
     assert value_group_key(None, "arch linux") == "karch linux"
@@ -179,14 +179,14 @@ async def test_embed_batch_sends_dimensions_and_list_input(make_config):
     assert body["input"] == ["one"]
 
 
-def test_recalled_edge_shape():
-    c = RecalledEdge(
+def test_recalled_claim_shape():
+    c = RecalledClaim(
         subject="Python",
         predicate="latest version",
         value_text="3.13",
         agreed_by=3,
         similarity=0.88,
-        conflicts=[ConflictingEdge(value_text="3.12", agreed_by=1)],
+        conflicts=[ConflictingClaim(value_text="3.12", agreed_by=1)],
     )
     assert c.agreed_by == 3
     assert c.conflicts[0].value_text == "3.12"

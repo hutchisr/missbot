@@ -14,7 +14,7 @@ from bot.memory import EntityNeighbor
 def fake_store() -> AsyncMock:
     store = AsyncMock()
     store.consolidate.return_value = {"merged_by_name": 2, "merged_by_embedding": 0, "merged_by_llm": 1}
-    store.stats.return_value = {"entities": 10, "edges": 40, "sources": 12, "authors": 8}
+    store.stats.return_value = {"entities": 10, "claims": 40, "sources": 12, "authors": 8}
     store.reembed_all.return_value = {"entities": 10, "relations": 14}
     store.entity_neighbors.return_value = [
         EntityNeighbor("Python", "Python (programming language)", 0.94),
@@ -50,7 +50,7 @@ def test_stats_prints_json(make_config, fake_store):
     result = _invoke(["stats", "-c", "x.yaml"], _memory_cfg(make_config), fake_store)
     assert result.exit_code == 0, result.output
     fake_store.stats.assert_awaited_once()
-    assert json.loads(result.output) == {"entities": 10, "edges": 40, "sources": 12, "authors": 8}
+    assert json.loads(result.output) == {"entities": 10, "claims": 40, "sources": 12, "authors": 8}
 
 
 def test_reembed_runs_and_prints_json(make_config, fake_store):

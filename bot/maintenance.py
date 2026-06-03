@@ -4,7 +4,7 @@ Runnable out-of-process (so it can be a k8s CronJob, separate from the long-runn
 bot) via ``python -m bot.maintenance <command> -c /config.yaml``:
 
     consolidate         merge duplicate entities (name/embedding/LLM), then backfill relationship links
-    stats               print store counts (entities, edges, distinct sources/authors)
+    stats               print store counts (entities, claims, distinct sources/authors)
     reembed             regenerate ALL embeddings with the configured model (model swap / seed cleanup)
     calibrate-entities  print the most-similar entity pairs to help tune entity_match_threshold
 
@@ -84,7 +84,7 @@ def consolidate(config_path: str) -> None:
 @cli.command()
 @_config_option
 def stats(config_path: str) -> None:
-    """Print store counts (entities, edges, distinct sources/authors)."""
+    """Print store counts (entities, claims, distinct sources/authors)."""
     click.echo(json.dumps(_run(config_path, lambda store: store.stats()), indent=2))
 
 

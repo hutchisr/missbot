@@ -13,7 +13,7 @@ from pydantic_ai import RunContext
 from redis.asyncio import Redis
 
 from .extract import ClaimExtraction, ExtractedClaim, Skip, looks_sensitive
-from .memory import MemoryStore, RecalledEdge
+from .memory import MemoryStore, RecalledClaim
 from .models import Config
 
 
@@ -31,16 +31,16 @@ def _fence_untrusted(label: str, body: str) -> str:
     )
 
 
-def _render_recalled_edge(edge: RecalledEdge) -> str:
-    """Render a recalled edge as one line: the most-agreed value, with any alternatives.
+def _render_recalled_claim(claim: RecalledClaim) -> str:
+    """Render a recalled claim as one line: the most-agreed value, with any alternatives.
 
     Shows how many distinct users assert the winning value (``agreed by N``) and lists
     competing values with their own counts, so the model weighs agreement rather than
     treating recall as confirmed truth.
     """
-    line = f"- {edge.subject} — {edge.predicate}: {edge.value_text} [agreed by {edge.agreed_by}]"
-    if edge.conflicts:
-        alts = "; ".join(f'"{c.value_text}" (agreed by {c.agreed_by})' for c in edge.conflicts)
+    line = f"- {claim.subject} — {claim.predicate}: {claim.value_text} [agreed by {claim.agreed_by}]"
+    if claim.conflicts:
+        alts = "; ".join(f'"{c.value_text}" [agreed by {c.agreed_by}]' for c in claim.conflicts)
         line += f"\n    other values: {alts}"
     return line
 
@@ -420,7 +420,7 @@ def build_tools(
                     # PII backstop: never store obvious personal data even if the gate allowed it.
                     if looks_sensitive(extracted.object) or looks_sensitive(extracted.subject):
                         return "Not stored — that looks like personal or private information."
-                    result = await _memory.add_edge(
+                    result = await _memory.add_claim(
                         subject=extracted.subject,
                         predicate=extracted.predicate,
                         object_text=extracted.object,
@@ -449,13 +449,13 @@ def build_tools(
             if not query:
                 return "Error: empty search query."
             try:
-                edges = await _memory.search_edges(query, config.global_recall_k)
+                claims = await _memory.search_claims(query, config.global_recall_k)
             except Exception:
                 logfire.exception("Error searching world-knowledge store")
                 return "Error searching memory."
-            if not edges:
+            if not claims:
                 return "No relevant facts found in memory."
-            body = "\n".join(_render_recalled_edge(c) for c in edges)
+            body = "\n".join(_render_recalled_claim(c) for c in claims)
             return _fence_untrusted("Recalled facts from the world-knowledge store", body)
 
         tools.append(search_memory)

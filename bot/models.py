@@ -336,7 +336,7 @@ class Config(BaseModel):
         default=False,
         description="Enable the persistent world-knowledge store (Postgres + pgvector). Off by default; "
         "requires postgres_url and embedding_model. Adds the search_memory tool and ingests user notes as "
-        "graph edges (entity-predicate-value facts). Recall ranks values by user agreement (how many "
+        "claims (entity-predicate-value facts). Recall ranks values by user agreement (how many "
         "distinct users assert each value).",
     )
     postgres_url: Optional[str] = Field(
@@ -380,7 +380,7 @@ class Config(BaseModel):
     global_recall_k: int = Field(
         default=5,
         gt=0,
-        description="Max number of facts (graph edges) returned per search_memory call (after conflict resolution).",
+        description="Max number of facts (claims) returned per search_memory call (after conflict resolution).",
     )
     global_recall_min_similarity: float = Field(
         default=0.3,
@@ -402,7 +402,7 @@ class Config(BaseModel):
         default=0.82,
         ge=0.0,
         le=1.0,
-        description="Cosine-similarity floor for linking an edge's source to an existing entity at write time. "
+        description="Cosine-similarity floor for linking a claim's source to an existing entity at write time. "
         "Below this (and with no exact name/alias match) a new entity is created instead.",
     )
     entity_merge_threshold: float = Field(
@@ -429,7 +429,7 @@ class Config(BaseModel):
     )
     memory_ingest_notes: bool = Field(
         default=True,
-        description="When memory is enabled, auto-ingest each incoming user note as a graph edge attributed to its "
+        description="When memory is enabled, auto-ingest each incoming user note as a claim attributed to its "
         "author (so distinct authors asserting the same value raise its agreement count). The extractor's Skip "
         "branch drops chatter/opinions/personal details, and writes are rate-limited per author by "
         "global_write_cooldown. Set false to disable note learning.",

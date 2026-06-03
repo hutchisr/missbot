@@ -1,28 +1,29 @@
 """World-knowledge store for Missbot (Postgres + pgvector), modelled as a graph.
 
 This module owns the bot's shared, non-user-specific knowledge as an explicit **property
-graph**: ``knowledge_entity`` rows are *vertices* (entities) and ``knowledge_edge`` rows are
-*edges* — each a ``(src_entity, predicate, value)`` fact attributed to the user who asserted
-it. An edge is one of two kinds, distinguished by whether its destination is a vertex:
+graph**: ``knowledge_entity`` rows are *vertices* (entities) and ``knowledge_claim`` rows are
+*attributed statements* — each a ``(src_entity, predicate, value)`` fact attributed to the user
+who asserted it. A claim is one of two kinds, by whether its value is itself a vertex:
 
-* **relationship edge** — ``dst_entity_id`` set: the value names another entity ("uses_os" ->
-  the *Arch Linux* vertex). Grouped by the destination vertex identity.
-* **attribute edge** — ``dst_entity_id`` NULL: the value is a literal ("born 1990",
-  "latest_version: 3.13"). Grouped by ``value_key`` (normalized literal text).
+* **relationship** — ``dst_entity_id`` set: the value names another entity ("uses_os" -> the
+  *Arch Linux* vertex), so the claim forms a true graph **edge** between two vertices. Grouped
+  by the destination vertex identity.
+* **attribute** — ``dst_entity_id`` NULL: the value is a literal ("born 1990", "latest version:
+  3.13"), a property of the source vertex. Grouped by ``value_key`` (normalized literal text).
 
 The one ranking signal is **agreement**: a value that more *distinct* users independently
 assert outranks one a single user asserts.
 
 Recall is **group-level**. Every ``(src_entity, predicate)`` "question" is one
 ``knowledge_relation`` row holding a single embedding of the question text (``subject —
-predicate``); the per-author values hang off it as edges. So the recall vector is shared by
+predicate``); the per-author values hang off it as claims. So the recall vector is shared by
 every author's value, isn't biased by any one asserted answer, and the ANN candidate pool is
 naturally one-row-per-group (no per-author duplicates crowding it). Embeddings: ``embed`` the
 *question* once per relation, and ``embed`` an entity's *name* once for resolution.
 
 Model (enforced in code):
 
-1. **One opinion per user.** An edge is keyed ``UNIQUE(author, relation_id)`` and written by
+1. **One opinion per user.** A claim is keyed ``UNIQUE(author, relation_id)`` and written by
    upsert, so each user holds at most one current value per relation; re-asserting overwrites
    their own row ("changed my mind").
 2. **Agreement = distinct authors.** Recall counts ``COUNT(DISTINCT author)`` per value within
@@ -100,9 +101,9 @@ def normalize_entity_name(name: str) -> str:
 
 
 def normalize_value(value_text: str) -> str:
-    """Canonicalize an edge's literal value into the grouping key for the agreement count.
+    """Canonicalize a claim's literal value into the grouping key for the agreement count.
 
-    Two attribute edges agree (count as the same value) only when their values share this key,
+    Two attribute claims agree (count as the same value) only when their values share this key,
     so it must fold away the formatting noise two writers can differ on for the *same* value while
     keeping genuinely different values apart. Deliberately **more conservative** than
     :func:`normalize_entity_name`: it lowercases, strips accents (NFKD), and collapses internal
@@ -111,7 +112,7 @@ def normalize_value(value_text: str) -> str:
     ``3 13`` or ``Windows`` vs ``Window`` are distinct, and a wrong merge silently miscounts
     agreement. A folding miss only undercounts agreement (the safe failure); a wrong merge would
     credit agreement to the wrong value. Synonyms ("Manila" vs "City of Manila") are out of scope
-    here — that needs entity resolution (relationship edges via ``dst_entity_id``), not string
+    here — that needs entity resolution (relationship claims via ``dst_entity_id``), not string
     normalization.
     """
     decomposed = unicodedata.normalize("NFKD", value_text or "")
@@ -119,8 +120,8 @@ def normalize_value(value_text: str) -> str:
     return re.sub(r"\s+", " ", ascii_ish.lower()).strip()
 
 
-# SQL expression yielding an edge's value grouping key: the linked destination entity if present
-# (relationship edge), else the normalized literal text (attribute edge). The ``e``/``k`` prefixes
+# SQL expression yielding a claim's value grouping key: the linked destination entity if present
+# (relationship claim), else the normalized literal text (attribute claim). The ``e``/``k`` prefixes
 # namespace the two so an entity id can never collide with a literal value that happens to be
 # numeric. MUST stay in lockstep with :func:`value_group_key` (the Python mirror) — the agreement
 # count groups by both.
@@ -130,9 +131,9 @@ _VALUE_GROUP_SQL = "COALESCE('e' || dst_entity_id::text, 'k' || value_key)"
 def value_group_key(dst_entity_id: Optional[int], value_key: str) -> str:
     """Grouping key for the agreement count — the Python mirror of :data:`_VALUE_GROUP_SQL`.
 
-    Two edges count as the same value (so they agree) when they point at the same destination
-    entity (relationship edges), or — when neither is linked — when their normalized literal text
-    matches (attribute edges). A value is only ever *linked* to an entity that already exists (see
+    Two claims count as the same value (so they agree) when they point at the same destination
+    entity (relationship claims), or — when neither is linked — when their normalized literal text
+    matches (attribute claims). A value is only ever *linked* to an entity that already exists (see
     :meth:`MemoryStore._match_entity_exact`), so this never invents entities for free-text values;
     unlinked values fall back to ``value_key``.
     """
@@ -191,7 +192,7 @@ def _vector_literal(vec: list[float]) -> str:
 
 
 @dataclass
-class ConflictingEdge:
+class ConflictingClaim:
     """An alternative value (fewer users assert it) that disagrees with the recalled winner."""
 
     value_text: str
@@ -199,23 +200,23 @@ class ConflictingEdge:
 
 
 @dataclass
-class RecalledEdge:
-    """A recalled edge: the most-agreed value for a (src, predicate), with alternatives."""
+class RecalledClaim:
+    """A recalled claim: the most-agreed value for a (src, predicate), with alternatives."""
 
     subject: str
     predicate: str
     value_text: str
     agreed_by: int
     similarity: float
-    conflicts: list[ConflictingEdge]
+    conflicts: list[ConflictingClaim]
 
 
 @dataclass
-class EdgeWriteResult:
-    """Outcome of an :meth:`MemoryStore.add_edge` call."""
+class ClaimWriteResult:
+    """Outcome of an :meth:`MemoryStore.add_claim` call."""
 
     stored: bool
-    edge_id: Optional[int]
+    claim_id: Optional[int]
     updated: bool
     subject: str
     predicate: str
@@ -231,7 +232,7 @@ class EntityNeighbor:
 
 
 class MemoryStore:
-    """Async Postgres-backed store for the world-knowledge graph (entities, relations, edges)."""
+    """Async Postgres-backed store for the world-knowledge graph (entities, relations, claims)."""
 
     def __init__(self, pool: asyncpg.Pool, http: httpx.AsyncClient, config: Config):
         self._pool = pool
@@ -246,22 +247,29 @@ class MemoryStore:
         self._embed_headers = {"Authorization": f"Bearer {key}"} if key else {}
         # Optional write-time entity-linking classifier, injected by the bot wiring.
         self.entity_linker: Optional[EntityLinker] = None
-        # Author whose edges are stored and recalled but excluded from the agreement count
+        # Author whose claims are stored and recalled but excluded from the agreement count
         # (the bot itself, via remember_fact), injected by the bot wiring. None in
-        # maintenance/headless contexts, where every author counts. See `search_edges`.
+        # maintenance/headless contexts, where every author counts. See `search_claims`.
         self.bot_author: Optional[str] = None
 
     @classmethod
     async def create(cls, config: Config, *, skip_dim_check: bool = False) -> "MemoryStore":
         """Connect, ensure/migrate the schema/extension exist, return store.
 
-        Migrates older layouts in place, losslessly:
+        Schema: ``knowledge_entity`` (vertices), ``knowledge_relation`` (one recall embedding per
+        ``(src_entity, predicate)`` "question"), and ``knowledge_claim`` (one per-author value for a
+        relation). A claim whose value names another entity (``dst_entity_id`` set) forms a graph
+        *edge* (a relationship); a literal-valued claim is an *attribute*.
 
-        * a minimal ``knowledge_claim`` store -> ``knowledge_edge`` (column rename);
+        Migrates older layouts in place, losslessly and idempotently, converging on that schema from
+        any prior state:
+
+        * an interim ``knowledge_edge`` value table -> ``knowledge_claim`` (table rename);
+        * a legacy minimal store's ``subject/object`` columns -> ``src/dst``/``value`` (column rename);
         * legacy snake_case predicates -> natural phrases;
-        * the per-edge recall embedding -> a group-level ``knowledge_relation`` (one embedding per
-          ``(src, predicate)``), seeding each relation from one of its edges' existing vectors so
-          no row is re-embedded against the API at startup.
+        * a per-row recall embedding -> a group-level ``knowledge_relation`` (one embedding per
+          ``(src, predicate)``), seeding each relation from one of its claims' existing vectors so no
+          row is re-embedded against the API at startup.
 
         Fails fast if it finds the legacy rich-claims schema (``trust_tier`` column), or if an
         existing relation-embedding column dimension disagrees with ``config.embedding_dim`` —
@@ -278,66 +286,72 @@ class MemoryStore:
         try:
             await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
 
-            # Fail fast on a pre-existing rich-schema deployment: the graph store is not
-            # column-compatible with the old rich claims store (no trust_tier/status/supersession),
-            # so refuse loudly rather than silently break. Check the historical table names so the
-            # guard holds whatever migration stage the deployment is at.
+            async def _has_column(table: str, column: str) -> bool:
+                """Whether ``table.column`` exists — used to tell schema generations apart."""
+                return bool(
+                    await conn.fetchval(
+                        "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+                        "WHERE table_name = $1 AND column_name = $2)",
+                        table,
+                        column,
+                    )
+                )
+
+            # Fail fast on the legacy rich-claims schema (not column-compatible with this store);
+            # check every historical value-table name so the guard holds at any migration stage.
             legacy = await conn.fetchval(
                 "SELECT 1 FROM information_schema.columns "
                 "WHERE table_name IN ('knowledge_claim', 'knowledge_edge') AND column_name = 'trust_tier'"
             )
             if legacy is not None:
                 raise RuntimeError(
-                    "knowledge_claim/knowledge_edge has the legacy 'trust_tier' column — this is the old rich "
-                    "claims store, which the minimal agreement-ranked graph store is not column-compatible with. "
-                    "Drop the knowledge_* tables (the bot re-learns from the timeline) before starting."
+                    "knowledge_claim/knowledge_edge has the legacy 'trust_tier' column — the old rich claims "
+                    "store, which this agreement-ranked store is not column-compatible with. Drop the "
+                    "knowledge_* tables (the bot re-learns from the timeline) before starting."
                 )
 
-            # Migration 1 — a prior deployment's minimal `knowledge_claim` is structurally identical
-            # to the pre-split `knowledge_edge`, so rename the table, its columns, and carried-over
-            # indexes. Idempotent: only runs when the old table exists and the new one does not.
-            needs_rename = await conn.fetchval(
-                "SELECT to_regclass('knowledge_claim') IS NOT NULL AND to_regclass('knowledge_edge') IS NULL"
-            )
-            if needs_rename:
-                await conn.execute("ALTER TABLE knowledge_claim RENAME TO knowledge_edge")
-                await conn.execute("ALTER TABLE knowledge_edge RENAME COLUMN subject_entity_id TO src_entity_id")
-                await conn.execute("ALTER TABLE knowledge_edge RENAME COLUMN object_entity_id TO dst_entity_id")
-                await conn.execute("ALTER TABLE knowledge_edge RENAME COLUMN object_text TO value_text")
-                await conn.execute("ALTER TABLE knowledge_edge RENAME COLUMN object_key TO value_key")
+            # --- In-place, idempotent migration converging on the current schema ----------------
+            # The value table was briefly named `knowledge_edge`; normalise it back to
+            # `knowledge_claim` first so every later step reasons about one name (column checks then
+            # tell the generations apart). Runs only when the interim name exists and the final
+            # one does not.
+            if await conn.fetchval(
+                "SELECT to_regclass('knowledge_edge') IS NOT NULL AND to_regclass('knowledge_claim') IS NULL"
+            ):
+                await conn.execute("ALTER TABLE knowledge_edge RENAME TO knowledge_claim")
+                for _old, _new in (
+                    ("knowledge_edge_embedding_idx", "knowledge_claim_embedding_idx"),
+                    ("knowledge_edge_sp_idx", "knowledge_claim_sp_idx"),
+                    ("knowledge_edge_relation_idx", "knowledge_claim_relation_idx"),
+                    ("knowledge_edge_dst_idx", "knowledge_claim_dst_idx"),
+                ):
+                    await conn.execute(f"ALTER INDEX IF EXISTS {_old} RENAME TO {_new}")
+                logfire.info("Renamed knowledge_edge -> knowledge_claim")
+
+            # Legacy minimal store: rename subject/object columns to src/dst/value.
+            if await _has_column("knowledge_claim", "subject_entity_id"):
+                await conn.execute("ALTER TABLE knowledge_claim RENAME COLUMN subject_entity_id TO src_entity_id")
+                await conn.execute("ALTER TABLE knowledge_claim RENAME COLUMN object_entity_id TO dst_entity_id")
+                await conn.execute("ALTER TABLE knowledge_claim RENAME COLUMN object_text TO value_text")
+                await conn.execute("ALTER TABLE knowledge_claim RENAME COLUMN object_key TO value_key")
+                logfire.info("Renamed legacy subject/object columns to src/dst/value")
+
+            # Fold legacy snake_case predicates to natural phrases (while `predicate` still lives on
+            # the value table, i.e. before the relation split). Safe: pre-change predicates never
+            # contain spaces, so no rewrite can collide. Idempotent (matches only rows holding '_').
+            if await _has_column("knowledge_claim", "predicate"):
                 await conn.execute(
-                    "ALTER INDEX IF EXISTS knowledge_claim_embedding_idx RENAME TO knowledge_edge_embedding_idx"
-                )
-                await conn.execute("ALTER INDEX IF EXISTS knowledge_claim_sp_idx RENAME TO knowledge_edge_sp_idx")
-                logfire.info("Migrated knowledge_claim -> knowledge_edge (in-place rename)")
-
-            # Predicates are stored as natural lowercase phrases, not snake_case. Fold any legacy
-            # snake_case predicates to the phrase form in place (while `predicate` still lives on the
-            # edge, i.e. before the relation split) so old and new assertions of the same relation
-            # group together. Safe: pre-change predicates never contain spaces, so no rewrite can
-            # collide with an existing row. Idempotent (the guard matches only rows holding '_').
-            edge_has_predicate = await conn.fetchval(
-                "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
-                "WHERE table_name = 'knowledge_edge' AND column_name = 'predicate')"
-            )
-            if edge_has_predicate:
-                await conn.execute(
-                    "UPDATE knowledge_edge SET predicate = replace(predicate, '_', ' ') WHERE strpos(predicate, '_') > 0"
+                    "UPDATE knowledge_claim SET predicate = replace(predicate, '_', ' ') WHERE strpos(predicate, '_') > 0"
                 )
 
-            # Migration 2 — split the per-edge recall embedding out into a group-level
-            # `knowledge_relation` (one embedding per (src, predicate) question). Idempotent: only
-            # runs while the edge still carries an `embedding` column and no relation table exists.
-            # Each relation is seeded from one of its edges' existing vectors (DISTINCT ON), so the
-            # migration never calls the embeddings API; the seed self-corrects to the question vector
-            # the next time that relation is written.
-            needs_split = await conn.fetchval(
-                "SELECT to_regclass('knowledge_edge') IS NOT NULL "
-                "AND to_regclass('knowledge_relation') IS NULL "
-                "AND EXISTS (SELECT 1 FROM information_schema.columns "
-                "WHERE table_name = 'knowledge_edge' AND column_name = 'embedding')"
-            )
-            if needs_split:
+            # Split a per-row recall embedding out into a group-level `knowledge_relation` (one
+            # embedding per (src, predicate)). Seeds each relation from one of its claims' existing
+            # vectors (DISTINCT ON) — no embeddings API call; the seed self-corrects to the question
+            # vector the next time that relation is written. Runs only while the value table still
+            # carries an `embedding` column and no relation table exists.
+            if await conn.fetchval("SELECT to_regclass('knowledge_relation') IS NULL") and await _has_column(
+                "knowledge_claim", "embedding"
+            ):
                 async with conn.transaction():
                     await conn.execute(
                         f"""
@@ -356,27 +370,27 @@ class MemoryStore:
                         "INSERT INTO knowledge_relation (src_entity_id, predicate, embedding, created_at, updated_at) "
                         "SELECT DISTINCT ON (src_entity_id, predicate) "
                         "src_entity_id, predicate, embedding, created_at, updated_at "
-                        "FROM knowledge_edge ORDER BY src_entity_id, predicate, updated_at DESC"
+                        "FROM knowledge_claim ORDER BY src_entity_id, predicate, updated_at DESC"
                     )
                     await conn.execute(
-                        "ALTER TABLE knowledge_edge ADD COLUMN relation_id BIGINT REFERENCES knowledge_relation(id)"
+                        "ALTER TABLE knowledge_claim ADD COLUMN relation_id BIGINT REFERENCES knowledge_relation(id)"
                     )
                     await conn.execute(
-                        "UPDATE knowledge_edge e SET relation_id = r.id FROM knowledge_relation r "
-                        "WHERE r.src_entity_id = e.src_entity_id AND r.predicate = e.predicate"
+                        "UPDATE knowledge_claim c SET relation_id = r.id FROM knowledge_relation r "
+                        "WHERE r.src_entity_id = c.src_entity_id AND r.predicate = c.predicate"
                     )
-                    await conn.execute("ALTER TABLE knowledge_edge ALTER COLUMN relation_id SET NOT NULL")
-                    # Drop the now-superseded per-edge embedding, and the src/predicate columns (now
-                    # on the relation). CASCADE on src_entity_id removes the old UNIQUE(author, src,
-                    # predicate) constraint and the (src, predicate) index that depend on it.
-                    await conn.execute("ALTER TABLE knowledge_edge DROP COLUMN embedding")
-                    await conn.execute("ALTER TABLE knowledge_edge DROP COLUMN src_entity_id CASCADE")
-                    await conn.execute("ALTER TABLE knowledge_edge DROP COLUMN predicate")
+                    await conn.execute("ALTER TABLE knowledge_claim ALTER COLUMN relation_id SET NOT NULL")
+                    # Drop the superseded per-row embedding + the src/predicate columns (now on the
+                    # relation). CASCADE on src_entity_id removes the old UNIQUE(author, src, predicate)
+                    # constraint and its index.
+                    await conn.execute("ALTER TABLE knowledge_claim DROP COLUMN embedding")
+                    await conn.execute("ALTER TABLE knowledge_claim DROP COLUMN src_entity_id CASCADE")
+                    await conn.execute("ALTER TABLE knowledge_claim DROP COLUMN predicate")
                     await conn.execute(
-                        "ALTER TABLE knowledge_edge "
-                        "ADD CONSTRAINT knowledge_edge_author_relation_key UNIQUE (author, relation_id)"
+                        "ALTER TABLE knowledge_claim "
+                        "ADD CONSTRAINT knowledge_claim_author_relation_key UNIQUE (author, relation_id)"
                     )
-                logfire.info("Split knowledge_edge into knowledge_relation + knowledge_edge (group-level embeddings)")
+                logfire.info("Split per-row embedding into knowledge_relation (group-level recall)")
 
             await conn.execute(
                 f"""
@@ -392,7 +406,7 @@ class MemoryStore:
                 """
             )
             # The (src, predicate) "question": one recall embedding per group, shared by all of its
-            # authors' edges. UNIQUE(src, predicate) also serves the write-path relation lookup.
+            # claims. UNIQUE(src, predicate) also serves the write-path relation lookup.
             await conn.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS knowledge_relation (
@@ -406,10 +420,12 @@ class MemoryStore:
                 )
                 """
             )
-            # One per-author value per relation (no embedding — recall is over the relation).
+            # One per-author value (claim) per relation; no embedding — recall is over the relation.
+            # A claim whose value names another entity (dst_entity_id) is a relationship (a graph
+            # edge); a literal-valued claim is an attribute.
             await conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS knowledge_edge (
+                CREATE TABLE IF NOT EXISTS knowledge_claim (
                     id            BIGSERIAL PRIMARY KEY,
                     relation_id   BIGINT NOT NULL REFERENCES knowledge_relation(id),
                     value_text    TEXT NOT NULL,
@@ -435,9 +451,11 @@ class MemoryStore:
             )
             # Agreement is tallied per relation; this serves the agg lookup by relation_id (the
             # UNIQUE(author, relation_id) index leads with author, so it can't).
-            await conn.execute("CREATE INDEX IF NOT EXISTS knowledge_edge_relation_idx ON knowledge_edge (relation_id)")
-            # Speeds entity merges (repointing destination edges) and is traversal-ready.
-            await conn.execute("CREATE INDEX IF NOT EXISTS knowledge_edge_dst_idx ON knowledge_edge (dst_entity_id)")
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS knowledge_claim_relation_idx ON knowledge_claim (relation_id)"
+            )
+            # Speeds entity merges (repointing relationship claims' destinations) and is traversal-ready.
+            await conn.execute("CREATE INDEX IF NOT EXISTS knowledge_claim_dst_idx ON knowledge_claim (dst_entity_id)")
 
             existing_dim = await conn.fetchval(
                 "SELECT atttypmod FROM pg_attribute "
@@ -510,9 +528,9 @@ class MemoryStore:
         """Id of the live entity whose canonical_name or an alias equals ``name`` (case-insensitive).
 
         The cheap, deterministic, embedding-free, LLM-free half of resolution. Used as the fast
-        path in :meth:`add_edge` and as the *only* linker for an edge **value** (link-only: a value
-        becomes a relationship edge only when it already names a known entity, never by creating one
-        — so free-text values like "born 1990" stay attribute edges).
+        path in :meth:`add_claim` and as the *only* linker for a claim **value** (link-only: a value
+        becomes a relationship claim only when it already names a known entity, never by creating one
+        — so free-text values like "born 1990" stay attribute claims).
         """
         row = await conn.fetchval(
             "SELECT id FROM knowledge_entity "
@@ -559,7 +577,7 @@ class MemoryStore:
         return None
 
     @logfire.instrument(extract_args=["subject", "predicate", "author"])
-    async def add_edge(self, *, subject: str, predicate: str, object_text: str, author: str) -> EdgeWriteResult:
+    async def add_claim(self, *, subject: str, predicate: str, object_text: str, author: str) -> ClaimWriteResult:
         """Record that ``author`` asserts ``object_text`` for (``subject``, ``predicate``).
 
         **Per-author upsert:** each user holds at most one current value per relation; re-asserting
@@ -567,8 +585,8 @@ class MemoryStore:
         value — the agreement count tallied at recall — reflects who *currently* asserts it. The
         source is resolved (or created) as an entity; the ``(src, predicate)`` relation is resolved
         (or created); the value is linked to a destination entity only on an exact name/alias match
-        (a relationship edge), otherwise it stays a literal grouped by its normalized text (an
-        attribute edge).
+        (a relationship claim), otherwise it stays a literal grouped by its normalized text (an
+        attribute claim).
 
         Embeddings are **lazy**: the subject name is embedded only when there's no exact entity
         match, and the relation "question" only when the relation doesn't already exist — so a
@@ -603,7 +621,7 @@ class MemoryStore:
         if relation_id is None:
             question_vec = _vector_literal(await self.embed(render_relation(subject, predicate)))
 
-        # 3. Write the entity (if new), relation (if new), and the per-author edge in one txn.
+        # 3. Write the entity (if new), relation (if new), and the per-author claim in one txn.
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 if src_entity_id is None:
@@ -634,14 +652,14 @@ class MemoryStore:
 
                 # Link the value to a destination entity only if it *exactly* names a known one
                 # (link-only, no creation, no embedding/LLM) — entity-valued facts become
-                # relationship edges that group by identity while free-text values stay attribute
-                # edges. A cheap indexed lookup inside the txn.
+                # relationship claims that group by identity while free-text values stay attribute
+                # claims. A cheap indexed lookup inside the txn.
                 dst_entity_id = await self._match_entity_exact(conn, object_text)
 
                 # Upsert this author's value for the relation. xmax <> 0 means the row already
                 # existed and we updated it (the author changed their mind).
                 row = await conn.fetchrow(
-                    "INSERT INTO knowledge_edge (relation_id, value_text, value_key, dst_entity_id, author) "
+                    "INSERT INTO knowledge_claim (relation_id, value_text, value_key, dst_entity_id, author) "
                     "VALUES ($1, $2, $3, $4, $5) "
                     "ON CONFLICT (author, relation_id) DO UPDATE SET "
                     "value_text = EXCLUDED.value_text, value_key = EXCLUDED.value_key, "
@@ -655,19 +673,19 @@ class MemoryStore:
                 )
                 assert row is not None  # INSERT ... RETURNING always yields a row
 
-        return EdgeWriteResult(
+        return ClaimWriteResult(
             stored=True,
-            edge_id=int(row["id"]),
+            claim_id=int(row["id"]),
             updated=bool(row["updated"]),
             subject=subject,
             predicate=predicate,
         )
 
     async def seconds_since_last_write(self, author: str) -> Optional[float]:
-        """Seconds since ``author``'s most recent edge write, or None if never."""
+        """Seconds since ``author``'s most recent claim write, or None if never."""
         async with self._pool.acquire() as conn:
             last = await conn.fetchval(
-                "SELECT EXTRACT(EPOCH FROM (now() - max(updated_at))) FROM knowledge_edge WHERE author = $1",
+                "SELECT EXTRACT(EPOCH FROM (now() - max(updated_at))) FROM knowledge_claim WHERE author = $1",
                 author,
             )
         return float(last) if last is not None else None
@@ -675,13 +693,13 @@ class MemoryStore:
     # --- Read path ---------------------------------------------------------------
 
     @logfire.instrument(extract_args=["query"])
-    async def search_edges(self, query: str, k: int) -> list[RecalledEdge]:
+    async def search_claims(self, query: str, k: int) -> list[RecalledClaim]:
         """Recall the most-agreed value for each relevant relation.
 
         Embedding recall runs over the **relation** vectors — one per ``(src, predicate)`` question,
         not per author — so the ANN candidate pool is naturally group-level (no per-author
         duplicates crowding it). For each candidate relation the **agreement count** —
-        ``COUNT(DISTINCT author)`` per value over *all* its live edges, excluding ``self.bot_author``
+        ``COUNT(DISTINCT author)`` per value over *all* its live claims, excluding ``self.bot_author``
         — picks the winner via :func:`resolve_conflict` (recency breaks ties), with the losing values
         riding along as ``conflicts``. Results are ordered by recall similarity and capped at ``k``.
         """
@@ -716,10 +734,10 @@ class MemoryStore:
                 subject_by_rel[rid] = r["subject"]
                 predicate_by_rel[rid] = r["predicate"]
 
-            # Tally agreement (distinct authors per value) across ALL live edges of the candidate
+            # Tally agreement (distinct authors per value) across ALL live claims of the candidate
             # relations. The bot author (when set) is excluded via ``IS DISTINCT FROM`` — which
             # counts every (non-null) author when ``bot_author`` is None, so maintenance/headless
-            # recall is unaffected. Bot-authored edges (from remember_fact) still group and surface
+            # recall is unaffected. Bot-authored claims (from remember_fact) still group and surface
             # (recency/value aggregate over all asserters); they just don't inflate corroboration,
             # so a human asserting the same value always outranks a bot-only one.
             agg = await conn.fetch(
@@ -728,7 +746,7 @@ class MemoryStore:
                        count(DISTINCT author) FILTER (WHERE author IS DISTINCT FROM $2) AS agreed_by,
                        max(updated_at) AS recency,
                        (array_agg(value_text ORDER BY updated_at DESC))[1] AS value_text
-                FROM knowledge_edge
+                FROM knowledge_claim
                 WHERE relation_id = ANY($1)
                 GROUP BY relation_id, {_VALUE_GROUP_SQL}
                 """,
@@ -743,17 +761,19 @@ class MemoryStore:
                 {"value_text": r["value_text"], "agreed_by": int(r["agreed_by"]), "recency": r["recency"]}
             )
 
-        edges: list[RecalledEdge] = []
+        claims: list[RecalledClaim] = []
         for rid, sim in sim_by_rel.items():
             values = values_by_rel.get(rid)
             if not values:
                 continue
             winner = resolve_conflict(values)
             conflicts = [
-                ConflictingEdge(value_text=v["value_text"], agreed_by=v["agreed_by"]) for v in values if v is not winner
+                ConflictingClaim(value_text=v["value_text"], agreed_by=v["agreed_by"])
+                for v in values
+                if v is not winner
             ]
-            edges.append(
-                RecalledEdge(
+            claims.append(
+                RecalledClaim(
                     subject=subject_by_rel[rid],
                     predicate=predicate_by_rel[rid],
                     value_text=winner["value_text"],
@@ -763,21 +783,21 @@ class MemoryStore:
                 )
             )
 
-        edges.sort(key=lambda c: c.similarity, reverse=True)
-        return edges[:k]
+        claims.sort(key=lambda c: c.similarity, reverse=True)
+        return claims[:k]
 
     # --- Maintenance (M4) --------------------------------------------------------
 
     async def _merge_entity(self, conn: _Conn, keep: int, dup: int) -> None:
-        """Fold entity ``dup`` into ``keep``: merge its relations + repoint edges, union aliases, mark merged.
+        """Fold entity ``dup`` into ``keep``: merge its relations + repoint claims, union aliases, mark merged.
 
         The duplicate row is **not deleted** — it is marked ``merged_into = keep`` so it drops out
         of resolution/recall/consolidation but stays auditable. Each of ``dup``'s relations is
         folded onto ``keep``: if ``keep`` has no relation for that predicate the dup relation is
-        repointed wholesale; otherwise ``dup``'s edges move onto ``keep``'s relation — dropping any
-        that would collide with an existing keep-side edge from the same author
+        repointed wholesale; otherwise ``dup``'s claims move onto ``keep``'s relation — dropping any
+        that would collide with an existing keep-side claim from the same author
         (``UNIQUE(author, relation_id)``) — and the now-empty dup relation is deleted. Edges whose
-        value pointed at ``dup`` (relationship edges) are repointed to ``keep``.
+        value pointed at ``dup`` (relationship claims) are repointed to ``keep``.
         """
         dup_relations = await conn.fetch("SELECT id, predicate FROM knowledge_relation WHERE src_entity_id = $1", dup)
         for rel in dup_relations:
@@ -787,20 +807,20 @@ class MemoryStore:
             if keep_rel is None:
                 await conn.execute("UPDATE knowledge_relation SET src_entity_id = $1 WHERE id = $2", keep, rel["id"])
             else:
-                # One opinion per author per relation: drop dup-side edges whose author already has a
-                # keep-side edge, move the rest onto the keep relation, then drop the empty dup.
+                # One opinion per author per relation: drop dup-side claims whose author already has a
+                # keep-side claim, move the rest onto the keep relation, then drop the empty dup.
                 await conn.execute(
-                    "DELETE FROM knowledge_edge WHERE relation_id = $1 "
-                    "AND author IN (SELECT author FROM knowledge_edge WHERE relation_id = $2)",
+                    "DELETE FROM knowledge_claim WHERE relation_id = $1 "
+                    "AND author IN (SELECT author FROM knowledge_claim WHERE relation_id = $2)",
                     rel["id"],
                     keep_rel,
                 )
                 await conn.execute(
-                    "UPDATE knowledge_edge SET relation_id = $1 WHERE relation_id = $2", keep_rel, rel["id"]
+                    "UPDATE knowledge_claim SET relation_id = $1 WHERE relation_id = $2", keep_rel, rel["id"]
                 )
                 await conn.execute("DELETE FROM knowledge_relation WHERE id = $1", rel["id"])
-        # Repoint relationship-edge destinations that named the duplicate.
-        await conn.execute("UPDATE knowledge_edge SET dst_entity_id = $1 WHERE dst_entity_id = $2", keep, dup)
+        # Repoint relationship-claim destinations that named the duplicate.
+        await conn.execute("UPDATE knowledge_claim SET dst_entity_id = $1 WHERE dst_entity_id = $2", keep, dup)
         krow = await conn.fetchrow("SELECT canonical_name, aliases FROM knowledge_entity WHERE id = $1", keep)
         drow = await conn.fetchrow("SELECT canonical_name, aliases FROM knowledge_entity WHERE id = $1", dup)
         assert krow is not None and drow is not None
@@ -866,13 +886,13 @@ class MemoryStore:
         return merged
 
     async def _backfill_relationship_links(self, conn: _Conn) -> int:
-        """Link unlinked edge values that now *exactly* name a live entity. Returns the count.
+        """Link unlinked claim values that now *exactly* name a live entity. Returns the count.
 
-        An edge's destination link is computed write-time-only (:meth:`add_edge`) against the
-        entities that exist at that instant and is **never** otherwise revisited — so an edge whose
-        value names an entity created (or aliased, via a merge) *after* the edge was written stays
-        an attribute edge forever, fragmenting the agreement count against sibling edges that did
-        link as relationship edges. This pass heals that staleness using the *same* exact-match rule
+        A claim's destination link is computed write-time-only (:meth:`add_claim`) against the
+        entities that exist at that instant and is **never** otherwise revisited — so a claim whose
+        value names an entity created (or aliased, via a merge) *after* the claim was written stays
+        an attribute claim forever, fragmenting the agreement count against sibling claims that did
+        link as relationship claims. This pass heals that staleness using the *same* exact-match rule
         the write path applies (:meth:`_match_entity_exact`: case-insensitive canonical-name/alias
         hit, live entities only, lowest id on ties): no embeddings, no LLM, link-only (never
         creates). Because it is exact match it carries zero overcount risk — it can only fold a stale
@@ -889,7 +909,7 @@ class MemoryStore:
         # The EXISTS guard keeps the UPDATE to rows that actually match (so the rowcount reflects
         # real backfills, and a non-matching row is never rewritten to NULL).
         status = await conn.execute(
-            f"UPDATE knowledge_edge c SET dst_entity_id = ({match}) WHERE c.dst_entity_id IS NULL AND EXISTS ({match})"
+            f"UPDATE knowledge_claim c SET dst_entity_id = ({match}) WHERE c.dst_entity_id IS NULL AND EXISTS ({match})"
         )
         # asyncpg returns a command tag like "UPDATE 3"; the trailing int is the affected rowcount.
         return int(status.rsplit(" ", 1)[-1]) if status else 0
@@ -953,9 +973,9 @@ class MemoryStore:
         key — high precision, no embeddings. Pass 2 (:meth:`_merge_by_embedding`) is a
         conservative embedding fallback at ``entity_merge_threshold``. Pass 3
         (:meth:`_merge_by_llm`, when a linker is wired and ``entity_merge_llm``) heals
-        fragmentation the deterministic passes miss. Merges fold relations/edges onto the keeper, so
+        fragmentation the deterministic passes miss. Merges fold relations/claims onto the keeper, so
         agreement counts re-tally automatically on the next recall — no recompute needed.
-        Finally :meth:`_backfill_relationship_links` exact-matches any unlinked edge value onto
+        Finally :meth:`_backfill_relationship_links` exact-matches any unlinked claim value onto
         a live entity (heals write-time link staleness; run last so it sees the merged aliases).
         """
         # Deterministic passes are atomic; the LLM pass makes decisions outside any
@@ -969,7 +989,7 @@ class MemoryStore:
         merged_by_llm = await self._merge_by_llm() if self._config.entity_merge_llm else 0
 
         # Backfill last: merges above may have unioned duplicate names into keeper aliases,
-        # exposing more exact value matches than existed at the edges' write time.
+        # exposing more exact value matches than existed at the claims' write time.
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 relationship_links_backfilled = await self._backfill_relationship_links(conn)
@@ -1023,19 +1043,19 @@ class MemoryStore:
         return pairs
 
     async def stats(self) -> dict[str, object]:
-        """Snapshot counts for observability (entities, relations, edges, distinct sources/authors)."""
+        """Snapshot counts for observability (entities, relations, claims, distinct sources/authors)."""
         async with self._pool.acquire() as conn:
             entities = await conn.fetchval("SELECT count(*) FROM knowledge_entity WHERE merged_into IS NULL")
             merged_entities = await conn.fetchval("SELECT count(*) FROM knowledge_entity WHERE merged_into IS NOT NULL")
             relations = await conn.fetchval("SELECT count(*) FROM knowledge_relation")
-            edges = await conn.fetchval("SELECT count(*) FROM knowledge_edge")
+            claims = await conn.fetchval("SELECT count(*) FROM knowledge_claim")
             sources = await conn.fetchval("SELECT count(DISTINCT src_entity_id) FROM knowledge_relation")
-            authors = await conn.fetchval("SELECT count(DISTINCT author) FROM knowledge_edge")
+            authors = await conn.fetchval("SELECT count(DISTINCT author) FROM knowledge_claim")
         return {
             "entities": int(entities or 0),
             "merged_entities": int(merged_entities or 0),
             "relations": int(relations or 0),
-            "edges": int(edges or 0),
+            "claims": int(claims or 0),
             "sources": int(sources or 0),
             "authors": int(authors or 0),
         }
