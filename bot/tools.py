@@ -12,7 +12,7 @@ import logfire
 from pydantic_ai import RunContext
 from redis.asyncio import Redis
 
-from .extract import ClaimExtraction, ExtractedClaim, Skip, looks_sensitive
+from .extract import ClaimExtraction, ExtractedClaim, Skip
 from .memory import MemoryStore, RecalledClaim
 from .models import Config
 
@@ -387,9 +387,8 @@ def build_tools(
 
                 Use this when you want to remember a lasting fact about a real, identifiable
                 subject (instance lore, an established fact about a person/place/project) so you
-                can recall it in future conversations — NOT for chit-chat, opinions, or
-                personal/private details about the user you're talking to. Keep each fact short,
-                self-contained, and about one clearly named subject.
+                can recall it in future conversations — NOT for chit-chat or one-off opinions.
+                Keep each fact short, self-contained, and about one clearly named subject.
 
                 The fact is stored under your own name and is deliberately excluded from the
                 agreement count, so it is recalled as background but never outranks what users
@@ -417,9 +416,6 @@ def build_tools(
                         return f"Not stored — that isn't durable world knowledge ({extracted.reason})."
                     if not isinstance(extracted, ExtractedClaim):
                         return "Couldn't structure that into a storable claim; not saved."
-                    # PII backstop: never store obvious personal data even if the gate allowed it.
-                    if looks_sensitive(extracted.object) or looks_sensitive(extracted.subject):
-                        return "Not stored — that looks like personal or private information."
                     result = await _memory.add_claim(
                         subject=extracted.subject,
                         predicate=extracted.predicate,

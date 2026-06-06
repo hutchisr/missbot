@@ -35,7 +35,6 @@ from .extract import (
     Skip,
     build_entity_link_prompt,
     build_extraction_prompt,
-    looks_sensitive,
     pick_entity_match,
 )
 from .mcp import build_mcp_toolsets, gate_names
@@ -699,9 +698,9 @@ class ChatAgent:
         author's handle is passed to the extractor so a self-statement ("I use Arch") resolves
         to a claim about them, and the prior thread (``context``) is supplied as reference-only
         material so cross-note references resolve (e.g. "her name is Olive" after "I have a pet
-        lizard"). Durable personal facts are allowed, but the extractor skips sensitive info and
-        a ``looks_sensitive`` backstop drops any obvious PII (email/phone/IDs) that slips through.
-        Rate-limited per author by ``global_write_cooldown``. Never raises — must not break the reply.
+        lizard"). Durable personal facts are allowed — the bot only ever sees public notes, so it
+        can't learn anything not already public. Rate-limited per author by ``global_write_cooldown``.
+        Never raises — must not break the reply.
         """
         if (
             self._memory is None
@@ -724,11 +723,6 @@ class ChatAgent:
                     return
             extracted = await self._extract_claim(text, speaker=author, context=context_lines or None)
             if not isinstance(extracted, ExtractedClaim):
-                return
-            # Backstop behind the extractor's sensitivity judgement: never store obvious
-            # PII, even if the model judged it storable.
-            if looks_sensitive(extracted.object) or looks_sensitive(extracted.subject):
-                logfire.info("Note claim dropped (sensitive-PII backstop)", author=author)
                 return
             await self._memory.add_claim(
                 subject=extracted.subject,

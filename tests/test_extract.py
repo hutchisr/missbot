@@ -10,7 +10,6 @@ from bot.extract import (
     Skip,
     build_entity_link_prompt,
     build_extraction_prompt,
-    looks_sensitive,
     pick_entity_match,
 )
 
@@ -53,12 +52,12 @@ def test_instructions_are_hardened_against_injection():
     assert "subject" in text
 
 
-def test_instructions_allow_personal_facts_but_skip_sensitive():
+def test_instructions_allow_personal_facts():
     text = EXTRACTION_INSTRUCTIONS.lower()
-    # Durable personal facts about a named person are now storable...
+    # Durable personal facts about a named person are storable; the bot only sees public
+    # notes, so the extractor no longer carries a private-information skip rule.
     assert "personal facts" in text
-    # ...but sensitive PII is always rejected.
-    assert "sensitive" in text
+    assert "sensitive" not in text
 
 
 def test_build_extraction_prompt_includes_speaker_resolution():
@@ -80,16 +79,6 @@ def test_build_extraction_prompt_includes_thread_context():
     assert "@alice" in prompt
     # Context is reference-only — the extractor must not mine separate claims from it.
     assert "do NOT extract separate claims" in prompt
-
-
-def test_looks_sensitive_flags_obvious_pii():
-    assert looks_sensitive("reach me at bob@example.com")
-    assert looks_sensitive("call 555-123-4567")
-    assert looks_sensitive("ssn 123-45-6789")
-    # Non-PII personal facts and short numbers are fine.
-    assert not looks_sensitive("I love Rust and hiking")
-    assert not looks_sensitive("released in 1991")
-    assert not looks_sensitive("")
 
 
 def test_entity_match_defaults_to_new():

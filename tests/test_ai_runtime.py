@@ -369,13 +369,14 @@ async def test_run_note_ingestion_passes_speaker_to_extractor(make_config, make_
 
 
 @pytest.mark.anyio
-async def test_run_note_ingestion_drops_sensitive_pii(make_config, make_note):
+async def test_run_note_ingestion_stores_whatever_the_gate_allows(make_config, make_note):
     mem = AsyncMock()
     mem.seconds_since_last_write.return_value = None
     agent = ChatAgent(_memory_cfg(make_config), memory=mem)
-    note = make_note(text="my email is alice@example.com")
-    # Even if the extractor judged it storable, the code backstop must block obvious PII.
-    claim = ExtractedClaim(subject="alice", predicate="email", object="alice@example.com")
+    note = make_note(text="I'm in the US/Pacific timezone")
+    # The private-information guard was removed — the bot only sees public notes, so whatever the
+    # extractor structures into a claim is stored without a separate sensitivity filter.
+    claim = ExtractedClaim(subject="alice", predicate="timezone", object="US/Pacific")
 
     with (
         patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
@@ -383,7 +384,8 @@ async def test_run_note_ingestion_drops_sensitive_pii(make_config, make_note):
     ):
         await agent.run(note)
 
-    mem.add_claim.assert_not_awaited()
+    mem.add_claim.assert_awaited_once()
+    assert mem.add_claim.await_args.kwargs["subject"] == "alice"
 
 
 @pytest.mark.anyio

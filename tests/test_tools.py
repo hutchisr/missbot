@@ -473,14 +473,15 @@ async def test_remember_fact_skips_non_durable(make_config):
 
 
 @pytest.mark.anyio
-async def test_remember_fact_pii_backstop(make_config):
+async def test_remember_fact_stores_whatever_the_gate_allows(make_config):
     mem = _fake_memory()
-    # Even if the extractor allowed it, the code backstop must drop obvious PII.
-    claim = ExtractedClaim(subject="alice", predicate="email", object="alice@example.com")
+    # The private-information backstop was removed — the bot only stores facts it gleaned from
+    # public notes, so whatever the extractor structures into a claim is saved.
+    claim = ExtractedClaim(subject="alice", predicate="timezone", object="US/Pacific")
     remember = _find(build_tools(_memory_config(make_config), memory=mem, extractor=_extractor(claim)), "remember_fact")
-    result = await remember("alice's email is alice@example.com")
-    assert "personal or private" in result
-    mem.add_claim.assert_not_awaited()
+    result = await remember("alice is in US/Pacific")
+    assert "Saved" in result or "Updated" in result
+    mem.add_claim.assert_awaited_once()
 
 
 @pytest.mark.anyio
