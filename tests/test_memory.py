@@ -180,14 +180,17 @@ async def test_embed_batch_sends_dimensions_and_list_input(make_config):
 
 
 def test_recalled_claim_shape():
+    asserted_at = datetime(2026, 3, 1, tzinfo=timezone.utc)
     c = RecalledClaim(
         subject="Python",
         predicate="latest version",
         value_text="3.13",
         agreed_by=3,
         similarity=0.88,
+        recency=asserted_at,
         conflicts=[ConflictingClaim(value_text="3.12", agreed_by=1)],
     )
     assert c.agreed_by == 3
+    assert c.recency == asserted_at  # when the winner was last asserted, for staleness display
     assert c.conflicts[0].value_text == "3.12"
     assert c.conflicts[0].agreed_by == 1

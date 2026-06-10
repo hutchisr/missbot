@@ -12,7 +12,7 @@ import logfire
 from pydantic_ai import RunContext
 from redis.asyncio import Redis
 
-from .extract import ClaimExtraction, ExtractedClaim, Skip
+from .extract import ClaimExtraction, ExtractedClaims, Skip
 from .memory import MemoryStore, RecalledClaim
 from .models import Config
 
@@ -31,16 +31,29 @@ def _fence_untrusted(label: str, body: str) -> str:
     )
 
 
+def _agreement_label(agreed_by: int) -> str:
+    """Label for a value's agreement count.
+
+    Zero distinct (human) users means the value exists only as the bot's own remember_fact
+    claim — label it as such rather than "agreed by 0", which would read as contradicted.
+    """
+    return f"agreed by {agreed_by}" if agreed_by else "bot-remembered"
+
+
 def _render_recalled_claim(claim: RecalledClaim) -> str:
     """Render a recalled claim as one line: the most-agreed value, with any alternatives.
 
-    Shows how many distinct users assert the winning value (``agreed by N``) and lists
+    Shows how many distinct users assert the winning value (``agreed by N``) and when it was
+    last asserted (``as of <date>``, so the model can discount stale facts), and lists
     competing values with their own counts, so the model weighs agreement rather than
     treating recall as confirmed truth.
     """
-    line = f"- {claim.subject} — {claim.predicate}: {claim.value_text} [agreed by {claim.agreed_by}]"
+    line = (
+        f"- {claim.subject} — {claim.predicate}: {claim.value_text} "
+        f"[{_agreement_label(claim.agreed_by)}, as of {claim.recency.date().isoformat()}]"
+    )
     if claim.conflicts:
-        alts = "; ".join(f'"{c.value_text}" [agreed by {c.agreed_by}]' for c in claim.conflicts)
+        alts = "; ".join(f'"{c.value_text}" [{_agreement_label(c.agreed_by)}]' for c in claim.conflicts)
         line += f"\n    other values: {alts}"
     return line
 
@@ -409,24 +422,29 @@ def build_tools(
                         if since is not None and since < config.global_write_cooldown:
                             wait = int(config.global_write_cooldown - since)
                             return f"Saving facts too quickly; try again in about {wait}s."
-                    # Admission gate: structure the fact into a typed claim (speaker is the bot, so
+                    # Admission gate: structure the fact into typed claims (speaker is the bot, so
                     # a first-person statement resolves to it), or reject it.
                     extracted = await _extract(fact, speaker=config.bot_username, context=None)
                     if isinstance(extracted, Skip):
                         return f"Not stored — that isn't durable world knowledge ({extracted.reason})."
-                    if not isinstance(extracted, ExtractedClaim):
+                    if not isinstance(extracted, ExtractedClaims):
                         return "Couldn't structure that into a storable claim; not saved."
-                    result = await _memory.add_claim(
-                        subject=extracted.subject,
-                        predicate=extracted.predicate,
-                        object_text=extracted.object,
-                        author=_bot_author,
-                    )
+                    results = [
+                        await _memory.add_claim(
+                            subject=claim.subject,
+                            predicate=claim.predicate,
+                            object_text=claim.object,
+                            author=_bot_author,
+                        )
+                        for claim in extracted.claims
+                    ]
                 except Exception:
                     logfire.exception("Error storing claim via remember_fact")
                     return "Error saving to memory."
-                verb = "Updated" if result.updated else "Saved"
-                return f"{verb}: {result.subject} / {result.predicate}."
+                saved = "; ".join(
+                    f"{'Updated' if r.updated else 'Saved'}: {r.subject} / {r.predicate}" for r in results
+                )
+                return f"{saved}."
 
             tools.append(remember_fact)
 

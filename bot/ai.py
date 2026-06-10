@@ -21,6 +21,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.models import Model
 from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.models.openrouter import OpenRouterModelSettings
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
 import logfire
@@ -29,16 +30,18 @@ from redis.asyncio import Redis
 from .extract import (
     ENTITY_LINK_INSTRUCTIONS,
     EXTRACTION_INSTRUCTIONS,
+    RELATION_LINK_INSTRUCTIONS,
     ClaimExtraction,
     EntityMatch,
-    ExtractedClaim,
+    ExtractedClaims,
     Skip,
     build_entity_link_prompt,
     build_extraction_prompt,
+    build_relation_link_prompt,
     pick_entity_match,
 )
 from .mcp import build_mcp_toolsets, gate_names
-from .memory import EntityLinker, MemoryStore
+from .memory import EntityLinker, MemoryStore, RelationLinker
 from .models import Config, CustomOpenAIModel, Note, User
 from .net import is_safe_media_url
 from .scoring import ScoringSpec, build_scoring_prompt, build_scoring_spec
@@ -230,6 +233,18 @@ async def _guarded(coro: Awaitable[object], label: str) -> None:
 
 _FALLBACK_ON = (ModelAPIError, httpx.TimeoutException)
 
+# Run settings for the constrained-output classifier agents (scoring, claim extraction,
+# entity/relation linking). Their output types force a tool call (`tool_choice`), which
+# thinking-mode endpoints reject ("Thinking mode does not support this tool_choice") — so
+# reasoning is disabled (it's wasted on a labeling task anyway) and OpenRouter routing is
+# restricted to providers that support every request param (`require_parameters`). Both
+# extra keys are OpenRouter-namespaced and ignored by non-OpenRouter models.
+_CLASSIFIER_MODEL_SETTINGS: ModelSettings = OpenRouterModelSettings(
+    timeout=60.0,
+    openrouter_reasoning={"enabled": False},
+    openrouter_provider={"require_parameters": True},
+)
+
 
 def _model_chain(specs: list[Union[str, CustomOpenAIModel]]) -> Optional[Union[str, Model]]:
     """Resolve a list of model specs into a single model or a FallbackModel chain (or None)."""
@@ -261,9 +276,45 @@ def build_entity_linker(config: Config) -> Optional[EntityLinker]:
             return None
         names = [name for _, name in candidates]
         try:
-            result = await agent.run(build_entity_link_prompt(subject, names), model_settings={"timeout": 60.0})
+            result = await agent.run(
+                build_entity_link_prompt(subject, names), model_settings=_CLASSIFIER_MODEL_SETTINGS
+            )
         except Exception:
             logfire.exception("Entity linking failed — treating subject as a new entity")
+            return None
+        return pick_entity_match(result.output, candidates)
+
+    return link
+
+
+def build_relation_linker(config: Config) -> Optional[RelationLinker]:
+    """Build the consolidation-time relation-link classifier as a standalone async callable.
+
+    Decides whether a predicate asks the same question about an entity as one of its sibling
+    relations' predicates ("latest version" ~ "current version"), so the `consolidate`
+    maintenance pass can merge them and agreement counts stop fragmenting across phrasings.
+    Same constrained shape as the entity linker (an offered candidate id or None) and the same
+    failure mode (degrades to None — no merge — on any error). Wired by the maintenance CLI.
+    """
+    if not config.memory_enabled:
+        return None
+    chain = _model_chain(config.memory_extract_models or config.llm_models)
+    if chain is None:
+        return None
+    agent = Agent[None, EntityMatch](
+        chain, output_type=EntityMatch, instructions=[RELATION_LINK_INSTRUCTIONS], retries=2
+    )
+
+    async def link(subject: str, predicate: str, candidates: list[tuple[int, str]]) -> Optional[int]:
+        if not candidates:
+            return None
+        names = [name for _, name in candidates]
+        try:
+            result = await agent.run(
+                build_relation_link_prompt(subject, predicate, names), model_settings=_CLASSIFIER_MODEL_SETTINGS
+            )
+        except Exception:
+            logfire.exception("Relation linking failed — leaving the relations separate")
             return None
         return pick_entity_match(result.output, candidates)
 
@@ -345,7 +396,7 @@ class ChatAgent:
             # of a bare ``Union`` value passed to output_type.
             self._extract_agent = Agent[None, ClaimExtraction](
                 extract_model,
-                output_type=[ExtractedClaim, Skip],
+                output_type=[ExtractedClaims, Skip],
                 instructions=[EXTRACTION_INSTRUCTIONS],
                 retries=2,
             )
@@ -614,7 +665,7 @@ class ChatAgent:
             try:
                 scored = await self._score_agent.run(
                     build_scoring_prompt(text, context=self._render_context_lines(context) or None),
-                    model_settings={"timeout": 60.0},
+                    model_settings=_CLASSIFIER_MODEL_SETTINGS,
                 )
             except Exception:
                 logfire.exception(
@@ -674,7 +725,7 @@ class ChatAgent:
         ``speaker`` lets the extractor resolve first-person references to that handle (used
         by the note-ingestion path so a user's self-statement is attributed to them).
         ``context`` is the prior thread (reference-only) so cross-note references resolve.
-        Returns an ``ExtractedClaim``, a ``Skip`` (rejection with a reason), or None if the
+        Returns an ``ExtractedClaims``, a ``Skip`` (rejection with a reason), or None if the
         classifier itself failed. Never raises — a failed extraction just means the fact
         isn't stored; it must not break the reply path.
         """
@@ -683,7 +734,7 @@ class ChatAgent:
         try:
             result = await self._extract_agent.run(
                 build_extraction_prompt(fact, speaker=speaker, context=context),
-                model_settings={"timeout": 60.0},
+                model_settings=_CLASSIFIER_MODEL_SETTINGS,
             )
         except Exception:
             logfire.exception("Claim extraction failed — fact not stored (reply unaffected)")
@@ -691,15 +742,17 @@ class ChatAgent:
         return result.output
 
     async def _maybe_ingest_note(self, note: Note, context: Optional[list[Note]] = None) -> None:
-        """Learn a world-fact claim from the author's note, attributed to the author.
+        """Learn world-fact claims from the author's note, attributed to the author.
 
-        The claim's ``author`` is the note's author (set by code, not by anything the model
+        Each claim's ``author`` is the note's author (set by code, not by anything the model
         says), so distinct authors asserting the same value raise its agreement count. The
         author's handle is passed to the extractor so a self-statement ("I use Arch") resolves
         to a claim about them, and the prior thread (``context``) is supplied as reference-only
         material so cross-note references resolve (e.g. "her name is Olive" after "I have a pet
-        lizard"). Durable personal facts are allowed — the bot only ever sees public notes, so it
-        can't learn anything not already public. Rate-limited per author by ``global_write_cooldown``.
+        lizard"). One note can yield several claims (capped by the extraction schema); claims
+        below ``memory_min_confidence`` are dropped. Durable personal facts are allowed — the bot
+        only ever sees public notes, so it can't learn anything not already public. Rate-limited
+        per author by ``global_write_cooldown`` (checked once per note, before extraction).
         Never raises — must not break the reply.
         """
         if (
@@ -722,14 +775,22 @@ class ChatAgent:
                     logfire.debug("Note ingestion skipped (write cooldown)", author=author)
                     return
             extracted = await self._extract_claim(text, speaker=author, context=context_lines or None)
-            if not isinstance(extracted, ExtractedClaim):
+            if not isinstance(extracted, ExtractedClaims):
                 return
-            await self._memory.add_claim(
-                subject=extracted.subject,
-                predicate=extracted.predicate,
-                object_text=extracted.object,
-                author=author,
-            )
+            for claim in extracted.claims:
+                if claim.confidence < self._config.memory_min_confidence:
+                    logfire.debug(
+                        "Claim dropped (below confidence floor)",
+                        subject=claim.subject,
+                        confidence=claim.confidence,
+                    )
+                    continue
+                await self._memory.add_claim(
+                    subject=claim.subject,
+                    predicate=claim.predicate,
+                    object_text=claim.object,
+                    author=author,
+                )
         except Exception:
             logfire.exception("Note claim ingestion failed (reply unaffected)", author=author)
 

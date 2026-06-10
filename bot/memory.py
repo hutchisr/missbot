@@ -44,6 +44,7 @@ import re
 import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional, Union
 
 import asyncpg
@@ -58,10 +59,18 @@ from .models import Config
 # "new"). Set by the bot wiring; None in maintenance/headless contexts (deterministic
 # embedding fallback then applies).
 EntityLinker = Callable[[str, list[tuple[int, str]]], Awaitable[Optional[int]]]
+# Consolidation-time relation linking: given a subject name, a predicate, and sibling
+# (relation_id, predicate) candidates on the same entity, returns the id of the relation
+# asking the SAME question (or None). Wired by the maintenance CLI; used only by consolidate.
+RelationLinker = Callable[[str, str, list[tuple[int, str]]], Awaitable[Optional[int]]]
 # How many nearest entities to offer the linker, and the (broad) similarity floor below
 # which a candidate isn't even a plausible duplicate.
 _LINK_CANDIDATES = 8
 _LINK_FLOOR = 0.4
+# Candidate floor for the relation merge pass. Higher than _LINK_FLOOR: two questions about
+# the same subject share the subject text, which inflates their baseline similarity, so a
+# broad floor would offer nearly every sibling pair to the LLM.
+_RELATION_LINK_FLOOR = 0.6
 
 # Pool-acquired connections are proxies, not bare Connections; helpers accept either.
 _Conn = Union[asyncpg.Connection, PoolConnectionProxy]
@@ -208,6 +217,7 @@ class RecalledClaim:
     value_text: str
     agreed_by: int
     similarity: float
+    recency: datetime  # when the winning value was last asserted — lets the model discount stale facts
     conflicts: list[ConflictingClaim]
 
 
@@ -247,6 +257,9 @@ class MemoryStore:
         self._embed_headers = {"Authorization": f"Bearer {key}"} if key else {}
         # Optional write-time entity-linking classifier, injected by the bot wiring.
         self.entity_linker: Optional[EntityLinker] = None
+        # Optional consolidation-time relation-linking classifier (merges two phrasings of the
+        # same question on one entity), injected by the maintenance wiring.
+        self.relation_linker: Optional[RelationLinker] = None
         # Author whose claims are stored and recalled but excluded from the agreement count
         # (the bot itself, via remember_fact), injected by the bot wiring. None in
         # maintenance/headless contexts, where every author counts. See `search_claims`.
@@ -576,6 +589,16 @@ class MemoryStore:
             return int(nearest["id"])
         return None
 
+    async def _record_alias(self, conn: _Conn, entity_id: int, surface_form: str) -> None:
+        """Add ``surface_form`` to an entity's aliases (deduped; no-op when already known)."""
+        row = await conn.fetchrow("SELECT canonical_name, aliases FROM knowledge_entity WHERE id = $1", entity_id)
+        assert row is not None  # the caller just resolved this id
+        aliases = list(row["aliases"] or [])
+        merged = merge_aliases(row["canonical_name"], aliases, surface_form, [])
+        if merged != aliases:
+            await conn.execute("UPDATE knowledge_entity SET aliases = $1 WHERE id = $2", merged, entity_id)
+            logfire.info("Recorded entity alias", entity_id=entity_id, alias=surface_form)
+
     @logfire.instrument(extract_args=["subject", "predicate", "author"])
     async def add_claim(self, *, subject: str, predicate: str, object_text: str, author: str) -> ClaimWriteResult:
         """Record that ``author`` asserts ``object_text`` for (``subject``, ``predicate``).
@@ -583,7 +606,9 @@ class MemoryStore:
         **Per-author upsert:** each user holds at most one current value per relation; re-asserting
         a new value overwrites their own row ("changed my mind"). So ``COUNT(DISTINCT author)`` per
         value — the agreement count tallied at recall — reflects who *currently* asserts it. The
-        source is resolved (or created) as an entity; the ``(src, predicate)`` relation is resolved
+        source is resolved (or created) as an entity — a non-exact link (linker/threshold) also
+        records the submitted surface form as an alias of the linked entity, so the same form
+        exact-matches from then on; the ``(src, predicate)`` relation is resolved
         (or created); the value is linked to a destination entity only on an exact name/alias match
         (a relationship claim), otherwise it stays a literal grouped by its normalized text (an
         attribute claim).
@@ -633,6 +658,13 @@ class MemoryStore:
                     )
                     assert created is not None  # INSERT ... RETURNING always yields the id
                     src_entity_id = int(created)
+                elif name_vec is not None:
+                    # The subject was linked by the non-exact path (linker/threshold), so this
+                    # surface form is a confirmed alias of the entity. Record it: future writes of
+                    # the same form then take the exact-match fast path (no embedding/LLM call),
+                    # and exact-match-only *value* linking can see it too (so claims naming this
+                    # form become relationship claims instead of fragmenting agreement).
+                    await self._record_alias(conn, src_entity_id, subject)
 
                 if relation_id is None:
                     assert question_vec is not None  # set above whenever the relation was missing
@@ -779,6 +811,7 @@ class MemoryStore:
                     value_text=winner["value_text"],
                     agreed_by=winner["agreed_by"],
                     similarity=sim,
+                    recency=winner["recency"],
                     conflicts=conflicts,
                 )
             )
@@ -787,6 +820,21 @@ class MemoryStore:
         return claims[:k]
 
     # --- Maintenance (M4) --------------------------------------------------------
+
+    async def _fold_relation(self, conn: _Conn, keep_rel: int, dup_rel: int) -> None:
+        """Move ``dup_rel``'s claims onto ``keep_rel`` and delete the emptied ``dup_rel``.
+
+        One opinion per author per relation (``UNIQUE(author, relation_id)``): a dup-side claim
+        whose author already holds a keep-side claim is dropped first (the keep side wins).
+        """
+        await conn.execute(
+            "DELETE FROM knowledge_claim WHERE relation_id = $1 "
+            "AND author IN (SELECT author FROM knowledge_claim WHERE relation_id = $2)",
+            dup_rel,
+            keep_rel,
+        )
+        await conn.execute("UPDATE knowledge_claim SET relation_id = $1 WHERE relation_id = $2", keep_rel, dup_rel)
+        await conn.execute("DELETE FROM knowledge_relation WHERE id = $1", dup_rel)
 
     async def _merge_entity(self, conn: _Conn, keep: int, dup: int) -> None:
         """Fold entity ``dup`` into ``keep``: merge its relations + repoint claims, union aliases, mark merged.
@@ -807,18 +855,7 @@ class MemoryStore:
             if keep_rel is None:
                 await conn.execute("UPDATE knowledge_relation SET src_entity_id = $1 WHERE id = $2", keep, rel["id"])
             else:
-                # One opinion per author per relation: drop dup-side claims whose author already has a
-                # keep-side claim, move the rest onto the keep relation, then drop the empty dup.
-                await conn.execute(
-                    "DELETE FROM knowledge_claim WHERE relation_id = $1 "
-                    "AND author IN (SELECT author FROM knowledge_claim WHERE relation_id = $2)",
-                    rel["id"],
-                    keep_rel,
-                )
-                await conn.execute(
-                    "UPDATE knowledge_claim SET relation_id = $1 WHERE relation_id = $2", keep_rel, rel["id"]
-                )
-                await conn.execute("DELETE FROM knowledge_relation WHERE id = $1", rel["id"])
+                await self._fold_relation(conn, keep_rel=int(keep_rel), dup_rel=int(rel["id"]))
         # Repoint relationship-claim destinations that named the duplicate.
         await conn.execute("UPDATE knowledge_claim SET dst_entity_id = $1 WHERE dst_entity_id = $2", keep, dup)
         krow = await conn.fetchrow("SELECT canonical_name, aliases FROM knowledge_entity WHERE id = $1", keep)
@@ -965,9 +1002,82 @@ class MemoryStore:
             merged_away.add(dup)
         return merged
 
+    async def _merge_relations_by_llm(self) -> int:
+        """Merge two phrasings of the same question on one entity, via the relation linker (LLM).
+
+        Agreement only tallies within an exact ``(src, predicate)`` relation, so "latest version"
+        and "current version" claims about the same entity never corroborate each other — entities
+        get consolidated but predicates would otherwise fragment forever. For each entity holding
+        several relations, each relation's near siblings (question-embedding similarity at or above
+        ``_RELATION_LINK_FLOOR``) are offered to ``relation_linker``; on a confirmed same-question
+        match the higher-id relation folds into the lower (claims move via :meth:`_fold_relation`;
+        a same-author collision drops the dup side). The kept relation keeps its own question
+        embedding. Decisions are made with NO transaction held — each fold is its own short txn
+        re-checking both relations still live on that entity. No-op without a linker. Returns the
+        number of relations folded away.
+        """
+        if self.relation_linker is None:
+            return 0
+        async with self._pool.acquire() as conn:
+            entities = await conn.fetch(
+                "SELECT e.id, e.canonical_name FROM knowledge_entity e WHERE e.merged_into IS NULL "
+                "AND (SELECT count(*) FROM knowledge_relation r WHERE r.src_entity_id = e.id) > 1 "
+                "ORDER BY e.id"
+            )
+        merged = 0
+        for ent in entities:
+            ent_id = int(ent["id"])
+            async with self._pool.acquire() as conn:
+                relations = await conn.fetch(
+                    "SELECT id, predicate, embedding::text AS emb FROM knowledge_relation "
+                    "WHERE src_entity_id = $1 ORDER BY id",
+                    ent_id,
+                )
+            merged_away: set[int] = set()
+            for rel in relations:
+                rel_id = int(rel["id"])
+                if rel_id in merged_away:
+                    continue
+                async with self._pool.acquire() as conn:
+                    siblings = await conn.fetch(
+                        "SELECT id, predicate FROM knowledge_relation "
+                        "WHERE src_entity_id = $1 AND id <> $2 AND embedding <=> $3::vector <= $4 "
+                        "ORDER BY embedding <=> $3::vector LIMIT $5",
+                        ent_id,
+                        rel_id,
+                        rel["emb"],
+                        1.0 - _RELATION_LINK_FLOOR,
+                        _LINK_CANDIDATES,
+                    )
+                offered = [(int(s["id"]), s["predicate"]) for s in siblings if int(s["id"]) not in merged_away]
+                if not offered:
+                    continue
+                chosen = await self.relation_linker(ent["canonical_name"], rel["predicate"], offered)
+                if chosen not in {oid for oid, _ in offered}:
+                    continue
+                keep, dup = (chosen, rel_id) if chosen < rel_id else (rel_id, chosen)
+                async with self._pool.acquire() as conn:
+                    async with conn.transaction():
+                        still_live = await conn.fetchval(
+                            "SELECT count(*) FROM knowledge_relation WHERE id = ANY($1) AND src_entity_id = $2",
+                            [keep, dup],
+                            ent_id,
+                        )
+                        if still_live == 2:
+                            await self._fold_relation(conn, keep_rel=keep, dup_rel=dup)
+                            merged += 1
+                            logfire.info(
+                                "Merged duplicate relation",
+                                entity=ent["canonical_name"],
+                                keep_id=keep,
+                                dup_id=dup,
+                            )
+                merged_away.add(dup)
+        return merged
+
     @logfire.instrument()
     async def consolidate(self) -> dict[str, int]:
-        """Merge duplicate entities (name, then embedding, then optional LLM), then backfill links.
+        """Merge duplicate entities (name, then embedding, then optional LLM), then relations, then links.
 
         Pass 1 (:meth:`_merge_by_name`) collapses entities with an identical normalized name
         key — high precision, no embeddings. Pass 2 (:meth:`_merge_by_embedding`) is a
@@ -975,10 +1085,13 @@ class MemoryStore:
         (:meth:`_merge_by_llm`, when a linker is wired and ``entity_merge_llm``) heals
         fragmentation the deterministic passes miss. Merges fold relations/claims onto the keeper, so
         agreement counts re-tally automatically on the next recall — no recompute needed.
+        Then :meth:`_merge_relations_by_llm` (when a relation linker is wired and
+        ``relation_merge_llm``) merges two phrasings of the same question on one entity — run after
+        the entity passes, which can land same-question relations on one keeper.
         Finally :meth:`_backfill_relationship_links` exact-matches any unlinked claim value onto
         a live entity (heals write-time link staleness; run last so it sees the merged aliases).
         """
-        # Deterministic passes are atomic; the LLM pass makes decisions outside any
+        # Deterministic passes are atomic; the LLM passes make decisions outside any
         # transaction (each merge is its own short txn) so no transaction is held across an
         # LLM call.
         async with self._pool.acquire() as conn:
@@ -987,6 +1100,7 @@ class MemoryStore:
                 merged_by_embedding = await self._merge_by_embedding(conn)
 
         merged_by_llm = await self._merge_by_llm() if self._config.entity_merge_llm else 0
+        merged_relations = await self._merge_relations_by_llm() if self._config.relation_merge_llm else 0
 
         # Backfill last: merges above may have unioned duplicate names into keeper aliases,
         # exposing more exact value matches than existed at the claims' write time.
@@ -998,6 +1112,7 @@ class MemoryStore:
             "merged_by_name": merged_by_name,
             "merged_by_embedding": merged_by_embedding,
             "merged_by_llm": merged_by_llm,
+            "merged_relations": merged_relations,
             "relationship_links_backfilled": relationship_links_backfilled,
         }
         logfire.info("Consolidation complete", summary=summary)

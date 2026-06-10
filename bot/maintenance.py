@@ -3,7 +3,7 @@
 Runnable out-of-process (so it can be a k8s CronJob, separate from the long-running
 bot) via ``python -m bot.maintenance <command> -c /config.yaml``:
 
-    consolidate         merge duplicate entities (name/embedding/LLM), then backfill relationship links
+    consolidate         merge duplicate entities (name/embedding/LLM) + duplicate relations, then backfill links
     stats               print store counts (entities, claims, distinct sources/authors)
     reembed             regenerate ALL embeddings with the configured model (model swap / seed cleanup)
     calibrate-entities  print the most-similar entity pairs to help tune entity_match_threshold
@@ -21,7 +21,7 @@ import click
 import logfire
 import yaml
 
-from .ai import build_entity_linker
+from .ai import build_entity_linker, build_relation_linker
 from .memory import MemoryStore
 from .models import Config
 
@@ -35,10 +35,11 @@ def load_config(path: str) -> Config:
 def _run(config_path: str, action: Callable[[MemoryStore], Awaitable[Any]], *, skip_dim_check: bool = False) -> Any:
     """Build a MemoryStore from config, run ``action`` against it, then close it.
 
-    The entity linker is wired in so the consolidation LLM merge pass works here in the
-    headless CronJob (which has no ChatAgent). ``skip_dim_check`` is for the ``reembed`` command,
-    which is about to re-dimension and repopulate the vectors, so the startup dimension guard
-    (which would otherwise abort on a model/dim change) must be suppressed.
+    The entity and relation linkers are wired in so the consolidation LLM merge passes work
+    here in the headless CronJob (which has no ChatAgent). ``skip_dim_check`` is for the
+    ``reembed`` command, which is about to re-dimension and repopulate the vectors, so the
+    startup dimension guard (which would otherwise abort on a model/dim change) must be
+    suppressed.
     """
 
     async def _main() -> Any:
@@ -47,6 +48,7 @@ def _run(config_path: str, action: Callable[[MemoryStore], Awaitable[Any]], *, s
             raise click.ClickException("memory_enabled must be true in the config to run maintenance")
         store = await MemoryStore.create(config, skip_dim_check=skip_dim_check)
         store.entity_linker = build_entity_linker(config)
+        store.relation_linker = build_relation_linker(config)
         try:
             return await action(store)
         finally:
@@ -76,7 +78,7 @@ def cli() -> None:
 @cli.command()
 @_config_option
 def consolidate(config_path: str) -> None:
-    """Merge duplicate entities (name/embedding/LLM), then backfill stale relationship links."""
+    """Merge duplicate entities (name/embedding/LLM) and same-question relations, then backfill links."""
     summary = _run(config_path, lambda store: store.consolidate())
     click.echo(json.dumps(summary))
 

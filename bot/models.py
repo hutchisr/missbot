@@ -421,6 +421,21 @@ class Config(BaseModel):
         "confirmed same-entity matches. Heals existing fragmentation the deterministic passes miss. Requires a "
         "model; set false to skip the extra LLM calls per run.",
     )
+    relation_merge_llm: bool = Field(
+        default=True,
+        description="In the `consolidate` maintenance pass, also merge near-duplicate relations on the same "
+        "entity (two phrasings of the same question, e.g. 'latest version' / 'current version') via a "
+        "constrained LLM relation-link classifier, so agreement counts don't fragment across predicate "
+        "phrasings. Requires a model; set false to skip the extra LLM calls per run.",
+    )
+    memory_min_confidence: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Confidence floor for auto-ingesting note claims: extracted claims whose extractor "
+        "confidence (0..1, how sure it is the text actually asserts the claim) is below this are dropped. "
+        "Does not apply to remember_fact (a deliberate store by the bot). Set 0 to keep every extracted claim.",
+    )
     memory_extract_models: List[Union[str, CustomOpenAIModel]] = Field(
         default_factory=list,
         description="Model chain for the claim-extraction classifier that turns a submitted fact into a "

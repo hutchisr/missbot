@@ -6,8 +6,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from pydantic_ai import ImageUrl
 
-from bot.ai import ChatAgent, build_entity_linker
-from bot.extract import ExtractedClaim, Skip
+from bot.ai import ChatAgent, build_entity_linker, build_relation_linker
+from bot.extract import ExtractedClaim, ExtractedClaims, Skip
 from bot.models import MiFile
 
 
@@ -263,6 +263,11 @@ def _memory_cfg(make_config, **extra):
     )
 
 
+def _claims(*claims: ExtractedClaim) -> ExtractedClaims:
+    """Wrap claims in the accepted extraction branch (one note can assert several)."""
+    return ExtractedClaims(claims=list(claims))
+
+
 @pytest.mark.anyio
 async def test_run_ingests_note_as_claim(make_config, make_note):
     mem = AsyncMock()
@@ -273,7 +278,7 @@ async def test_run_ingests_note_as_claim(make_config, make_note):
 
     with (
         patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
-        patch.object(agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=claim))),
+        patch.object(agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=_claims(claim)))),
     ):
         out = await agent.run(note)
 
@@ -288,6 +293,51 @@ async def test_run_ingests_note_as_claim(make_config, make_note):
 
 
 @pytest.mark.anyio
+async def test_run_ingests_multiple_claims_from_one_note(make_config, make_note):
+    mem = AsyncMock()
+    mem.seconds_since_last_write.return_value = None
+    agent = ChatAgent(_memory_cfg(make_config), memory=mem)
+    note = make_note(text="I live in Berlin and work at ACME")
+    extraction = _claims(
+        ExtractedClaim(subject="alice", predicate="lives in", object="Berlin"),
+        ExtractedClaim(subject="alice", predicate="works at", object="ACME"),
+    )
+
+    with (
+        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
+        patch.object(agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=extraction))),
+    ):
+        await agent.run(note)
+
+    # One note asserting several independent facts stores one claim per fact.
+    assert mem.add_claim.await_count == 2
+    objects = [c.kwargs["object_text"] for c in mem.add_claim.await_args_list]
+    assert objects == ["Berlin", "ACME"]
+
+
+@pytest.mark.anyio
+async def test_run_note_ingestion_drops_low_confidence_claims(make_config, make_note):
+    mem = AsyncMock()
+    mem.seconds_since_last_write.return_value = None
+    agent = ChatAgent(_memory_cfg(make_config), memory=mem)  # default memory_min_confidence = 0.5
+    note = make_note(text="Python 3.13 is out, and I think maybe Guido likes it?")
+    extraction = _claims(
+        ExtractedClaim(subject="Python", predicate="latest version", object="3.13", confidence=0.9),
+        ExtractedClaim(subject="Guido", predicate="likes", object="Python 3.13", confidence=0.2),
+    )
+
+    with (
+        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
+        patch.object(agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=extraction))),
+    ):
+        await agent.run(note)
+
+    # Only the claim at/above the confidence floor is stored.
+    mem.add_claim.assert_awaited_once()
+    assert mem.add_claim.await_args.kwargs["subject"] == "Python"
+
+
+@pytest.mark.anyio
 async def test_run_note_ingestion_respects_write_cooldown(make_config, make_note):
     mem = AsyncMock()
     mem.seconds_since_last_write.return_value = 5.0  # within the default 60s cooldown
@@ -298,7 +348,7 @@ async def test_run_note_ingestion_respects_write_cooldown(make_config, make_note
     with (
         patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
         patch.object(
-            agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=claim))
+            agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=_claims(claim)))
         ) as extract_mock,
     ):
         await agent.run(note)
@@ -355,7 +405,7 @@ async def test_run_note_ingestion_passes_speaker_to_extractor(make_config, make_
     with (
         patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
         patch.object(
-            agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=claim))
+            agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=_claims(claim)))
         ) as extract_mock,
     ):
         await agent.run(note)
@@ -380,7 +430,7 @@ async def test_run_note_ingestion_stores_whatever_the_gate_allows(make_config, m
 
     with (
         patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
-        patch.object(agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=claim))),
+        patch.object(agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=_claims(claim)))),
     ):
         await agent.run(note)
 
@@ -400,7 +450,7 @@ async def test_run_note_ingestion_supplies_thread_context(make_config, make_note
     with (
         patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
         patch.object(
-            agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=claim))
+            agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=_claims(claim)))
         ) as extract_mock,
     ):
         await agent.run(note, context=[parent])
@@ -431,3 +481,8 @@ def test_entity_linker_absent_without_memory(make_config):
 def test_build_entity_linker_only_when_memory_enabled(make_config):
     assert build_entity_linker(make_config()) is None  # disabled => no linker
     assert callable(build_entity_linker(_memory_cfg(make_config)))  # enabled => a callable
+
+
+def test_build_relation_linker_only_when_memory_enabled(make_config):
+    assert build_relation_linker(make_config()) is None  # disabled => no linker
+    assert callable(build_relation_linker(_memory_cfg(make_config)))  # enabled => a callable

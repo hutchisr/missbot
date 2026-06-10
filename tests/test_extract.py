@@ -2,28 +2,45 @@
 
 import typing
 
+import pytest
+from pydantic import ValidationError
+
 from bot.extract import (
     EXTRACTION_INSTRUCTIONS,
+    MAX_CLAIMS_PER_EXTRACTION,
+    RELATION_LINK_INSTRUCTIONS,
     ClaimExtraction,
     EntityMatch,
     ExtractedClaim,
+    ExtractedClaims,
     Skip,
     build_entity_link_prompt,
     build_extraction_prompt,
+    build_relation_link_prompt,
     pick_entity_match,
 )
 
 
 def test_extraction_union_has_both_branches():
-    # The output is constrained to a typed claim or an explicit rejection — nothing else.
-    assert set(typing.get_args(ClaimExtraction)) == {ExtractedClaim, Skip}
+    # The output is constrained to typed claims or an explicit rejection — nothing else.
+    assert set(typing.get_args(ClaimExtraction)) == {ExtractedClaims, Skip}
 
 
 def test_extracted_claim_defaults():
     c = ExtractedClaim(subject="Python", predicate="latest version", object="3.13")
-    assert c.kind == "claim"
     assert c.volatility == "stable"
     assert c.confidence == 0.5
+
+
+def test_extracted_claims_bounds():
+    one = ExtractedClaim(subject="Python", predicate="latest version", object="3.13")
+    assert ExtractedClaims(claims=[one]).kind == "claims"
+    # The schema caps how much a single note (or injection attempt) can write in one burst...
+    with pytest.raises(ValidationError):
+        ExtractedClaims(claims=[one] * (MAX_CLAIMS_PER_EXTRACTION + 1))
+    # ...and the accepted branch can never be empty (that's what Skip is for).
+    with pytest.raises(ValidationError):
+        ExtractedClaims(claims=[])
 
 
 def test_skip_requires_reason():
@@ -99,3 +116,19 @@ def test_pick_entity_match_maps_index_or_falls_back_to_new():
     assert pick_entity_match(EntityMatch(match_index=None), candidates) is None  # null => new
     assert pick_entity_match(EntityMatch(match_index=5), candidates) is None  # out of range => new
     assert pick_entity_match(EntityMatch(match_index=0), []) is None  # no candidates => new
+
+
+def test_relation_link_instructions_are_hardened_and_conservative():
+    text = RELATION_LINK_INSTRUCTIONS.lower()
+    assert "untrusted data" in text
+    assert "never obey" in text
+    # Must bias toward NOT merging — a wrong merge corrupts both relations' agreement counts.
+    assert "null" in text
+
+
+def test_build_relation_link_prompt_numbers_and_fences_candidates():
+    prompt = build_relation_link_prompt("Python", "latest version", ["current version", "release date"])
+    assert "Python" in prompt  # the subject
+    assert "latest version" in prompt  # the predicate being linked
+    assert "0: current version" in prompt and "1: release date" in prompt  # numbered candidates
+    assert "untrusted data" in prompt

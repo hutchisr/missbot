@@ -33,6 +33,7 @@ def _invoke(args, cfg, fake_store):
         patch("bot.maintenance.logfire.configure"),
         patch("bot.maintenance.load_config", return_value=cfg),
         patch("bot.maintenance.build_entity_linker", return_value=None),
+        patch("bot.maintenance.build_relation_linker", return_value=None),
         patch("bot.maintenance.MemoryStore.create", AsyncMock(return_value=fake_store)),
     ):
         return runner.invoke(cli, args)
