@@ -256,6 +256,31 @@ def _model_chain(specs: list[Union[str, CustomOpenAIModel]]) -> Optional[Union[s
     return FallbackModel(*resolved, fallback_on=_FALLBACK_ON)
 
 
+def _build_match_agent(config: Config, instructions: str) -> Optional[Agent[None, EntityMatch]]:
+    """Build a constrained candidate-pick agent (shared by entity and relation linking).
+
+    Returns None when memory is disabled or no model chain is configured.
+    """
+    if not config.memory_enabled:
+        return None
+    chain = _model_chain(config.memory_extract_models or config.llm_models)
+    if chain is None:
+        return None
+    return Agent[None, EntityMatch](chain, output_type=EntityMatch, instructions=[instructions], retries=2)
+
+
+async def _run_match(
+    agent: Agent[None, EntityMatch], prompt: str, candidates: list[tuple[int, str]], failure_msg: str
+) -> Optional[int]:
+    """Run a candidate-pick agent and map its answer to a candidate id; None on any error."""
+    try:
+        result = await agent.run(prompt, model_settings=_CLASSIFIER_MODEL_SETTINGS)
+    except Exception:
+        logfire.exception(failure_msg)
+        return None
+    return pick_entity_match(result.output, candidates)
+
+
 def build_entity_linker(config: Config) -> Optional[EntityLinker]:
     """Build the write-time entity-link classifier as a standalone async callable.
 
@@ -264,25 +289,20 @@ def build_entity_linker(config: Config) -> Optional[EntityLinker]:
     which has no ChatAgent). The callable returns the chosen entity id or None ("new"); it
     only ever returns one of the offered candidate ids, and degrades to None on any error.
     """
-    if not config.memory_enabled:
+    agent = _build_match_agent(config, ENTITY_LINK_INSTRUCTIONS)
+    if agent is None:
         return None
-    chain = _model_chain(config.memory_extract_models or config.llm_models)
-    if chain is None:
-        return None
-    agent = Agent[None, EntityMatch](chain, output_type=EntityMatch, instructions=[ENTITY_LINK_INSTRUCTIONS], retries=2)
 
     async def link(subject: str, candidates: list[tuple[int, str]]) -> Optional[int]:
         if not candidates:
             return None
         names = [name for _, name in candidates]
-        try:
-            result = await agent.run(
-                build_entity_link_prompt(subject, names), model_settings=_CLASSIFIER_MODEL_SETTINGS
-            )
-        except Exception:
-            logfire.exception("Entity linking failed — treating subject as a new entity")
-            return None
-        return pick_entity_match(result.output, candidates)
+        return await _run_match(
+            agent,
+            build_entity_link_prompt(subject, names),
+            candidates,
+            "Entity linking failed — treating subject as a new entity",
+        )
 
     return link
 
@@ -296,27 +316,20 @@ def build_relation_linker(config: Config) -> Optional[RelationLinker]:
     Same constrained shape as the entity linker (an offered candidate id or None) and the same
     failure mode (degrades to None — no merge — on any error). Wired by the maintenance CLI.
     """
-    if not config.memory_enabled:
+    agent = _build_match_agent(config, RELATION_LINK_INSTRUCTIONS)
+    if agent is None:
         return None
-    chain = _model_chain(config.memory_extract_models or config.llm_models)
-    if chain is None:
-        return None
-    agent = Agent[None, EntityMatch](
-        chain, output_type=EntityMatch, instructions=[RELATION_LINK_INSTRUCTIONS], retries=2
-    )
 
     async def link(subject: str, predicate: str, candidates: list[tuple[int, str]]) -> Optional[int]:
         if not candidates:
             return None
         names = [name for _, name in candidates]
-        try:
-            result = await agent.run(
-                build_relation_link_prompt(subject, predicate, names), model_settings=_CLASSIFIER_MODEL_SETTINGS
-            )
-        except Exception:
-            logfire.exception("Relation linking failed — leaving the relations separate")
-            return None
-        return pick_entity_match(result.output, candidates)
+        return await _run_match(
+            agent,
+            build_relation_link_prompt(subject, predicate, names),
+            candidates,
+            "Relation linking failed — leaving the relations separate",
+        )
 
     return link
 
