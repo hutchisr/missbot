@@ -55,4 +55,5 @@ mise run bot
 
 ## License
 
-MIT — see [LICENSE.md](LICENSE.md).
+Dual-licensed under the **MIT License** or the **Grok Public License, Version 1**,
+at your option — see [LICENSE.md](LICENSE.md).
