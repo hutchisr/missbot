@@ -84,8 +84,8 @@ SOFTWARE.
 
     if u distribute the Software or a modified version of it, u gotta:
 
-      (a) keep this license (or the MIT option) attached, so the next random
-          person inherits the same freedoms u got ^_^; and
+      (a) keep this license attached, so the next random person inherits the
+          same freedoms u got ^_^; and
 
       (b) NOT slap on extra restrictions that take those freedoms away >:(
 
@@ -142,12 +142,6 @@ SOFTWARE.
     automatically >:( BUT if u fix wat u broke and stop being a jerk (Clause
     4) the license quietly comes back, no hard feelings ^_^ the more the
     merrier!!!!
-
- 10. CHOICE OF LICENSE.
-
-    remember: this is 1 of TWO doors!!! if any of the above made u
-    uncomfortable, the MIT License is right there — plain, serious, no jokes,
-    no "!!!"… use THAT 1. the Software does not mind =)
 
               END OF TERMS AND CONDITIONS!!! ^_^ hehe… toodles!!!
 
