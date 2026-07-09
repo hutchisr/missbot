@@ -288,6 +288,24 @@ async def test_run_note_ingestion_disabled_by_flag(make_config, make_note):
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("visibility", ["followers", "specified"])
+async def test_run_note_ingestion_skips_restricted_notes_even_when_dm_replies_enabled(
+    make_config, make_note, visibility
+):
+    mem = AsyncMock()
+    cfg = _memory_cfg(make_config, ignore_direct_messages=False)
+    agent = ChatAgent(cfg, memory=mem)
+    note = make_note(text="restricted account recovery code").model_copy(update={"visibility": visibility})
+
+    with patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="private reply"))) as run_mock:
+        out = await agent.run(note)
+
+    assert out == "private reply"
+    assert run_mock.await_args.kwargs["deps"].memory_writes_allowed is False
+    mem.add_note.assert_not_awaited()
+
+
+@pytest.mark.anyio
 async def test_run_note_ingestion_skips_empty_text(make_config, make_note):
     mem = AsyncMock()
     agent = ChatAgent(_memory_cfg(make_config), memory=mem)

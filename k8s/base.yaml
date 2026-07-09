@@ -44,8 +44,8 @@ spec:
               cpu: "1000m"
       volumes:
         - name: config-volume
-          configMap:
-            name: missbot-config
+          secret:
+            secretName: missbot-config
 status: {}
 ---
 apiVersion: v1

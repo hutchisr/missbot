@@ -43,6 +43,18 @@ Or via Mise:
 mise run bot
 ```
 
+## Kubernetes
+
+Copy the runtime configuration to `k8s/config.yaml` and put environment-style
+provider secrets in `k8s/secrets.txt`; both files are ignored by Git. Kustomize
+generates Kubernetes Secrets for them, including the config file because it
+contains the Misskey token and may contain database credentials.
+
+```bash
+cp config.example.yaml k8s/config.yaml
+mise run deploy
+```
+
 ## Project Layout
 
 - [bot/bot.py](bot/bot.py) — WebSocket client and message routing

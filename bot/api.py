@@ -16,6 +16,7 @@ from .models import Config
 
 
 _RETRY_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+_RETRY_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
 class _RetryableStatus(Exception):
@@ -41,23 +42,43 @@ def _log_retry(retry_state: RetryCallState) -> None:
     )
 
 
+async def _close_retryable_response(retry_state: RetryCallState) -> None:
+    """Close a response that will be discarded before the next attempt."""
+    exc = retry_state.outcome.exception() if retry_state.outcome else None
+    if isinstance(exc, _RetryableStatus):
+        await exc.response.aclose()
+    _log_retry(retry_state)
+
+
 class RetryTransport(httpx.AsyncBaseTransport):
-    """Wraps a transport to retry transient failures with exponential backoff + jitter."""
+    """Retry transient failures for requests that are safe to replay."""
 
     def __init__(self, wrapped: httpx.AsyncBaseTransport, max_retries: int):
         self._wrapped = wrapped
-        self._retrying = AsyncRetrying(
-            stop=stop_after_attempt(max_retries + 1),
+        self._max_retries = max_retries
+
+    def _retrying(self) -> AsyncRetrying:
+        # AsyncRetrying keeps mutable per-call state, so do not share one across
+        # concurrent requests.
+        return AsyncRetrying(
+            stop=stop_after_attempt(self._max_retries + 1),
             wait=wait_random_exponential(multiplier=0.5, max=30),
             retry=retry_if_exception_type((httpx.TransportError, _RetryableStatus)),
-            before_sleep=_log_retry,
+            before_sleep=_close_retryable_response,
             reraise=True,
         )
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        # Misskey uses POST for reads as well as writes. Retrying any POST after
+        # an ambiguous transport failure could duplicate a note or other action.
+        if request.method not in _RETRY_METHODS:
+            return await self._wrapped.handle_async_request(request)
+
         try:
-            return await self._retrying(self._send_once, request)
+            return await self._retrying()(self._send_once, request)
         except _RetryableStatus as exc:
+            # Tenacity only invokes before_sleep when another attempt will run,
+            # so the exhausted response remains open for the caller to inspect.
             return exc.response
 
     async def _send_once(self, request: httpx.Request) -> httpx.Response:
@@ -81,10 +102,14 @@ class ApiClient:
         with self.__lock:
             if self.__async_client is None:
                 if self.__config:
-                    base_transport = httpx.AsyncHTTPTransport(retries=self.__config.max_retries)
+                    # RetryTransport is the sole retry layer. httpx transport
+                    # retries here would compound attempts and bypass method
+                    # safety decisions made by the wrapper.
+                    base_transport = httpx.AsyncHTTPTransport(retries=0)
                     self.__async_client = httpx.AsyncClient(
                         transport=RetryTransport(base_transport, max_retries=self.__config.max_retries),
                         headers={"Authorization": f"Bearer {self.__config.token}"},
+                        timeout=httpx.Timeout(self.__config.http_timeout_seconds),
                     )
                 else:
                     logfire.warning("API client accessed before configuration")

@@ -5,7 +5,7 @@ resources:
 - base.yaml
 generatorOptions:
   disableNameSuffixHash: true
-configMapGenerator:
+secretGenerator:
 - name: missbot-config
   namespace: misskey
   files:
@@ -13,7 +13,6 @@ configMapGenerator:
   options:
     labels:
       app.kubernetes.io/name: missbot
-secretGenerator:
 - name: missbot-secrets
   namespace: misskey
   envs:

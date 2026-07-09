@@ -35,6 +35,9 @@ from .scoring import ScoringSpec, build_scoring_prompt, build_scoring_spec
 from .tools import apply_social_credit, build_tools, normalize_username
 
 
+_RESTRICTED_MEMORY_VISIBILITIES = frozenset({"followers", "specified"})
+
+
 @dataclass
 class _ProviderReportedPrice:
     input_price: Decimal
@@ -186,6 +189,8 @@ class AgentDeps:
     """The bot's most recent reply in this thread, if any. Used by the verbatim-repeat
     output validator to reject a reply that just parrots the prior turn (a failure mode of
     weaker fallback models when the new message is a thin same-topic follow-up)."""
+    memory_writes_allowed: bool = True
+    """False for followers-only/private notes so global memory cannot retain restricted content."""
 
 
 def _make_enable_gate_tool(gate: str, servers: list[str]):
@@ -497,6 +502,7 @@ class ChatAgent:
             social_credit_score=score,
             social_credit_unrestricted=unrestricted,
             previous_bot_reply=previous_bot_reply,
+            memory_writes_allowed=note.visibility not in _RESTRICTED_MEMORY_VISIBILITIES,
         )
 
         run_kwargs: dict[str, Any] = {
@@ -621,6 +627,10 @@ class ChatAgent:
         ``_guarded`` in ``run`` and also catches its own errors so memory never breaks replies.
         """
         if self._memory is None or not self._config.memory_enabled or not self._config.memory_ingest_notes:
+            return
+        # Followers-only and direct/specified notes may be replyable, but their
+        # restricted content must never enter the bot-global memory namespace.
+        if note.visibility in _RESTRICTED_MEMORY_VISIBILITIES:
             return
         text = (note.text or "").strip()
         if not text:

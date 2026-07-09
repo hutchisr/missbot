@@ -4,7 +4,9 @@ import re
 import time
 
 import asyncio
-from typing import Optional
+from collections import deque
+from collections.abc import Callable, Coroutine
+from typing import Any, Optional
 from pydantic import ValidationError
 from redis.asyncio import Redis
 from websockets import ClientConnection, ConnectionClosed
@@ -27,6 +29,7 @@ from .api import api_client
 
 
 _REDIS_AUTO_REPLY_KEY = "global:last_auto_reply_time"
+_RECENT_NOTE_ID_LIMIT = 1024
 
 
 class Bot:
@@ -52,7 +55,15 @@ class Bot:
         self._next_auto_reply_delay: float = self._compute_auto_reply_delay()
         # Strong refs for fire-and-forget handler tasks; asyncio holds only weakrefs,
         # so without this the tasks can be GC'd mid-run.
-        self._background_tasks: set[asyncio.Task] = set()
+        self._background_tasks: set[asyncio.Task[Any]] = set()
+        # A public mention can arrive on both the main and global-timeline channels.
+        # Coordinate those paths by note id so only one successful handler runs. A
+        # timeline event that is not due does not count as handled, allowing the main
+        # mention to proceed.
+        self._note_processing_lock = asyncio.Lock()
+        self._note_processing: dict[str, asyncio.Future[bool]] = {}
+        self._recent_note_ids: deque[str] = deque()
+        self._recent_note_id_set: set[str] = set()
 
     @logfire.instrument(extract_args=["note"])
     async def on_mention(self, note: Note):
@@ -158,13 +169,21 @@ class Bot:
         return bool(_image_urls_for(note, self._config.vision))
 
     def _reply_visibility(self, note: Optional[Note]) -> str:
+        # "followers" is relative to the author. Reusing it on a bot-authored
+        # reply could expose the response to the bot's followers while hiding it
+        # from the source author, so narrow followers-only replies to that author.
+        if note and note.visibility == "followers":
+            return "specified"
         if note and note.visibility:
             return note.visibility
         return "public"
 
     def _reply_visible_user_ids(self, note: Optional[Note]) -> list[str]:
-        if not note or note.visibility != "specified":
+        if not note or note.visibility not in {"followers", "specified"}:
             return []
+
+        if note.visibility == "followers":
+            return [note.user.id] if note.user.id and note.user.id != self.user_id else []
 
         recipients: list[str] = []
         if note.visibleUserIds:
@@ -267,15 +286,15 @@ class Bot:
         jitter = self._config.auto_reply_jitter
         return interval + random.randint(-jitter, jitter) if jitter else interval
 
-    async def on_auto_reply(self, note: Note):
+    async def on_auto_reply(self, note: Note) -> bool:
         """Automatically reply to a timeline note if enough time has passed."""
         if not self._note_has_prompt_content(note):
-            return
+            return False
 
         now = time.time()
         elapsed = now - self._last_auto_reply_time
         if elapsed < self._next_auto_reply_delay:
-            return
+            return False
 
         self._last_auto_reply_time = now
         self._next_auto_reply_delay = self._compute_auto_reply_delay()
@@ -284,6 +303,7 @@ class Bot:
 
         logfire.info("Auto-reply triggered", note=note)
         await self.on_mention(note)
+        return True
 
     @logfire.instrument(extract_args=False)
     async def post_autonomous(self):
@@ -331,7 +351,12 @@ class Bot:
             await self._load_last_auto_reply_time()
 
         async with self._agent:
-            await self._run_loop()
+            try:
+                await self._run_loop()
+            finally:
+                # Handler tasks use the agent, Redis, and memory store. Stop them
+                # before ChatAgent.__aexit__ closes those shared resources.
+                await self._cancel_background_tasks()
 
     async def _run_loop(self):
         auto_post_task: Optional[asyncio.Task] = None
@@ -389,7 +414,7 @@ class Bot:
                 await self._cancel_and_wait(auto_post_task)
 
     @staticmethod
-    async def _cancel_and_wait(*tasks: asyncio.Task):
+    async def _cancel_and_wait(*tasks: asyncio.Task[Any]):
         for task in tasks:
             if not task.done():
                 task.cancel()
@@ -407,9 +432,17 @@ class Bot:
                 msg = MiWebsocketMessage(**json.loads(message))
                 if msg.type == "channel" and msg.body and msg.body.body:
                     if msg.body.type == "mention":
-                        self._spawn_background_task(self.on_mention(msg.body.body))
+                        note = msg.body.body
+                        self._spawn_background_task(
+                            lambda: self._process_note_event(note, auto_reply=False),
+                            note_id=note.id,
+                        )
                     elif msg.body.type == "note" and self._config.auto_reply_enabled:
-                        self._spawn_background_task(self.on_auto_reply(msg.body.body))
+                        note = msg.body.body
+                        self._spawn_background_task(
+                            lambda: self._process_note_event(note, auto_reply=True),
+                            note_id=note.id,
+                        )
             except ValidationError as e:
                 logfire.debug(f"Validation error: {e}. Message doesn't match expected format, ignoring.")
                 pass
@@ -419,15 +452,84 @@ class Bot:
             except Exception:
                 logfire.exception("Error processing message")
 
-    def _spawn_background_task(self, coro) -> asyncio.Task:
-        """Create a tracked background task (holds a strong ref, logs failures)."""
-        task = asyncio.create_task(coro)
+    async def _process_note_event(self, note: Note, *, auto_reply: bool) -> None:
+        """Deduplicate main/timeline delivery while preserving main mentions."""
+        while True:
+            async with self._note_processing_lock:
+                if note.id in self._recent_note_id_set:
+                    return
+
+                pending = self._note_processing.get(note.id)
+                if pending is None:
+                    pending = asyncio.get_running_loop().create_future()
+                    self._note_processing[note.id] = pending
+                    owns_processing = True
+                else:
+                    owns_processing = False
+
+            if not owns_processing:
+                if await asyncio.shield(pending):
+                    return
+                # The prior timeline delivery was not due, or the handler failed.
+                # Compete for ownership again so a main mention can still run.
+                continue
+
+            handled = False
+            try:
+                if auto_reply:
+                    handled = await self.on_auto_reply(note)
+                else:
+                    await self.on_mention(note)
+                    handled = True
+            finally:
+                async with self._note_processing_lock:
+                    if handled:
+                        self._remember_note_id(note.id)
+                    if self._note_processing.get(note.id) is pending:
+                        del self._note_processing[note.id]
+                    if not pending.done():
+                        pending.set_result(handled)
+            return
+
+    def _remember_note_id(self, note_id: str) -> None:
+        if note_id in self._recent_note_id_set:
+            return
+        if len(self._recent_note_ids) >= _RECENT_NOTE_ID_LIMIT:
+            self._recent_note_id_set.discard(self._recent_note_ids.popleft())
+        self._recent_note_ids.append(note_id)
+        self._recent_note_id_set.add(note_id)
+
+    def _spawn_background_task(
+        self,
+        coro_factory: Callable[[], Coroutine[Any, Any, Any]],
+        *,
+        note_id: str,
+    ) -> Optional[asyncio.Task[Any]]:
+        """Create a tracked handler task, dropping work above the configured bound."""
+        capacity = self._config.max_concurrent_handlers
+        if len(self._background_tasks) >= capacity:
+            logfire.warning(
+                "Dropping note because handler capacity is full",
+                note_id=note_id,
+                capacity=capacity,
+            )
+            return None
+
+        # Invoke the factory only after the capacity check so overload never
+        # leaves an unawaited coroutine object behind.
+        task = asyncio.create_task(coro_factory())
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
         task.add_done_callback(self._task_done_callback)
         return task
 
-    def _task_done_callback(self, task: asyncio.Task):
+    async def _cancel_background_tasks(self) -> None:
+        tasks = tuple(self._background_tasks)
+        if tasks:
+            await self._cancel_and_wait(*tasks)
+        self._background_tasks.difference_update(tasks)
+
+    def _task_done_callback(self, task: asyncio.Task[Any]):
         """Handle completed tasks - log exceptions and discard."""
         if task.cancelled():
             return

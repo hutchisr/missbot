@@ -14,6 +14,7 @@ allowlist if your instance proxies all media.
 """
 
 import ipaddress
+import socket
 from urllib.parse import urlsplit
 
 # Internal-by-convention names that should never be reachable media hosts.
@@ -57,13 +58,23 @@ def is_safe_media_url(url: str) -> bool:
     except ValueError:
         pass  # not an IP literal — treat as a hostname
 
+    # ``ipaddress`` deliberately accepts only canonical text, but system resolvers also
+    # understand legacy dotted-hex/octal forms (for example ``0xa9.0xfe.0xa9.0xfe`` ->
+    # 169.254.169.254). Reject anything inet_aton recognizes here: canonical IPv4 literals
+    # already returned above, so a match at this point is necessarily an obfuscated address.
+    try:
+        socket.inet_aton(host)
+    except OSError:
+        pass
+    else:
+        return False
+
     if host in _BLOCKED_HOSTS or host.endswith(_BLOCKED_HOST_SUFFIXES):
         return False
     # Bare single-label hosts ("redis", "db") resolve to internal services.
     if "." not in host:
         return False
-    # Numeric-only hosts that didn't parse as an IP are obfuscated IPs
-    # (octal/decimal/hex tricks like 0177.0.0.1 or 2130706433).
+    # Numeric-only hosts that neither parser accepted are still suspicious obfuscated IPs.
     if all(ch in "0123456789." for ch in host):
         return False
     return True

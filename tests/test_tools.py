@@ -352,6 +352,12 @@ def _fake_memory(**overrides: Any) -> AsyncMock:
     return mem
 
 
+def _memory_ctx(*, writes_allowed: bool = True) -> MagicMock:
+    ctx = MagicMock()
+    ctx.deps.memory_writes_allowed = writes_allowed
+    return ctx
+
+
 def test_memory_tools_absent_without_store(config):
     assert "search_memory" not in _tool_names(build_tools(config))
 
@@ -432,7 +438,7 @@ async def test_add_memory_saves_with_mem0(make_config):
     cfg = _memory_config(make_config)  # conftest bot_username = "grok"
     add = _find(build_tools(cfg, memory=mem), "add_memory")
 
-    result = await add("the instance mascot is a shrimp")
+    result = await add(_memory_ctx(), "the instance mascot is a shrimp")
 
     mem.add.assert_awaited_once_with("the instance mascot is a shrimp")
     assert "Added memory" in result
@@ -443,7 +449,7 @@ async def test_add_memory_saves_with_mem0(make_config):
 async def test_add_memory_rejects_empty(make_config):
     mem = _fake_memory()
     add = _find(build_tools(_memory_config(make_config), memory=mem), "add_memory")
-    result = await add("   ")
+    result = await add(_memory_ctx(), "   ")
     assert "empty memory" in result
     mem.add.assert_not_awaited()
 
@@ -452,7 +458,7 @@ async def test_add_memory_rejects_empty(make_config):
 async def test_add_memory_reports_when_mem0_extracts_nothing(make_config):
     mem = _fake_memory(add_result={"results": []})
     add = _find(build_tools(_memory_config(make_config), memory=mem), "add_memory")
-    result = await add("lol nice")
+    result = await add(_memory_ctx(), "lol nice")
     assert "nothing added" in result
 
 
@@ -461,6 +467,17 @@ async def test_add_memory_rejects_too_long(make_config):
     mem = _fake_memory()
     cfg = _memory_config(make_config)
     add = _find(build_tools(cfg, memory=mem), "add_memory")
-    result = await add("x" * (cfg.max_fact_length + 1))
+    result = await add(_memory_ctx(), "x" * (cfg.max_fact_length + 1))
     assert "memory too long" in result
+    mem.add.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_add_memory_refuses_private_message_writes(make_config):
+    mem = _fake_memory()
+    add = _find(build_tools(_memory_config(make_config), memory=mem), "add_memory")
+
+    result = await add(_memory_ctx(writes_allowed=False), "my private recovery code is 1234")
+
+    assert "disabled for private messages" in result
     mem.add.assert_not_awaited()

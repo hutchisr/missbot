@@ -1,9 +1,11 @@
 """Tests for Bot helper methods that don't need a live WebSocket."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from bot.bot import Bot
 from bot.models import MiFile
@@ -53,6 +55,13 @@ def test_note_has_prompt_content_false_without_text_or_images(bot, make_note):
 
 def test_reply_visibility_defaults_public(bot):
     assert bot._reply_visibility(None) == "public"
+
+
+def test_reply_visibility_narrows_followers_to_author(bot, make_note):
+    note = make_note().model_copy(update={"visibility": "followers"})
+
+    assert bot._reply_visibility(note) == "specified"
+    assert bot._reply_visible_user_ids(note) == [note.user.id]
 
 
 def test_reply_visible_user_ids_filters_bot_and_dedupes(bot, make_note, make_user):
@@ -173,7 +182,7 @@ async def test_build_mentions_limit_one_keeps_only_author(make_config, make_note
 
 
 @pytest.mark.anyio
-async def test_send_note_preserves_reply_visibility(bot, make_note):
+async def test_send_note_narrows_followers_reply_to_source_author(bot, make_note):
     note = make_note().model_copy(update={"visibility": "followers"})
     response = MagicMock()
     response.json.return_value = {"createdNote": {"id": "created-note"}}
@@ -186,9 +195,9 @@ async def test_send_note_preserves_reply_visibility(bot, make_note):
 
     assert post_mock.await_args is not None
     payload = post_mock.await_args.kwargs["json"]
-    assert payload["visibility"] == "followers"
+    assert payload["visibility"] == "specified"
     assert payload["text"] == "@alice hello there"
-    assert "visibleUserIds" not in payload
+    assert payload["visibleUserIds"] == [note.user.id]
 
 
 @pytest.mark.anyio
@@ -362,12 +371,150 @@ async def test_on_auto_reply_updates_timestamp_and_triggers_reply(make_config, f
         patch.object(bot, "_save_last_auto_reply_time", AsyncMock()) as save_mock,
         patch.object(bot, "on_mention", AsyncMock()) as mention_mock,
     ):
-        await bot.on_auto_reply(note)
+        handled = await bot.on_auto_reply(note)
 
+    assert handled is True
     assert bot._last_auto_reply_time == 10
     assert bot._next_auto_reply_delay == 12
     save_mock.assert_awaited_once_with()
     mention_mock.assert_awaited_once_with(note)
+
+
+@pytest.mark.anyio
+async def test_note_event_deduplicates_main_and_due_auto_reply(make_config, make_note):
+    bot = Bot(config=make_config(auto_reply_interval=5, auto_reply_jitter=0))
+    note = make_note()
+    bot._last_auto_reply_time = 0
+    bot._next_auto_reply_delay = 5
+    mention_started = asyncio.Event()
+    release_mention = asyncio.Event()
+
+    async def mention_handler(_note):
+        mention_started.set()
+        await release_mention.wait()
+
+    with (
+        patch("bot.bot.time.time", return_value=10),
+        patch.object(bot, "on_mention", AsyncMock(side_effect=mention_handler)) as mention_mock,
+    ):
+        auto_task = asyncio.create_task(bot._process_note_event(note, auto_reply=True))
+        await mention_started.wait()
+        main_task = asyncio.create_task(bot._process_note_event(note, auto_reply=False))
+        await asyncio.sleep(0)
+        release_mention.set()
+        await asyncio.gather(auto_task, main_task)
+
+    mention_mock.assert_awaited_once_with(note)
+
+
+@pytest.mark.anyio
+async def test_not_due_auto_reply_does_not_suppress_main_mention(bot, make_note):
+    note = make_note()
+    auto_started = asyncio.Event()
+    release_auto = asyncio.Event()
+
+    async def not_due(_note):
+        auto_started.set()
+        await release_auto.wait()
+        return False
+
+    with (
+        patch.object(bot, "on_auto_reply", AsyncMock(side_effect=not_due)),
+        patch.object(bot, "on_mention", AsyncMock()) as mention_mock,
+    ):
+        auto_task = asyncio.create_task(bot._process_note_event(note, auto_reply=True))
+        await auto_started.wait()
+        main_task = asyncio.create_task(bot._process_note_event(note, auto_reply=False))
+        await asyncio.sleep(0)
+        mention_mock.assert_not_awaited()
+        release_auto.set()
+        await asyncio.gather(auto_task, main_task)
+
+    mention_mock.assert_awaited_once_with(note)
+
+
+@pytest.mark.anyio
+async def test_failed_note_processing_can_be_retried(bot, make_note):
+    note = make_note()
+
+    with patch.object(
+        bot,
+        "on_mention",
+        AsyncMock(side_effect=[RuntimeError("temporary failure"), None]),
+    ) as mention_mock:
+        with pytest.raises(RuntimeError, match="temporary failure"):
+            await bot._process_note_event(note, auto_reply=False)
+        await bot._process_note_event(note, auto_reply=False)
+
+    assert mention_mock.await_count == 2
+
+
+def test_max_concurrent_handlers_must_be_positive(make_config):
+    with pytest.raises(ValidationError):
+        make_config(max_concurrent_handlers=0)
+
+
+@pytest.mark.anyio
+async def test_background_handler_capacity_drops_without_creating_coroutine(make_config):
+    bot = Bot(config=make_config(max_concurrent_handlers=1))
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def first_handler():
+        first_started.set()
+        await release_first.wait()
+
+    first_task = bot._spawn_background_task(first_handler, note_id="note-1")
+    assert first_task is not None
+    await first_started.wait()
+
+    rejected_factory = MagicMock()
+    with patch("bot.bot.logfire.warning") as warning_mock:
+        rejected_task = bot._spawn_background_task(rejected_factory, note_id="note-2")
+
+    assert rejected_task is None
+    rejected_factory.assert_not_called()
+    warning_mock.assert_called_once_with(
+        "Dropping note because handler capacity is full",
+        note_id="note-2",
+        capacity=1,
+    )
+
+    release_first.set()
+    await first_task
+
+
+@pytest.mark.anyio
+async def test_run_cancels_handlers_before_agent_context_exits(bot):
+    events: list[str] = []
+    handler_started = asyncio.Event()
+    never_finishes = asyncio.Event()
+
+    async def handler():
+        try:
+            handler_started.set()
+            await never_finishes.wait()
+        finally:
+            events.append("handler-stopped")
+
+    class TrackingAgent:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            events.append("agent-exited")
+
+    async def run_loop():
+        task = bot._spawn_background_task(handler, note_id="note-1")
+        assert task is not None
+        await handler_started.wait()
+
+    bot._agent = TrackingAgent()  # type: ignore[assignment]
+    with patch.object(bot, "_run_loop", AsyncMock(side_effect=run_loop)):
+        await bot.run()
+
+    assert events == ["handler-stopped", "agent-exited"]
+    assert not bot._background_tasks
 
 
 @pytest.mark.anyio

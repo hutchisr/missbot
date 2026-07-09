@@ -56,6 +56,84 @@ def test_mem0_config_always_sets_explicit_llm_base_url(make_config):
     assert _mem0_config(cfg)["llm"]["config"]["openai_base_url"] == "https://my-endpoint.internal/v1"
 
 
+def test_mem0_config_inherits_first_custom_model_literal_api_key(make_config, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-openrouter")
+    cfg = _memory_cfg(
+        make_config,
+        llm_models=[
+            {
+                "model": "custom:model-v1",
+                "base_url": "https://custom.example/v1",
+                "api_key": "sk-custom",
+            }
+        ],
+    )
+
+    llm = _mem0_config(cfg)["llm"]["config"]
+    assert llm["model"] == "custom:model-v1"
+    assert llm["openai_base_url"] == "https://custom.example/v1"
+    assert llm["api_key"] == "sk-custom"
+
+
+def test_mem0_config_inherits_first_custom_model_api_key_env(make_config, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-openrouter")
+    monkeypatch.setenv("CUSTOM_LLM_API_KEY", "sk-custom-env")
+    cfg = _memory_cfg(
+        make_config,
+        llm_models=[
+            {
+                "model": "custom/model-v1",
+                "base_url": "https://custom.example/v1",
+                "api_key_env": "CUSTOM_LLM_API_KEY",
+            }
+        ],
+    )
+
+    llm = _mem0_config(cfg)["llm"]["config"]
+    assert llm == {
+        "model": "custom/model-v1",
+        "temperature": 0.1,
+        "api_key": "sk-custom-env",
+        "openai_base_url": "https://custom.example/v1",
+    }
+
+
+def test_mem0_config_does_not_send_default_openrouter_key_to_custom_endpoint(make_config, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-openrouter")
+    cfg = _memory_cfg(
+        make_config,
+        llm_models=[{"model": "custom/model-v1", "base_url": "https://custom.example/v1"}],
+    )
+
+    llm = _mem0_config(cfg)["llm"]["config"]
+    assert llm["openai_base_url"] == "https://custom.example/v1"
+    assert "api_key" not in llm
+
+
+def test_mem0_config_explicit_memory_llm_overrides_inherited_connection(make_config):
+    cfg = _memory_cfg(
+        make_config,
+        llm_models=[
+            {
+                "model": "custom/model-v1",
+                "base_url": "https://custom.example/v1",
+                "api_key": "sk-custom",
+            }
+        ],
+        memory_llm_model="override/model-v2",
+        memory_llm_base_url="https://override.example/v1",
+        memory_llm_api_key="sk-override",
+    )
+
+    llm = _mem0_config(cfg)["llm"]["config"]
+    assert llm == {
+        "model": "override/model-v2",
+        "temperature": 0.1,
+        "api_key": "sk-override",
+        "openai_base_url": "https://override.example/v1",
+    }
+
+
 def test_suppress_openrouter_autodetect_hides_and_restores_env(make_config, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-outer")
     with _suppress_openrouter_autodetect():

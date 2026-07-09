@@ -328,6 +328,12 @@ class Config(BaseModel):
         description="Maximum total mentions (including the author being replied to) the bot puts in "
         "a reply. Caps mention-amplification / harassment relaying via notes that tag many users.",
     )
+    max_concurrent_handlers: int = Field(
+        default=20,
+        gt=0,
+        description="Maximum number of concurrent mention and auto-reply handlers. New events are "
+        "dropped when this capacity is full to bound LLM, memory, Redis, and HTTP work.",
+    )
     mcp_servers: List[MCPServerConfig] = Field(
         default_factory=list,
         description="Streamable-HTTP MCP servers to expose as tools.",

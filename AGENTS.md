@@ -29,6 +29,8 @@ docker build -t missbot . && docker run -v /path/to/config.yaml:/config.yaml mis
 # Kubernetes
 mise run build      # Build and push Docker image
 mise run deploy     # Apply K8s manifests and restart
+# k8s/config.yaml and k8s/secrets.txt are ignored local inputs; Kustomize emits
+# both as Secrets (the runtime config contains the Misskey token/DB credentials).
 
 # Production cluster (kubectl context: mercury)
 # Memory DB is CloudNativePG, NOT local. Connect via the primary pod with peer auth
@@ -81,6 +83,7 @@ Optional fields:
 - `ignore_direct_messages` (default `true`): skip direct/private messages (Misskey `specified` visibility); the bot is built for public-timeline threads. Set false to also reply to DMs
 - `ignore_bots` (default `true`): skip mentions from accounts flagged as bots (Misskey user `isBot`); prevents bot-to-bot reply loops. Set false to also reply to other bots
 - `max_reply_mentions`: cap on total mentions (incl. the author) echoed into a reply (default 5); prevents mention-amplification/harassment relaying
+- `max_concurrent_handlers` (default `20`): hard cap on in-flight mention/auto-reply handlers; excess events are dropped before a coroutine is created to bound provider and memory load
 - `http_timeout_seconds`: HTTP timeout (default 30.0)
 - `mcp_servers`: list of streamable-HTTP MCP servers (see below)
 - `memory_enabled` (default `false`): turn on mem0 long-term memory (see below). Requires `postgres_url` and `embedding_model`
@@ -102,7 +105,7 @@ Memory is delegated to mem0 OSS through `bot/memory.py:MemoryStore`, backed by P
 - `memory_ingest_notes` (default `true`): auto-ingest each incoming user note through mem0
 - `max_fact_length` (default `500`): longer `add_memory` submissions are rejected
 
-**Write path.** `ChatAgent.run` still runs reply generation, social scoring, and memory ingestion concurrently. `_maybe_ingest_note` sends only the latest author note to mem0 with metadata `{source: "misskey_note", author, source_note_id}`; mem0 owns extraction, deduplication, vector storage, and entity-style linking. The `add_memory` tool calls `MemoryStore.add()` with metadata `{source: "add_memory", author: bot_username}`. Memory failures are logged and swallowed so they never cancel a reply.
+**Write path.** `ChatAgent.run` still runs reply generation, social scoring, and memory ingestion concurrently. `_maybe_ingest_note` sends only the latest public author note to mem0 with metadata `{source: "misskey_note", author, source_note_id}`; specified/private notes are never ingested. The `add_memory` tool likewise refuses writes during private interactions. mem0 owns extraction, deduplication, vector storage, and entity-style linking. Successful tool writes use metadata `{source: "add_memory", author: bot_username}`. Memory failures are logged and swallowed so they never cancel a reply.
 
 **Read path.** `search_memory` calls `MemoryStore.search()` with `agent_id=bot_username`, renders mem0 memories with score/source/author/recency metadata when available, and fences the returned text as untrusted data before the model sees it.
 
@@ -123,7 +126,7 @@ Gating is progressive disclosure driven by the model itself: each unique `gate` 
 ## Key Patterns
 
 ### Agent setup (`bot/ai.py`)
-- `AgentDeps` is a **dataclass** (not BaseModel) with `username`, `source_note_id`, `social_credit_score`, `adjusted_credit_users`, `social_credit_unrestricted`, `enabled_gates`
+- `AgentDeps` is a **dataclass** (not BaseModel) with `username`, `source_note_id`, `social_credit_score`, `adjusted_credit_users`, `social_credit_unrestricted`, `enabled_gates`, and `memory_writes_allowed`
 - `adjust_social_credit` is privileged-only: it works only when `deps.social_credit_unrestricted` is set (`ChatAgent.run` sets it when the note's author id is in `social_credit_unrestricted_user_ids`); for everyone else it refuses
 - Every author's score moves via `ChatAgent._maybe_score_message` (privileged users included): a separate tool-less classifier (`bot/scoring.py`, model from `score_models` or the reply model) runs concurrently with the reply, returns one of the configured `social_credit_categories` (default toxic/rude/neutral/good/exceptional) that's mapped to its fixed delta in code, applied through `apply_social_credit` and rate-limited by a Redis `score_cooldown:<user>` key. `ChatAgent.__init__` builds a `ScoringSpec` (constrained output type + delta map + instructions) from the configured categories via `build_scoring_spec`. This is the prompt-injection mitigation — the model only picks a category name, never the number
 - Agent uses `output_type=str` (plain string output, not structured)
@@ -159,7 +162,7 @@ When `system_prompt_auto` and `auto_post_interval` are configured, `ChatAgent.ru
 - `search_web` (async) — when `searxng_url` configured. Returns domain-prefixed snippets
 - `search_users`, `search_notes` — Misskey search APIs
 - Social credit tools (when Redis configured): `get_social_credit`, `adjust_social_credit` (privileged authors only), `get_social_credit_history`, `get_social_credit_leaderboard`. All users (privileged included) are also scored automatically by the `bot/scoring.py` classifier, separate from any tool call
-- Long-term memory tools (when `memory_enabled`): `add_memory` (passes text to mem0 `add`) and `search_memory` (mem0 `search` results, fenced as untrusted data). User notes are also ingested automatically when `memory_ingest_notes=true`. Not given to the auto-agent
+- Long-term memory tools (when `memory_enabled`): `add_memory` (passes text to mem0 `add`, except in private interactions) and `search_memory` (mem0 `search` results, fenced as untrusted data). Public user notes are also ingested automatically when `memory_ingest_notes=true`; private/specified notes are not. Not given to the auto-agent
 - `enable_<gate>` — one per unique `gate` value in `mcp_servers`; model calls it to unlock gated MCP tools
 - MCP tools — from each configured `mcp_servers` entry, name-prefixed per `tool_prefix`
 

@@ -40,6 +40,8 @@ def test_allows_public_http_urls(url):
         # Obfuscated IPs that don't parse as ip_address
         "http://2130706433/",
         "http://0177.0.0.1/",
+        "http://0x7f.0x0.0x0.0x1/",  # dotted hex loopback
+        "http://0xa9.0xfe.0xa9.0xfe/latest/meta-data/",  # dotted hex link-local
         # Non-http schemes
         "file:///etc/passwd",
         "ftp://example.com/x",

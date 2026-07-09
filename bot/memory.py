@@ -53,13 +53,6 @@ def _first_model_name(specs: list[Union[str, CustomOpenAIModel]]) -> str:
     return _strip_model_provider(first.model)
 
 
-def _first_custom_base_url(specs: list[Union[str, CustomOpenAIModel]]) -> Optional[str]:
-    first = specs[0]
-    if isinstance(first, CustomOpenAIModel) and first.base_url is not None:
-        return str(first.base_url)
-    return None
-
-
 def _api_key(value: Optional[str], env_name: Optional[str]) -> Optional[str]:
     if value:
         return value
@@ -79,27 +72,47 @@ _OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 _OPENROUTER_ENV_VAR = "OPENROUTER_API_KEY"
 
 
+def _default_memory_llm(config: Config) -> tuple[str, str, Optional[str]]:
+    """Resolve the first reply model as one endpoint/credential tuple."""
+    first = config.llm_models[0]
+    if isinstance(first, CustomOpenAIModel) and first.base_url is not None:
+        return first.model, str(first.base_url), _api_key(first.api_key, first.api_key_env)
+    return _first_model_name(config.llm_models), _OPENROUTER_BASE_URL, os.environ.get(_OPENROUTER_ENV_VAR)
+
+
+def _memory_llm_connection(config: Config) -> tuple[str, str, Optional[str]]:
+    """Apply explicit memory overrides without leaking credentials across endpoints."""
+    default_model, default_base_url, default_key = _default_memory_llm(config)
+    model = config.memory_llm_model or default_model
+    base_url = str(config.memory_llm_base_url) if config.memory_llm_base_url else default_base_url
+
+    credentials_overridden = bool(config.memory_llm_api_key) or "memory_llm_api_key_env" in config.model_fields_set
+    if credentials_overridden:
+        api_key = _api_key(config.memory_llm_api_key, config.memory_llm_api_key_env)
+    elif base_url.rstrip("/") == default_base_url.rstrip("/"):
+        api_key = default_key
+    elif base_url.rstrip("/") == _OPENROUTER_BASE_URL:
+        api_key = os.environ.get(_OPENROUTER_ENV_VAR)
+    else:
+        # A base-URL override names a different endpoint. Do not attach credentials
+        # inherited from the old endpoint (especially the default OpenRouter key).
+        api_key = None
+    return model, base_url, api_key
+
+
 @contextlib.contextmanager
 def _suppress_openrouter_autodetect() -> Iterator[None]:
     """Hide OPENROUTER_API_KEY from mem0's "openai" LLM provider for one construction call.
 
-    mem0's OpenAILLM hardcodes ``if os.environ.get("OPENROUTER_API_KEY"): ...`` and, when true,
-    builds its client from that env var and its own OpenRouter base URL — completely ignoring
-    the ``api_key``/``openai_base_url`` we pass in ``config``. Since OPENROUTER_API_KEY is
-    required for the rest of the bot, that branch always fires, which would silently discard
-    memory_llm_base_url/memory_llm_api_key. ``_mem0_config`` always resolves a concrete api_key
-    and openai_base_url ahead of time (falling back to the same OpenRouter default mem0 would
-    have chosen), so once the env var is hidden mem0 takes its "else" branch and uses exactly
-    those resolved values. Only wraps the single synchronous ``AsyncMemory.from_config`` call —
-    no ``await`` happens inside the block, so no concurrent coroutine on the event loop can
-    observe the temporarily-cleared value.
+    mem0 otherwise lets the ambient variable override the endpoint and credentials in
+    its config. This wraps only synchronous ``AsyncMemory.from_config`` construction,
+    so no other coroutine can observe the temporary removal.
     """
-    sentinel = object()
-    saved = os.environ.pop(_OPENROUTER_ENV_VAR, sentinel)
+    saved = os.environ.pop(_OPENROUTER_ENV_VAR, None)
     try:
         yield
     finally:
-        if saved is not sentinel:
+        if saved is not None:
             os.environ[_OPENROUTER_ENV_VAR] = saved
 
 
@@ -119,25 +132,16 @@ def _mem0_config(config: Config) -> dict[str, Any]:
     if config.embedding_dimensions is not None:
         embedder_config["embedding_dims"] = config.embedding_dimensions
 
-    llm_model = config.memory_llm_model or _first_model_name(config.llm_models)
+    llm_model, llm_base_url, llm_key = _memory_llm_connection(config)
     llm_config: dict[str, Any] = {
         "model": llm_model,
         "temperature": 0.1,
     }
-    llm_key = _api_key(config.memory_llm_api_key, config.memory_llm_api_key_env)
     if llm_key:
         llm_config["api_key"] = llm_key
-    # Always resolve an explicit base URL (never leave it for mem0 to infer): mem0's "openai"
-    # provider silently ignores config.api_key/openai_base_url and routes to OpenRouter using
-    # os.environ["OPENROUTER_API_KEY"] whenever that var is set — which it always is here (the
-    # rest of the bot requires it). Resolving the default ourselves and pairing it with
-    # _suppress_openrouter_autodetect (below) is what makes memory_llm_base_url/memory_llm_api_key
-    # actually take effect instead of being silently discarded.
-    llm_config["openai_base_url"] = (
-        str(config.memory_llm_base_url)
-        if config.memory_llm_base_url
-        else _first_custom_base_url(config.llm_models) or _OPENROUTER_BASE_URL
-    )
+    # Always pass the resolved endpoint; construction suppresses mem0's ambient
+    # OpenRouter auto-detection so the endpoint and credential stay paired.
+    llm_config["openai_base_url"] = llm_base_url
 
     mem0_config: dict[str, Any] = {
         "vector_store": {

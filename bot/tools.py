@@ -376,7 +376,7 @@ def build_tools(
         _memory: MemoryStore = memory
 
         @logfire.instrument(extract_args=["memory"])
-        async def add_memory(memory: str) -> str:
+        async def add_memory(ctx: RunContext[object], memory: str) -> str:
             """Add a memory to mem0 long-term memory.
 
             Use this when durable facts, preferences, project context, instance lore, or other
@@ -384,8 +384,11 @@ def build_tools(
             final memories from the submitted text.
 
             Args:
+                ctx: The run context (injected automatically).
                 memory: Text to pass to mem0's add operation.
             """
+            if not getattr(ctx.deps, "memory_writes_allowed", False):
+                return "Memory writes are disabled for private messages."
             memory = (memory or "").strip()
             if not memory:
                 return "Error: empty memory."
