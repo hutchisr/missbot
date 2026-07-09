@@ -37,10 +37,11 @@ spec:
               subPath: config.yaml
           resources:
             requests:
-              memory: "16Mi"
-              cpu: "10m"
+              memory: "512Mi"
+              cpu: "100m"
             limits:
-              memory: "256Mi"
+              memory: "1Gi"
+              cpu: "1000m"
       volumes:
         - name: config-volume
           configMap:
