@@ -97,18 +97,19 @@ searxng_password: "yourpassword"
 #     allowed_tools: ["search"]
 #     # gate: research   # hide until the model calls enable_research()
 
-# Optional: persistent long-term memory (Postgres + pgvector). Off by default.
-# Adds the remember_fact / search_memory tools. Requires postgres_url + embedding_model.
+# Optional: persistent long-term memory via mem0 (Postgres + pgvector). Off by default.
+# Adds the add_memory / search_memory tools. Requires postgres_url + embedding_model.
 # memory_enabled: false
 # postgres_url: "postgres://user:pass@localhost:5432/missbot"
+# memory_collection_name: missbot_memories
 # embedding_model: "perplexity/pplx-embed-v1-0.6b"
-# embedding_dim: 1024                # must match the model AND the pgvector column
+# embedding_dim: 1024                # must match the embedding model output
 # embedding_base_url: "https://openrouter.ai/api/v1"
 # embedding_api_key_env: OPENROUTER_API_KEY
-# global_recall_k: 5                 # facts returned per search_memory call
-# global_recall_min_similarity: 0.3  # cosine-similarity floor for recalled facts
-# global_write_cooldown: 60          # min seconds between memory writes per author
-# global_dedup_threshold: 0.95       # skip a write this cosine-similar to an existing fact
+# memory_llm_model: "anthropic/claude-3.5-haiku"  # optional; defaults to first llm_models entry
+# memory_llm_api_key_env: OPENROUTER_API_KEY
+# memory_search_limit: 5
+# memory_search_threshold: 0.1
 # max_fact_length: 500               # longer facts are rejected
 
 # The bot's reply is the model's plain text output. Mentions are added

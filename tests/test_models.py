@@ -120,6 +120,9 @@ def test_memory_disabled_by_default(make_config):
     assert cfg.embedding_dim == 1024
     assert cfg.embedding_api_key_env == "OPENROUTER_API_KEY"
     assert "openrouter.ai" in str(cfg.embedding_base_url)
+    assert cfg.memory_collection_name == "missbot_memories"
+    assert cfg.memory_search_limit == 5
+    assert cfg.memory_search_threshold == 0.1
 
 
 def test_memory_enabled_requires_postgres_url(make_config):
@@ -142,6 +145,7 @@ def test_memory_enabled_with_required_fields_ok(make_config):
     )
     assert cfg.memory_enabled is True
     assert cfg.embedding_model == "perplexity/pplx-embed-v1-0.6b"
+    assert cfg.memory_llm_api_key_env == "OPENROUTER_API_KEY"
 
 
 def test_embedding_dimensions_must_equal_embedding_dim(make_config):

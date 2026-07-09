@@ -6,8 +6,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from pydantic_ai import ImageUrl
 
-from bot.ai import ChatAgent, build_entity_linker, build_relation_linker
-from bot.extract import ExtractedClaim, ExtractedClaims, Skip
+from bot.ai import ChatAgent
 from bot.models import MiFile
 
 
@@ -251,7 +250,7 @@ async def test_run_scoring_failure_does_not_break_reply(make_config, make_note, 
     assert not await fake_redis.exists("score_cooldown:alice")
 
 
-# --- Note -> world-knowledge ingestion ---
+# --- Note -> mem0 ingestion ---
 
 
 def _memory_cfg(make_config, **extra):
@@ -263,226 +262,64 @@ def _memory_cfg(make_config, **extra):
     )
 
 
-def _claims(*claims: ExtractedClaim) -> ExtractedClaims:
-    """Wrap claims in the accepted extraction branch (one note can assert several)."""
-    return ExtractedClaims(claims=list(claims))
-
-
 @pytest.mark.anyio
-async def test_run_ingests_note_as_claim(make_config, make_note):
+async def test_run_ingests_note_with_mem0(make_config, make_note):
     mem = AsyncMock()
-    mem.seconds_since_last_write.return_value = None
     agent = ChatAgent(_memory_cfg(make_config), memory=mem)
-    note = make_note(text="Python's latest version is 3.13")  # author = alice
-    claim = ExtractedClaim(subject="Python", predicate="latest version", object="3.13")
+    note = make_note(text="Python's latest version is 3.13")
 
-    with (
-        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
-        patch.object(agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=_claims(claim)))),
-    ):
+    with patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))):
         out = await agent.run(note)
 
     assert out == "reply"
-    mem.add_claim.assert_awaited_once()
-    kw = mem.add_claim.await_args.kwargs
-    # The note's author is attributed as the claim's author (this drives the agreement count).
-    assert kw["author"] == "alice"
-    assert kw["subject"] == "Python"
-    assert kw["predicate"] == "latest version"
-    assert kw["object_text"] == "3.13"
-
-
-@pytest.mark.anyio
-async def test_run_ingests_multiple_claims_from_one_note(make_config, make_note):
-    mem = AsyncMock()
-    mem.seconds_since_last_write.return_value = None
-    agent = ChatAgent(_memory_cfg(make_config), memory=mem)
-    note = make_note(text="I live in Berlin and work at ACME")
-    extraction = _claims(
-        ExtractedClaim(subject="alice", predicate="lives in", object="Berlin"),
-        ExtractedClaim(subject="alice", predicate="works at", object="ACME"),
-    )
-
-    with (
-        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
-        patch.object(agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=extraction))),
-    ):
-        await agent.run(note)
-
-    # One note asserting several independent facts stores one claim per fact.
-    assert mem.add_claim.await_count == 2
-    objects = [c.kwargs["object_text"] for c in mem.add_claim.await_args_list]
-    assert objects == ["Berlin", "ACME"]
-
-
-@pytest.mark.anyio
-async def test_run_note_ingestion_drops_low_confidence_claims(make_config, make_note):
-    mem = AsyncMock()
-    mem.seconds_since_last_write.return_value = None
-    agent = ChatAgent(_memory_cfg(make_config), memory=mem)  # default memory_min_confidence = 0.5
-    note = make_note(text="Python 3.13 is out, and I think maybe Guido likes it?")
-    extraction = _claims(
-        ExtractedClaim(subject="Python", predicate="latest version", object="3.13", confidence=0.9),
-        ExtractedClaim(subject="Guido", predicate="likes", object="Python 3.13", confidence=0.2),
-    )
-
-    with (
-        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
-        patch.object(agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=extraction))),
-    ):
-        await agent.run(note)
-
-    # Only the claim at/above the confidence floor is stored.
-    mem.add_claim.assert_awaited_once()
-    assert mem.add_claim.await_args.kwargs["subject"] == "Python"
-
-
-@pytest.mark.anyio
-async def test_run_note_ingestion_respects_write_cooldown(make_config, make_note):
-    mem = AsyncMock()
-    mem.seconds_since_last_write.return_value = 5.0  # within the default 60s cooldown
-    agent = ChatAgent(_memory_cfg(make_config), memory=mem)
-    note = make_note(text="some durable world fact")
-    claim = ExtractedClaim(subject="X", predicate="y", object="z")
-
-    with (
-        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
-        patch.object(
-            agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=_claims(claim)))
-        ) as extract_mock,
-    ):
-        await agent.run(note)
-
-    # Cooldown short-circuits before paying for an extraction call.
-    extract_mock.assert_not_awaited()
-    mem.add_claim.assert_not_awaited()
-
-
-@pytest.mark.anyio
-async def test_run_note_ingestion_skips_when_extractor_rejects(make_config, make_note):
-    mem = AsyncMock()
-    mem.seconds_since_last_write.return_value = None
-    agent = ChatAgent(_memory_cfg(make_config), memory=mem)
-    note = make_note(text="i really love pizza")
-
-    with (
-        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
-        patch.object(
-            agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=Skip(reason="personal detail")))
-        ),
-    ):
-        await agent.run(note)
-
-    mem.add_claim.assert_not_awaited()
+    mem.add_note.assert_awaited_once_with(text="Python's latest version is 3.13", author="alice", note_id=note.id)
 
 
 @pytest.mark.anyio
 async def test_run_note_ingestion_disabled_by_flag(make_config, make_note):
     mem = AsyncMock()
-    mem.seconds_since_last_write.return_value = None
     agent = ChatAgent(_memory_cfg(make_config, memory_ingest_notes=False), memory=mem)
     note = make_note(text="Python's latest version is 3.13")
 
-    with (
-        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
-        patch.object(agent._extract_agent, "run", AsyncMock()) as extract_mock,
-    ):
+    with patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))):
         await agent.run(note)
 
-    # Flag off => the ingestion path returns before extracting or writing.
-    extract_mock.assert_not_awaited()
-    mem.add_claim.assert_not_awaited()
+    mem.add_note.assert_not_awaited()
 
 
 @pytest.mark.anyio
-async def test_run_note_ingestion_passes_speaker_to_extractor(make_config, make_note):
+async def test_run_note_ingestion_skips_empty_text(make_config, make_note):
     mem = AsyncMock()
-    mem.seconds_since_last_write.return_value = None
     agent = ChatAgent(_memory_cfg(make_config), memory=mem)
-    note = make_note(text="I use Arch btw")  # author = alice
-    claim = ExtractedClaim(subject="alice", predicate="os", object="Arch Linux")
+    note = make_note(text="  ")
 
-    with (
-        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
-        patch.object(
-            agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=_claims(claim)))
-        ) as extract_mock,
-    ):
+    with patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))):
         await agent.run(note)
 
-    # The author's handle is plumbed into the extraction prompt so "I" resolves to them.
-    assert extract_mock.await_args is not None
-    prompt = extract_mock.await_args.args[0]
-    assert "@alice" in prompt
-    mem.add_claim.assert_awaited_once()
-    assert mem.add_claim.await_args.kwargs["subject"] == "alice"
+    mem.add_note.assert_not_awaited()
 
 
 @pytest.mark.anyio
-async def test_run_note_ingestion_stores_whatever_the_gate_allows(make_config, make_note):
+async def test_run_note_ingestion_swallows_mem0_errors(make_config, make_note):
     mem = AsyncMock()
-    mem.seconds_since_last_write.return_value = None
+    mem.add_note.side_effect = RuntimeError("mem0 down")
     agent = ChatAgent(_memory_cfg(make_config), memory=mem)
-    note = make_note(text="I'm in the US/Pacific timezone")
-    # The private-information guard was removed — the bot only sees public notes, so whatever the
-    # extractor structures into a claim is stored without a separate sensitivity filter.
-    claim = ExtractedClaim(subject="alice", predicate="timezone", object="US/Pacific")
+    note = make_note(text="some durable world fact")
 
-    with (
-        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
-        patch.object(agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=_claims(claim)))),
-    ):
-        await agent.run(note)
+    with patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))):
+        out = await agent.run(note)
 
-    mem.add_claim.assert_awaited_once()
-    assert mem.add_claim.await_args.kwargs["subject"] == "alice"
+    assert out == "reply"
+    mem.add_note.assert_awaited_once()
 
 
 @pytest.mark.anyio
-async def test_run_note_ingestion_supplies_thread_context(make_config, make_note):
-    mem = AsyncMock()
-    mem.seconds_since_last_write.return_value = None
-    agent = ChatAgent(_memory_cfg(make_config), memory=mem)
-    parent = make_note(id="note-0", text="I have a pet lizard")  # earlier note by alice
-    note = make_note(id="note-1", text="her name is Olive")  # follow-up by alice
-    claim = ExtractedClaim(subject="alice's lizard", predicate="name", object="Olive")
-
-    with (
-        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
-        patch.object(
-            agent._extract_agent, "run", AsyncMock(return_value=SimpleNamespace(output=_claims(claim)))
-        ) as extract_mock,
-    ):
-        await agent.run(note, context=[parent])
-
-    # The prior note rides along as reference context so "her" can resolve to the lizard.
-    assert extract_mock.await_args is not None
-    prompt = extract_mock.await_args.args[0]
-    assert "I have a pet lizard" in prompt
-    assert "her name is Olive" in prompt
-    assert "@alice" in prompt
-    mem.add_claim.assert_awaited_once()
-
-
-# --- Write-time entity linking ---
-
-
-def test_entity_linker_wired_when_memory_enabled(make_config):
+async def test_run_note_ingestion_normalizes_remote_author(make_config, make_note, make_user):
     mem = AsyncMock()
     agent = ChatAgent(_memory_cfg(make_config), memory=mem)
-    assert agent._entity_linker is not None
-    assert mem.entity_linker is agent._entity_linker  # store gets the linker callable
+    note = make_note(text="I use Arch btw", user=make_user(username="Alice", host="Remote.Example"))
 
+    with patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))):
+        await agent.run(note)
 
-def test_entity_linker_absent_without_memory(make_config):
-    assert ChatAgent(make_config())._entity_linker is None  # memory disabled
-
-
-def test_build_entity_linker_only_when_memory_enabled(make_config):
-    assert build_entity_linker(make_config()) is None  # disabled => no linker
-    assert callable(build_entity_linker(_memory_cfg(make_config)))  # enabled => a callable
-
-
-def test_build_relation_linker_only_when_memory_enabled(make_config):
-    assert build_relation_linker(make_config()) is None  # disabled => no linker
-    assert callable(build_relation_linker(_memory_cfg(make_config)))  # enabled => a callable
+    mem.add_note.assert_awaited_once_with(text="I use Arch btw", author="alice@remote.example", note_id=note.id)

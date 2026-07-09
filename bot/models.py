@@ -334,28 +334,33 @@ class Config(BaseModel):
     )
     memory_enabled: bool = Field(
         default=False,
-        description="Enable the persistent world-knowledge store (Postgres + pgvector). Off by default; "
-        "requires postgres_url and embedding_model. Adds the search_memory tool and ingests user notes as "
-        "claims (entity-predicate-value facts). Recall ranks values by user agreement (how many "
-        "distinct users assert each value).",
+        description="Enable persistent long-term memory via mem0 (Postgres + pgvector). Off by default; "
+        "requires postgres_url and embedding_model. Adds the add_memory / search_memory tools and "
+        "can ingest user notes through mem0's extraction/dedup pipeline.",
     )
     postgres_url: Optional[str] = Field(
         default=None,
-        description="Postgres DSN for long-term memory (e.g. postgres://user:pass@host:5432/db). "
-        "The pgvector extension must be available on the server.",
+        description="Postgres DSN for mem0's pgvector store (e.g. postgres://user:pass@host:5432/db). "
+        "The vector extension must be available on the server.",
+    )
+    memory_collection_name: str = Field(
+        default="missbot_memories",
+        description="Postgres table/collection name mem0 uses for stored memories.",
+    )
+    memory_history_db_path: Optional[str] = Field(
+        default=None,
+        description="Optional SQLite path for mem0's local message/history database. Leave unset for mem0's default.",
     )
     embedding_model: Optional[str] = Field(
         default=None,
-        description="Embedding model id sent to the embeddings endpoint (e.g. "
-        "'perplexity/pplx-embed-v1-0.6b'). Required when memory_enabled.",
+        description="Embedding model id sent to the OpenAI-compatible embeddings endpoint. Required when memory_enabled.",
     )
     embedding_dim: int = Field(
         default=1024,
         gt=0,
-        description="Embedding vector dimension; must match what the model returns (see "
-        "embedding_dimensions for Matryoshka models) and the pgvector column. pplx-embed-v1-0.6b is 1024. "
-        "Note pgvector HNSW indexes support at most 2000 dimensions on a plain `vector` column. Changing "
-        "this requires re-embedding all rows (`python -m bot.maintenance reembed`).",
+        description="Embedding vector dimension for mem0's pgvector collection; must match what the embedding "
+        "model returns. pplx-embed-v1-0.6b is 1024. pgvector HNSW indexes support at most 2000 dimensions "
+        "on a plain `vector` column.",
     )
     embedding_dimensions: Optional[int] = Field(
         default=None,
@@ -377,77 +382,47 @@ class Config(BaseModel):
         default="OPENROUTER_API_KEY",
         description="Environment variable holding the embeddings API key (used when embedding_api_key is unset).",
     )
-    global_recall_k: int = Field(
+    memory_llm_model: Optional[str] = Field(
+        default=None,
+        description="Model mem0 uses for memory extraction. Defaults to the first llm_models entry with any "
+        "pydantic-ai provider prefix stripped (e.g. openrouter:anthropic/... -> anthropic/...).",
+    )
+    memory_llm_base_url: Optional[AnyHttpUrl] = Field(
+        default=None,
+        description="Optional OpenAI-compatible base URL for mem0's extraction LLM.",
+    )
+    memory_llm_api_key: Optional[str] = Field(
+        default=None,
+        description="API key for mem0's extraction LLM. Use memory_llm_api_key_env to load from env instead.",
+    )
+    memory_llm_api_key_env: str = Field(
+        default="OPENROUTER_API_KEY",
+        description="Environment variable holding mem0 extraction LLM API key when memory_llm_api_key is unset.",
+    )
+    memory_search_limit: int = Field(
         default=5,
         gt=0,
-        description="Max number of facts (claims) returned per search_memory call (after conflict resolution).",
+        description="Max number of memories returned per search_memory call.",
     )
-    global_recall_min_similarity: float = Field(
-        default=0.3,
+    memory_search_threshold: float = Field(
+        default=0.1,
         ge=0.0,
         le=1.0,
-        description="Cosine-similarity floor for search_memory results; weaker matches are dropped.",
-    )
-    global_write_cooldown: int = Field(
-        default=60,
-        ge=0,
-        description="Minimum seconds between global memory writes per author. Bounds memory poisoning rate.",
+        description="Minimum mem0 search score for search_memory results.",
     )
     max_fact_length: int = Field(
         default=500,
         gt=0,
-        description="Maximum character length of a single submitted fact/claim; longer writes are rejected.",
+        description="Maximum character length accepted by the add_memory tool.",
     )
-    entity_match_threshold: float = Field(
-        default=0.82,
-        ge=0.0,
-        le=1.0,
-        description="Cosine-similarity floor for linking a claim's source to an existing entity at write time. "
-        "Below this (and with no exact name/alias match) a new entity is created instead.",
-    )
-    entity_merge_threshold: float = Field(
-        default=0.90,
-        ge=0.0,
-        le=1.0,
-        description="Cosine-similarity floor for the embedding-based entity merge in the `consolidate` "
-        "maintenance pass. Kept higher than entity_match_threshold because merging is structural — name-based "
-        "merging (exact normalized key) does the bulk of the work; this is a conservative secondary signal. "
-        "Run `bot.maintenance calibrate-entities` to tune against your embedding model.",
-    )
-    entity_merge_llm: bool = Field(
-        default=True,
-        description="In the `consolidate` maintenance pass, after the deterministic name/embedding passes, run "
-        "an LLM merge pass that offers each entity's near-neighbours to the entity-link classifier and folds in "
-        "confirmed same-entity matches. Heals existing fragmentation the deterministic passes miss. Requires a "
-        "model; set false to skip the extra LLM calls per run.",
-    )
-    relation_merge_llm: bool = Field(
-        default=True,
-        description="In the `consolidate` maintenance pass, also merge near-duplicate relations on the same "
-        "entity (two phrasings of the same question, e.g. 'latest version' / 'current version') via a "
-        "constrained LLM relation-link classifier, so agreement counts don't fragment across predicate "
-        "phrasings. Requires a model; set false to skip the extra LLM calls per run.",
-    )
-    memory_min_confidence: float = Field(
-        default=0.5,
-        ge=0.0,
-        le=1.0,
-        description="Confidence floor for auto-ingesting note claims: extracted claims whose extractor "
-        "confidence (0..1, how sure it is the text actually asserts the claim) is below this are dropped. "
-        "Does not apply to remember_fact (a deliberate store by the bot). Set 0 to keep every extracted claim.",
-    )
-    memory_extract_models: List[Union[str, CustomOpenAIModel]] = Field(
-        default_factory=list,
-        description="Model chain for the claim-extraction classifier that turns a submitted fact into a "
-        "typed subject/predicate/object claim or rejects it (same forms as llm_models). Defaults to "
-        "llm_models when empty; a smaller/cheaper model is usually fine.",
+    memory_custom_instructions: Optional[str] = Field(
+        default=None,
+        description="Optional custom instructions appended to mem0's memory extraction prompt.",
     )
     memory_ingest_notes: bool = Field(
         default=True,
-        description="When memory is enabled, auto-ingest each incoming user note as a claim attributed to its "
-        "author (so distinct authors asserting the same value raise its agreement count). The extractor's Skip "
-        "branch drops chatter/opinions/personal details, and writes are rate-limited per author by "
-        "global_write_cooldown. Set false to disable note learning.",
+        description="When memory is enabled, auto-ingest each incoming user note through mem0. Set false to "
+        "disable note learning while keeping add_memory / search_memory available.",
     )
     debug: Optional[bool] = None
 

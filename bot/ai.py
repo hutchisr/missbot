@@ -27,21 +27,8 @@ from pydantic_ai.settings import ModelSettings
 import logfire
 from redis.asyncio import Redis
 
-from .extract import (
-    ENTITY_LINK_INSTRUCTIONS,
-    EXTRACTION_INSTRUCTIONS,
-    RELATION_LINK_INSTRUCTIONS,
-    ClaimExtraction,
-    EntityMatch,
-    ExtractedClaims,
-    Skip,
-    build_entity_link_prompt,
-    build_extraction_prompt,
-    build_relation_link_prompt,
-    pick_entity_match,
-)
 from .mcp import build_mcp_toolsets, gate_names
-from .memory import EntityLinker, MemoryStore, RelationLinker
+from .memory import MemoryStore
 from .models import Config, CustomOpenAIModel, Note, User
 from .net import is_safe_media_url
 from .scoring import ScoringSpec, build_scoring_prompt, build_scoring_spec
@@ -233,8 +220,8 @@ async def _guarded(coro: Awaitable[object], label: str) -> None:
 
 _FALLBACK_ON = (ModelAPIError, httpx.TimeoutException)
 
-# Run settings for the constrained-output classifier agents (scoring, claim extraction,
-# entity/relation linking). Their output types force a tool call (`tool_choice`), which
+# Run settings for constrained-output classifier agents (currently social scoring).
+# Their output types force a tool call (`tool_choice`), which
 # thinking-mode endpoints reject ("Thinking mode does not support this tool_choice") — so
 # reasoning is disabled (it's wasted on a labeling task anyway) and OpenRouter routing is
 # restricted to providers that support every request param (`require_parameters`). Both
@@ -254,84 +241,6 @@ def _model_chain(specs: list[Union[str, CustomOpenAIModel]]) -> Optional[Union[s
     if len(resolved) == 1:
         return resolved[0]
     return FallbackModel(*resolved, fallback_on=_FALLBACK_ON)
-
-
-def _build_match_agent(config: Config, instructions: str) -> Optional[Agent[None, EntityMatch]]:
-    """Build a constrained candidate-pick agent (shared by entity and relation linking).
-
-    Returns None when memory is disabled or no model chain is configured.
-    """
-    if not config.memory_enabled:
-        return None
-    chain = _model_chain(config.memory_extract_models or config.llm_models)
-    if chain is None:
-        return None
-    return Agent[None, EntityMatch](chain, output_type=EntityMatch, instructions=[instructions], retries=2)
-
-
-async def _run_match(
-    agent: Agent[None, EntityMatch], prompt: str, candidates: list[tuple[int, str]], failure_msg: str
-) -> Optional[int]:
-    """Run a candidate-pick agent and map its answer to a candidate id; None on any error."""
-    try:
-        result = await agent.run(prompt, model_settings=_CLASSIFIER_MODEL_SETTINGS)
-    except Exception:
-        logfire.exception(failure_msg)
-        return None
-    return pick_entity_match(result.output, candidates)
-
-
-def build_entity_linker(config: Config) -> Optional[EntityLinker]:
-    """Build the write-time entity-link classifier as a standalone async callable.
-
-    Returns None when memory is disabled. Used both by ChatAgent (the write path) and by
-    the maintenance CLI (so consolidation's LLM merge pass works in the headless CronJob,
-    which has no ChatAgent). The callable returns the chosen entity id or None ("new"); it
-    only ever returns one of the offered candidate ids, and degrades to None on any error.
-    """
-    agent = _build_match_agent(config, ENTITY_LINK_INSTRUCTIONS)
-    if agent is None:
-        return None
-
-    async def link(subject: str, candidates: list[tuple[int, str]]) -> Optional[int]:
-        if not candidates:
-            return None
-        names = [name for _, name in candidates]
-        return await _run_match(
-            agent,
-            build_entity_link_prompt(subject, names),
-            candidates,
-            "Entity linking failed — treating subject as a new entity",
-        )
-
-    return link
-
-
-def build_relation_linker(config: Config) -> Optional[RelationLinker]:
-    """Build the consolidation-time relation-link classifier as a standalone async callable.
-
-    Decides whether a predicate asks the same question about an entity as one of its sibling
-    relations' predicates ("latest version" ~ "current version"), so the `consolidate`
-    maintenance pass can merge them and agreement counts stop fragmenting across phrasings.
-    Same constrained shape as the entity linker (an offered candidate id or None) and the same
-    failure mode (degrades to None — no merge — on any error). Wired by the maintenance CLI.
-    """
-    agent = _build_match_agent(config, RELATION_LINK_INSTRUCTIONS)
-    if agent is None:
-        return None
-
-    async def link(subject: str, predicate: str, candidates: list[tuple[int, str]]) -> Optional[int]:
-        if not candidates:
-            return None
-        names = [name for _, name in candidates]
-        return await _run_match(
-            agent,
-            build_relation_link_prompt(subject, predicate, names),
-            candidates,
-            "Relation linking failed — leaving the relations separate",
-        )
-
-    return link
 
 
 # Chars reserved for the mention prefix the bot prepends (up to ``max_reply_mentions``
@@ -396,32 +305,7 @@ class ChatAgent:
         else:
             self._vision_model = _chain(vision_specs)
 
-        # Claim-extraction agent (the admission gate): turns free-text into a typed claim or
-        # rejects it — tool-less + constrained output, so untrusted text can only pick a branch
-        # (bot/extract.py). Built only when memory is enabled; the entity linker is wired into
-        # the store to prevent write-time fragmentation.
-        self._extract_agent: Optional[Agent[None, ClaimExtraction]] = None
-        self._entity_linker: Optional[EntityLinker] = None
-        if memory is not None and config.memory_enabled:
-            extract_model = _chain(config.memory_extract_models) if config.memory_extract_models else model
-            # Subscript Agent[...] explicitly and pass the union members as a list (pydantic-ai's
-            # multi-output spec): the type checker can't infer the OutputDataT type var back out
-            # of a bare ``Union`` value passed to output_type.
-            self._extract_agent = Agent[None, ClaimExtraction](
-                extract_model,
-                output_type=[ExtractedClaims, Skip],
-                instructions=[EXTRACTION_INSTRUCTIONS],
-                retries=2,
-            )
-            self._entity_linker = build_entity_linker(config)
-            memory.entity_linker = self._entity_linker
-            # The bot's own claims (via remember_fact) are stored but excluded from agreement.
-            memory.bot_author = normalize_username(config.bot_username)
-
-        # Pass the extractor only when memory + the extract agent exist, so remember_fact is
-        # exposed only when it can structure a submitted fact into a typed claim.
-        extractor = self._extract_claim if self._extract_agent is not None else None
-        tools = build_tools(config, redis_client=redis_client, memory=memory, extractor=extractor)
+        tools = build_tools(config, redis_client=redis_client, memory=memory)
         gates = gate_names(config)
         for gate, servers in sorted(gates.items()):
             tools.append(_make_enable_gate_tool(gate, servers))
@@ -730,82 +614,22 @@ class ChatAgent:
         self._auto_history.append(result.output)
         return result.output
 
-    async def _extract_claim(
-        self, fact: str, speaker: Optional[str] = None, context: Optional[list[str]] = None
-    ) -> Optional[ClaimExtraction]:
-        """Run the claim extractor over a submitted fact for the world-knowledge store.
-
-        ``speaker`` lets the extractor resolve first-person references to that handle (used
-        by the note-ingestion path so a user's self-statement is attributed to them).
-        ``context`` is the prior thread (reference-only) so cross-note references resolve.
-        Returns an ``ExtractedClaims``, a ``Skip`` (rejection with a reason), or None if the
-        classifier itself failed. Never raises — a failed extraction just means the fact
-        isn't stored; it must not break the reply path.
-        """
-        if self._extract_agent is None:
-            return None
-        try:
-            result = await self._extract_agent.run(
-                build_extraction_prompt(fact, speaker=speaker, context=context),
-                model_settings=_CLASSIFIER_MODEL_SETTINGS,
-            )
-        except Exception:
-            logfire.exception("Claim extraction failed — fact not stored (reply unaffected)")
-            return None
-        return result.output
-
     async def _maybe_ingest_note(self, note: Note, context: Optional[list[Note]] = None) -> None:
-        """Learn world-fact claims from the author's note, attributed to the author.
+        """Let mem0 learn durable memories from the author's note.
 
-        Each claim's ``author`` is the note's author (set by code, not by anything the model
-        says), so distinct authors asserting the same value raise its agreement count. The
-        author's handle is passed to the extractor so a self-statement ("I use Arch") resolves
-        to a claim about them, and the prior thread (``context``) is supplied as reference-only
-        material so cross-note references resolve (e.g. "her name is Olive" after "I have a pet
-        lizard"). One note can yield several claims (capped by the extraction schema); claims
-        below ``memory_min_confidence`` are dropped. Durable personal facts are allowed — the bot
-        only ever sees public notes, so it can't learn anything not already public. Rate-limited
-        per author by ``global_write_cooldown`` (checked once per note, before extraction).
-        Never raises — must not break the reply.
+        mem0 owns extraction, deduplication, and storage. This side task is guarded by
+        ``_guarded`` in ``run`` and also catches its own errors so memory never breaks replies.
         """
-        if (
-            self._memory is None
-            or self._extract_agent is None
-            or not self._config.memory_enabled
-            or not self._config.memory_ingest_notes
-        ):
+        if self._memory is None or not self._config.memory_enabled or not self._config.memory_ingest_notes:
             return
         text = (note.text or "").strip()
         if not text:
             return
         author = normalize_username(_user_handle(note.user))
-        context_lines = self._render_context_lines(context)
         try:
-            cooldown = self._config.global_write_cooldown
-            if cooldown > 0:
-                since = await self._memory.seconds_since_last_write(author)
-                if since is not None and since < cooldown:
-                    logfire.debug("Note ingestion skipped (write cooldown)", author=author)
-                    return
-            extracted = await self._extract_claim(text, speaker=author, context=context_lines or None)
-            if not isinstance(extracted, ExtractedClaims):
-                return
-            for claim in extracted.claims:
-                if claim.confidence < self._config.memory_min_confidence:
-                    logfire.debug(
-                        "Claim dropped (below confidence floor)",
-                        subject=claim.subject,
-                        confidence=claim.confidence,
-                    )
-                    continue
-                await self._memory.add_claim(
-                    subject=claim.subject,
-                    predicate=claim.predicate,
-                    object_text=claim.object,
-                    author=author,
-                )
+            await self._memory.add_note(text=text, author=author, note_id=note.id)
         except Exception:
-            logfire.exception("Note claim ingestion failed (reply unaffected)", author=author)
+            logfire.exception("Note memory ingestion failed (reply unaffected)", author=author)
 
     async def get_author_score(self, note: Note) -> Optional[int]:
         """Fetch the note author's social credit score (None if unset/no Redis)."""
