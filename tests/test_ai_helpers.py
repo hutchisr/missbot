@@ -1,5 +1,7 @@
 """Tests for pure helper functions in bot.ai."""
 
+import tomllib
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +12,7 @@ from bot.ai import (
     AgentDeps,
     ChatAgent,
     _build_user_content,
+    _CLASSIFIER_MODEL_SETTINGS,
     _enforce_length,
     _image_urls_for,
     _normalize_for_repeat,
@@ -147,6 +150,16 @@ def test_spec_supports_vision_respects_dict_flag():
         base_url="https://example.modal.run/v1",  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
     )
     assert _spec_supports_vision(spec_default) is True
+
+
+def test_model_settings_identify_missbot(config):
+    agent = ChatAgent(config)
+    with (Path(__file__).parents[1] / "pyproject.toml").open("rb") as project_file:
+        project_version = tomllib.load(project_file)["project"]["version"]
+    expected_headers = {"User-Agent": f"Missbot/{project_version}"}
+
+    assert agent._generation_settings(30.0)["extra_headers"] == expected_headers
+    assert _CLASSIFIER_MODEL_SETTINGS["extra_headers"] == expected_headers
 
 
 def test_enforce_length_passes_through_within_budget():

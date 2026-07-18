@@ -23,6 +23,7 @@ RUN useradd -m -u 1000 app
 
 COPY --from=builder --chown=app:app /app/.venv /app/.venv
 COPY --chown=app:app bot /app/bot
+COPY --chown=app:app pyproject.toml /app/pyproject.toml
 
 USER app
 

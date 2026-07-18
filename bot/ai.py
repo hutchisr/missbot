@@ -1,10 +1,12 @@
 import asyncio
 import os
 import re
+import tomllib
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Optional, Union
 
 import httpx
@@ -225,14 +227,26 @@ async def _guarded(coro: Awaitable[object], label: str) -> None:
 
 _FALLBACK_ON = (ModelAPIError, httpx.TimeoutException)
 
+
+def _load_project_version() -> str:
+    with (Path(__file__).resolve().parents[1] / "pyproject.toml").open("rb") as project_file:
+        project_version = tomllib.load(project_file)["project"]["version"]
+    if not isinstance(project_version, str):
+        raise TypeError("project.version must be a string")
+    return project_version
+
+
+_USER_AGENT = f"Missbot/{_load_project_version()}"
+
 # Run settings for constrained-output classifier agents (currently social scoring).
 # Their output types force a tool call (`tool_choice`), which
 # thinking-mode endpoints reject ("Thinking mode does not support this tool_choice") — so
 # reasoning is disabled (it's wasted on a labeling task anyway) and OpenRouter routing is
-# restricted to providers that support every request param (`require_parameters`). Both
-# extra keys are OpenRouter-namespaced and ignored by non-OpenRouter models.
+# restricted to providers that support every request param (`require_parameters`).
+# The two ``openrouter_*`` keys are ignored by non-OpenRouter models.
 _CLASSIFIER_MODEL_SETTINGS: ModelSettings = OpenRouterModelSettings(
     timeout=60.0,
+    extra_headers={"User-Agent": _USER_AGENT},
     openrouter_reasoning={"enabled": False},
     openrouter_provider={"require_parameters": True},
 )
@@ -412,13 +426,14 @@ class ChatAgent:
     def _generation_settings(self, timeout: float) -> ModelSettings:
         """Model settings for the reply/auto agents: the configured token cap
         (``max_tokens`` — otherwise unused), any configured sampling/anti-repetition
-        knobs, and a per-call timeout.
+        knobs, the versioned Missbot user agent, and a per-call timeout.
 
         ``max_tokens`` and the sampling params are only included when set in config, so
         unset ones keep the provider default (and aren't sent to models that reject them).
         """
         settings: ModelSettings = {
             "timeout": timeout,
+            "extra_headers": {"User-Agent": _USER_AGENT},
         }
         if self._config.max_tokens is not None:
             settings["max_tokens"] = self._config.max_tokens
