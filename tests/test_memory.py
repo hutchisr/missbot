@@ -1,11 +1,12 @@
 """Tests for the mem0 MemoryStore adapter."""
 
 import os
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from bot.memory import MemorySearchResult, MemoryStore, _mem0_config, _suppress_openrouter_autodetect
+from bot.memory import MemorySearchResult, MemoryStore, StoredMemory, _mem0_config, _suppress_openrouter_autodetect
 
 
 def _memory_cfg(make_config, **extra):
@@ -197,7 +198,18 @@ async def test_add_note_scopes_to_bot_agent_and_records_author(make_config):
         "author": "alice@remote.example",
         "source_note_id": "note-1",
     }
+    assert date.fromisoformat(kwargs["expiration_date"]) == datetime.now(timezone.utc).date() + timedelta(days=90)
     assert client.add.await_args.args[0][0]["content"] == "Alice@Remote.Example: I use Arch btw"
+
+
+@pytest.mark.anyio
+async def test_add_note_can_disable_expiration(make_config):
+    client = AsyncMock()
+    store = MemoryStore(client, _memory_cfg(make_config, memory_note_retention_days=None))
+
+    await store.add_note(text="I use Arch btw", author="alice")
+
+    assert client.add.await_args.kwargs["expiration_date"] is None
 
 
 @pytest.mark.anyio
@@ -244,3 +256,45 @@ async def test_search_maps_mem0_results(make_config):
             metadata={"author": "alice"},
         )
     ]
+
+
+@pytest.mark.anyio
+async def test_list_all_includes_expired_memories(make_config):
+    client = AsyncMock()
+    client.get_all.return_value = {
+        "results": [
+            {
+                "id": "memory-1",
+                "memory": "Alice likes lizards",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "expiration_date": "2026-02-01",
+                "metadata": {"source": "misskey_note", "author": "alice"},
+            },
+            {"memory": "missing id"},
+        ]
+    }
+    store = MemoryStore(client, _memory_cfg(make_config))
+
+    memories = await store.list_all(123)
+
+    client.get_all.assert_awaited_once_with(filters={"agent_id": "grok"}, top_k=123, show_expired=True)
+    assert memories == [
+        StoredMemory(
+            id="memory-1",
+            memory="Alice likes lizards",
+            created_at="2026-01-01T00:00:00+00:00",
+            expiration_date="2026-02-01",
+            metadata={"source": "misskey_note", "author": "alice"},
+        )
+    ]
+
+
+@pytest.mark.anyio
+async def test_delete_initializes_entity_store_before_mem0_delete(make_config):
+    client = MagicMock()
+    client.delete = AsyncMock()
+    store = MemoryStore(client, _memory_cfg(make_config))
+
+    await store.delete("memory-1")
+
+    client.delete.assert_awaited_once_with("memory-1")

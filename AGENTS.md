@@ -13,6 +13,10 @@ uv sync
 # Run
 uv run python -m bot -c config.local.yaml   # or: mise run bot
 
+# mem0 maintenance (the k8s CronJob runs the destructive form daily)
+uv run python -m bot.maintenance cleanup --dry-run -c config.local.yaml
+uv run python -m bot.maintenance cleanup -c config.local.yaml
+
 # Test
 # OPENROUTER_API_KEY must be set or test collection errors out: importing the agents
 # constructs a pydantic-ai OpenRouter provider that fails fast without a key. The value is
@@ -31,13 +35,15 @@ mise run build      # Build and push Docker image
 mise run deploy     # Apply K8s manifests and restart
 # k8s/config.yaml and k8s/secrets.txt are ignored local inputs; Kustomize emits
 # both as Secrets (the runtime config contains the Misskey token/DB credentials).
+# Edit k8s/maintenance-settings.yaml for the cleanup schedule/timezone; set
+# memory_max_memories_per_author in config.yaml for the per-author limit.
 
 # Production cluster (kubectl context: mercury)
 # Memory DB is CloudNativePG, NOT local. Connect via the primary pod with peer auth
 # as the postgres OS user (the `grok` app user fails peer auth; never put the password on the
 # command line — the safety classifier blocks it, and you don't need it):
 kubectl exec -n cnpg pg-cluster-1 -- psql -U postgres -d grok -tAc "SELECT count(*) FROM missbot_memories"
-# Bot pod lives in the `misskey` namespace (missbot-*), not `default`.
+# Bot pod and memory-maintenance CronJob live in the `misskey` namespace (missbot-*), not `default`.
 ```
 
 **Important:** Always use `uv run` or `.venv/bin/python` — never bare `python`.
@@ -51,7 +57,8 @@ kubectl exec -n cnpg pg-cluster-1 -- psql -U postgres -d grok -tAc "SELECT count
 | `bot/models.py` | Pydantic models: `Config`, `Note`, `User`, `MiFile`, WS message types |
 | `bot/tools.py` | `build_tools()` factory — datetime, web search, search_users/notes, social credit tools; `apply_social_credit()` helper |
 | `bot/scoring.py` | Injection-resistant message classifier: `build_scoring_spec()` turns `Config.social_credit_categories` into the constrained output type + delta map + hardened instructions; `build_scoring_prompt()` fences untrusted input |
-| `bot/memory.py` | Thin async adapter around mem0's `AsyncMemory`; builds the mem0 config, scopes memories to the bot `agent_id`, and exposes `add_note`, `add`, `search`, and `close` |
+| `bot/memory.py` | Thin async adapter around mem0's `AsyncMemory`; builds the mem0 config, scopes memories to the bot `agent_id`, and exposes the runtime plus maintenance read/delete paths |
+| `bot/maintenance.py` | Out-of-process mem0 cleanup CLI; selects expired, duplicate, stale, empty, and per-author overflow note memories, then deletes them through mem0 so entity links stay consistent. Driven by `k8s/maintenance.yaml` |
 | `bot/net.py` | `is_safe_media_url()` — SSRF guard for attacker-supplied image URLs (blocks private/reserved IPs and internal hosts) |
 | `bot/mcp.py` | `build_mcp_toolsets()` + `gate_names()` — streamable-HTTP MCP servers with allow/block and gate filtering |
 | `bot/api.py` | HTTP client utilities |
@@ -103,11 +110,16 @@ Memory is delegated to mem0 OSS through `bot/memory.py:MemoryStore`, backed by P
 - `memory_search_limit` (default `5`), `memory_search_threshold` (default `0.1`): search result count and mem0 score floor
 - `memory_custom_instructions`: optional custom instructions appended to mem0's extraction prompt
 - `memory_ingest_notes` (default `true`): auto-ingest each incoming user note through mem0
+- `memory_note_retention_days` (default `90`, nullable): expiration/physical-retention window for inferred note memories; explicit `add_memory` entries are exempt
+- `memory_max_memories_per_author` (default `50`, nullable): per-author cap for inferred note memories; maintenance removes the oldest overflow rows
+- `memory_cleanup_scan_limit` (default `10000`): maximum scoped rows examined in one cleanup run
 - `max_fact_length` (default `500`): longer `add_memory` submissions are rejected
 
-**Write path.** `ChatAgent.run` still runs reply generation, social scoring, and memory ingestion concurrently. `_maybe_ingest_note` sends only the latest public author note to mem0 with metadata `{source: "misskey_note", author, source_note_id}`; specified/private notes are never ingested. The `add_memory` tool likewise refuses writes during private interactions. mem0 owns extraction, deduplication, vector storage, and entity-style linking. Successful tool writes use metadata `{source: "add_memory", author: bot_username}`. Memory failures are logged and swallowed so they never cancel a reply.
+**Write path.** `ChatAgent.run` still runs reply generation, social scoring, and memory ingestion concurrently. `_maybe_ingest_note` sends only the latest public author note to mem0 with metadata `{source: "misskey_note", author, source_note_id}` and a configured expiration date; specified/private notes are never ingested. The `add_memory` tool likewise refuses writes during private interactions. mem0 owns extraction, deduplication, vector storage, and entity-style linking. Successful tool writes use metadata `{source: "add_memory", author: bot_username}` and do not expire automatically. Memory failures are logged and swallowed so they never cancel a reply.
 
 **Read path.** `search_memory` calls `MemoryStore.search()` with `agent_id=bot_username`, renders mem0 memories with score/source/author/recency metadata when available, and fences the returned text as untrusted data before the model sees it.
+
+**Maintenance path.** `python -m bot.maintenance cleanup` lists only the bot's `agent_id`, includes already-expired rows, and physically deletes empty memories, exact duplicates, inferred note memories past retention, and the oldest inferred memories above each author's cap. Explicit `add_memory` rows are protected from retention/cap cleanup. Deletion goes through mem0 after initializing its entity store so `missbot_memories_entities` links are cleaned too. `--dry-run` reports the same candidate summary without deleting. The `missbot-maintenance` CronJob runs with concurrency forbidden; Kustomize reads its schedule and timezone from `k8s/maintenance-settings.yaml`, while `memory_max_memories_per_author` in `config.yaml` controls the cap.
 
 ### MCP servers
 Each entry in `mcp_servers` takes:

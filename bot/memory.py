@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import os
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator, Optional, Union
 
 import logfire
@@ -35,6 +36,29 @@ class MemorySearchResult:
             score=item.get("score"),
             created_at=item.get("created_at"),
             updated_at=item.get("updated_at"),
+            metadata=dict(item.get("metadata") or {}),
+        )
+
+
+@dataclass
+class StoredMemory:
+    """A stored mem0 memory returned for maintenance."""
+
+    id: str
+    memory: str
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    expiration_date: Optional[str] = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_mem0(cls, item: dict[str, Any]) -> "StoredMemory":
+        return cls(
+            id=str(item.get("id") or ""),
+            memory=str(item.get("memory") or ""),
+            created_at=item.get("created_at"),
+            updated_at=item.get("updated_at"),
+            expiration_date=item.get("expiration_date"),
             metadata=dict(item.get("metadata") or {}),
         )
 
@@ -208,10 +232,16 @@ class MemoryStore:
         }
         if note_id:
             metadata["source_note_id"] = note_id
+        expiration_date = None
+        if self._config.memory_note_retention_days is not None:
+            expiration_date = (
+                datetime.now(timezone.utc).date() + timedelta(days=self._config.memory_note_retention_days)
+            ).isoformat()
         return await self._client.add(
             [{"role": "user", "content": f"{author}: {text}"}],
             agent_id=self._agent_id,
             metadata=metadata,
+            expiration_date=expiration_date,
             infer=True,
         )
 
@@ -231,6 +261,22 @@ class MemoryStore:
             threshold=self._config.memory_search_threshold,
         )
         return [MemorySearchResult.from_mem0(item) for item in result.get("results", []) if item.get("memory")]
+
+    async def list_all(self, limit: int) -> list[StoredMemory]:
+        """Return agent-scoped memories, including expired rows, for maintenance."""
+        result = await self._client.get_all(
+            filters=self._filters(),
+            top_k=limit,
+            show_expired=True,
+        )
+        return [StoredMemory.from_mem0(item) for item in result.get("results", []) if item.get("id")]
+
+    async def delete(self, memory_id: str) -> None:
+        """Delete one memory through mem0, including its entity-store links."""
+        # AsyncMemory initializes the entity store lazily. Its delete path only
+        # cleans entity links when the store has already been initialized.
+        self._client.entity_store
+        await self._client.delete(memory_id)
 
     async def close(self) -> None:
         self._client.close()

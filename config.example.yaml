@@ -113,6 +113,9 @@ searxng_password: "yourpassword"
 # memory_llm_api_key_env: OPENROUTER_API_KEY
 # memory_search_limit: 5
 # memory_search_threshold: 0.1
+# memory_note_retention_days: 90       # null disables age-based note cleanup
+# memory_max_memories_per_author: 50  # null disables the per-author note cap
+# memory_cleanup_scan_limit: 10000
 # max_fact_length: 500               # longer facts are rejected
 
 # The bot's reply is the model's plain text output. Mentions are added

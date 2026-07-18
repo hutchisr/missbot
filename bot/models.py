@@ -430,6 +430,23 @@ class Config(BaseModel):
         description="When memory is enabled, auto-ingest each incoming user note through mem0. Set false to "
         "disable note learning while keeping add_memory / search_memory available.",
     )
+    memory_note_retention_days: Optional[int] = Field(
+        default=90,
+        gt=0,
+        description="Days to retain memories inferred from Misskey notes. New note memories receive a mem0 "
+        "expiration date, and maintenance physically deletes older rows. Set null to disable age-based cleanup.",
+    )
+    memory_max_memories_per_author: Optional[int] = Field(
+        default=50,
+        gt=0,
+        description="Maximum auto-ingested note memories retained per author. Maintenance removes the oldest "
+        "overflow rows. Explicit add_memory entries are exempt. Set null to disable the per-author cap.",
+    )
+    memory_cleanup_scan_limit: int = Field(
+        default=10_000,
+        gt=0,
+        description="Maximum agent-scoped mem0 rows examined by one maintenance cleanup run.",
+    )
     debug: Optional[bool] = None
 
     @model_validator(mode="after")

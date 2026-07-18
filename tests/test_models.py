@@ -123,6 +123,9 @@ def test_memory_disabled_by_default(make_config):
     assert cfg.memory_collection_name == "missbot_memories"
     assert cfg.memory_search_limit == 5
     assert cfg.memory_search_threshold == 0.1
+    assert cfg.memory_note_retention_days == 90
+    assert cfg.memory_max_memories_per_author == 50
+    assert cfg.memory_cleanup_scan_limit == 10_000
 
 
 def test_memory_enabled_requires_postgres_url(make_config):

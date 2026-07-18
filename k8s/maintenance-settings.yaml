@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/name: missbot
+    app.kubernetes.io/component: memory-maintenance
+  name: missbot-maintenance-settings
+  namespace: misskey
+data:
+  # Kubernetes CronJob syntax. This runs at 04:17 in the timezone below.
+  schedule: "17 4 * * *"
+  timeZone: America/Los_Angeles

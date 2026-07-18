@@ -1,0 +1,59 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  labels:
+    app.kubernetes.io/name: missbot
+    app.kubernetes.io/component: memory-maintenance
+  name: missbot-maintenance
+  namespace: misskey
+spec:
+  # Kustomize replaces these defaults from maintenance-settings.yaml. Explicit
+  # add_memory entries are preserved; inferred note memories follow the limits
+  # in config.yaml.
+  schedule: "17 4 * * *"
+  timeZone: America/Los_Angeles
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 1800
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: missbot
+            app.kubernetes.io/component: memory-maintenance
+        spec:
+          restartPolicy: Never
+          containers:
+            - image: lax.vultrcr.com/mercury/korg:latest
+              imagePullPolicy: Always
+              name: maintenance
+              command: ["/app/.venv/bin/python", "-m", "bot.maintenance"]
+              args: ["cleanup", "-c", "/config.yaml"]
+              env:
+                - name: LOGFIRE_SERVICE_NAME
+                  value: missbot-maintenance
+                - name: LOGFIRE_ENVIRONMENT
+                  value: k8s
+              envFrom:
+                - secretRef:
+                    name: missbot-secrets
+              volumeMounts:
+                - name: config-volume
+                  mountPath: /config.yaml
+                  subPath: config.yaml
+                  readOnly: true
+              resources:
+                requests:
+                  memory: "512Mi"
+                  cpu: "100m"
+                limits:
+                  memory: "1Gi"
+                  cpu: "1000m"
+          volumes:
+            - name: config-volume
+              secret:
+                secretName: missbot-config
