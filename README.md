@@ -125,11 +125,12 @@ contains the Misskey token and may contain database credentials.
 
 ```bash
 cp config.example.yaml k8s/config.yaml
+mise run build
 mise run deploy
 ```
 
-`mise run deploy` builds and pushes the image, applies the Kustomize manifests,
-and restarts the deployment. Edit
+`mise run build` builds and pushes the image. `mise run deploy` applies the
+Kustomize manifests and restarts the deployment. Edit
 [k8s/maintenance-settings.yaml](k8s/maintenance-settings.yaml) to change the
 memory-cleanup schedule or timezone.
 
