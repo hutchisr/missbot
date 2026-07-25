@@ -15,7 +15,11 @@ allowlist if your instance proxies all media.
 
 import ipaddress
 import socket
+from typing import Optional
 from urllib.parse import urlsplit
+
+import httpx
+import logfire
 
 # Internal-by-convention names that should never be reachable media hosts.
 _BLOCKED_HOSTS = frozenset({"localhost", "metadata", "metadata.google.internal"})
@@ -78,3 +82,58 @@ def is_safe_media_url(url: str) -> bool:
     if all(ch in "0123456789." for ch in host):
         return False
     return True
+
+
+async def fetch_image(
+    url: str,
+    *,
+    timeout: float,
+    max_bytes: int,
+    transport: Optional[httpx.AsyncBaseTransport] = None,
+) -> Optional[tuple[bytes, str]]:
+    """Download an image so it can be sent inline as base64, or None if unusable.
+
+    Some OpenAI-compatible providers refuse image URLs and require the bytes inline
+    (Ollama Cloud answers ``image URLs are not currently supported, please use base64
+    encoded data instead``). Fetching means *this process* now retrieves
+    attacker-supplied media from a federated note, so the guards matter:
+
+    - ``is_safe_media_url`` is re-checked here, not merely trusted from extraction time.
+    - The body is streamed and abandoned the moment it exceeds ``max_bytes``, so a huge
+      file cannot exhaust the pod's memory.
+    - A non-image content type is refused rather than handed to a model.
+    - A dedicated client is used. The shared ``api_client`` carries the Misskey token,
+      which must never be sent to a third-party media host.
+
+    Every failure returns None so the caller drops that one image and still replies.
+    """
+    if not is_safe_media_url(url):
+        logfire.warning("Refusing to fetch image with unsafe URL", url=url)
+        return None
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout),
+            follow_redirects=False,  # a redirect could point back at an internal host
+            transport=transport,
+        ) as client:
+            async with client.stream("GET", url) as response:
+                response.raise_for_status()
+                media_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+                if not media_type.startswith("image/"):
+                    logfire.warning("Refusing non-image media", url=url, content_type=media_type)
+                    return None
+
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in response.aiter_bytes():
+                    total += len(chunk)
+                    if total > max_bytes:
+                        logfire.warning("Image exceeds size cap; dropping", url=url, max_bytes=max_bytes)
+                        return None
+                    chunks.append(chunk)
+    except httpx.HTTPError:
+        logfire.warning("Image fetch failed", url=url)
+        return None
+
+    return b"".join(chunks), media_type

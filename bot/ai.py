@@ -11,7 +11,7 @@ from typing import Any, Optional, Union
 
 import httpx
 
-from pydantic_ai import Agent, ImageUrl, ModelRetry, RunContext
+from pydantic_ai import Agent, ModelRetry, RunContext
 from pydantic_ai.exceptions import ModelAPIError
 from pydantic_ai.messages import (
     ModelMessage,
@@ -29,15 +29,12 @@ from pydantic_ai.settings import ModelSettings
 import logfire
 from redis.asyncio import Redis
 
+from .core import AgentTurn, HistoryTurn, TurnImage
 from .mcp import build_mcp_toolsets, gate_names
 from .memory import MemoryStore
-from .models import Config, CustomOpenAIModel, Note, User
-from .net import is_safe_media_url
+from .models import Config, CustomOpenAIModel
 from .scoring import ScoringSpec, build_scoring_prompt, build_scoring_spec
 from .tools import apply_social_credit, build_tools, normalize_username
-
-
-_RESTRICTED_MEMORY_VISIBILITIES = frozenset({"followers", "specified"})
 
 
 @dataclass
@@ -109,16 +106,9 @@ def _spec_supports_vision(spec: Union[str, CustomOpenAIModel]) -> bool:
     return spec.vision
 
 
-def _user_handle(user: User) -> str:
-    """Get full handle: username for local, username@host for remote."""
-    if user.host:
-        return f"{user.username}@{user.host}"
-    return user.username
-
-
 # Mirrors bot/bot.py:_strip_leading_mentions — the `@handle` prefix send_note prepends to
-# every reply. Stripped when a prior bot note is reconstructed as assistant history so it
-# doesn't prime the model to open with the same mention (and copy the rest verbatim).
+# every reply. Adapters strip it before handing a prior bot message back as assistant
+# history; `_normalize_for_repeat` strips it again when comparing model output.
 _LEADING_MENTIONS_RE = re.compile(r"^(?:@[\w\-]+(?:@[\w\-.]+)?(?:\s+|$))+")
 
 
@@ -133,39 +123,10 @@ def _normalize_for_repeat(text: str) -> str:
     return " ".join(_strip_leading_mentions(text.strip()).split()).lower()
 
 
-def _image_urls_for(note: Note, vision: bool) -> list[ImageUrl]:
-    """Extract ImageUrl objects for a note's visual attachments.
-
-    Images use their thumbnail (falling back to the full image). Videos have no
-    image body, but Misskey renders an image thumbnail for them — use that so the
-    vision model can still see a frame. Never fall back to a video's raw ``url``
-    (that's the video file, not an image). Other media (audio, etc.) is skipped.
-    """
-    if not vision or not note.files:
-        return []
-
-    images: list[ImageUrl] = []
-    for file in note.files:
-        if file.type.startswith("image/"):
-            image_url = file.thumbnailUrl or file.url
-        elif file.type.startswith("video/"):
-            image_url = file.thumbnailUrl
-        else:
-            continue
-        if not image_url:
-            continue
-        # SSRF guard: the URL is attacker-controlled on federated notes.
-        if not is_safe_media_url(image_url):
-            logfire.warning("Dropping image with unsafe URL", url=image_url, file_id=file.id)
-            continue
-        images.append(ImageUrl(url=image_url))
-    return images
-
-
-def _build_user_content(note: Note, vision: bool) -> str | list[str | ImageUrl]:
-    """Build content for a user prompt part, with optional images."""
-    text = f"{_user_handle(note.user)}: {note.text or ''}"
-    images = _image_urls_for(note, vision)
+def _history_content(turn: HistoryTurn, vision: bool) -> str | list[str | TurnImage]:
+    """Build content for a historical user prompt part, with optional images."""
+    text = f"{turn.author}: {turn.text}" if turn.author else turn.text
+    images = turn.images if vision else []
     if images:
         return [text, *images]
     return text
@@ -193,6 +154,10 @@ class AgentDeps:
     weaker fallback models when the new message is a thin same-topic follow-up)."""
     memory_writes_allowed: bool = True
     """False for followers-only/private notes so global memory cannot retain restricted content."""
+    char_budget: Optional[int] = None
+    """Hard reply length cap for this run, or None for no cap. Set per-frontend by the
+    adapter (Misskey passes its note limit; ACP passes None), so the same agent can serve
+    surfaces with different limits. Drives both the length instruction and its validator."""
 
 
 def _make_enable_gate_tool(gate: str, servers: list[str]):
@@ -260,12 +225,6 @@ def _model_chain(specs: list[Union[str, CustomOpenAIModel]]) -> Optional[Union[s
     if len(resolved) == 1:
         return resolved[0]
     return FallbackModel(*resolved, fallback_on=_FALLBACK_ON)
-
-
-# Chars reserved for the mention prefix the bot prepends (up to ``max_reply_mentions``
-# handles). Budgeting the reply below the raw cap keeps the final note within the platform
-# limit; ``_enforce_length`` enforces it (no truncation backstop — over-cap notes are refused).
-_MENTION_HEADROOM = 280
 
 
 def _length_instruction(char_limit: int) -> str:
@@ -351,20 +310,24 @@ class ChatAgent:
                 )
             return "\n".join(parts)
 
-        # Budget the reply below the raw note cap so the prepended mention prefix
-        # still fits; the auto post (no mentions) gets the full cap.
-        reply_char_budget = max(1, config.max_note_length - _MENTION_HEADROOM)
+        async def _inject_length_budget(ctx: RunContext[AgentDeps]) -> str:
+            # Per-run, not per-agent: each frontend sets its own cap on the turn
+            # (Misskey its note limit, ACP none), so the instruction is dynamic.
+            if ctx.deps.char_budget is None:
+                return ""
+            return _length_instruction(ctx.deps.char_budget)
+
         self._agent: Agent[AgentDeps, str] = Agent(
             model,
             output_type=str,
             deps_type=AgentDeps,
-            instructions=[config.system_prompt, _length_instruction(reply_char_budget), _inject_social_credit],
+            instructions=[config.system_prompt, _inject_length_budget, _inject_social_credit],
             tools=tools,
             toolsets=mcp_toolsets or None,
             retries=3,
         )
-        # Hard-gate the reply to the budget the instruction states (see _enforce_length).
-        self._agent.output_validator(_enforce_length(reply_char_budget))
+        # Hard-gate the reply to the budget the instruction states (see _enforce_budget).
+        self._agent.output_validator(self._enforce_budget)
         # Reject a reply that just parrots the bot's prior turn in the same thread.
         self._agent.output_validator(self._reject_verbatim_repeat)
 
@@ -409,6 +372,16 @@ class ChatAgent:
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self._agent.__aexit__(exc_type, exc, tb)
 
+    def _enforce_budget(self, ctx: RunContext[AgentDeps], output: str) -> str:
+        """Output validator hard-gating the reply to the turn's ``char_budget``.
+
+        The per-run counterpart to ``_enforce_length`` (which the auto agent still uses
+        with its fixed cap). A frontend that passes no budget — ACP — gets no cap.
+        """
+        if ctx.deps.char_budget is None:
+            return output
+        return _enforce_length(ctx.deps.char_budget)(output)
+
     def _reject_verbatim_repeat(self, ctx: RunContext[AgentDeps], output: str) -> str:
         """Output validator: reject a reply identical to the bot's previous turn in this
         thread. Weaker fallback models sometimes re-emit their prior (often long) assistant
@@ -447,14 +420,12 @@ class ChatAgent:
             settings["presence_penalty"] = self._config.presence_penalty
         return settings
 
-    @logfire.instrument(extract_args=["note"])
-    async def run(self, note: Note, context: Optional[list[Note]] = None) -> str:
-        """Process a note and generate a reply."""
-        bot_user_id = self._config.bot_user_id
-        vision = self._config.vision
-        current_images = _image_urls_for(note, vision)
-        if not note.text and not current_images:
-            raise ValueError("Note has no text or supported images")
+    @logfire.instrument(extract_args=["turn"])
+    async def run(self, turn: AgentTurn) -> str:
+        """Process one frontend-neutral turn and generate a reply."""
+        current_images = list(turn.images)
+        if not turn.text and not current_images:
+            raise ValueError("Turn has no text or supported images")
 
         # Pick the model chain. If the prompt has images but no model is vision-capable,
         # drop the images and run text-only — else the whole fallback fails ("no endpoints
@@ -467,57 +438,48 @@ class ChatAgent:
             elif self._vision_model is not None:
                 run_model = self._vision_model
 
-        # Mirror the same drop on context-note images so the history matches.
-        effective_vision = vision and self._has_vision_model
+        # Mirror the same drop on history images so the history matches.
+        effective_vision = self._has_vision_model
         message_history: list[ModelMessage] = []
-        if context:
-            for c in reversed(context):
-                if c.userId == bot_user_id:
-                    # Bot's own previous messages become assistant responses. Strip the
-                    # leading @mention prefix send_note prepended, so the history doesn't
-                    # prime the model to re-open (and copy) its prior reply verbatim.
-                    message_history.append(
-                        ModelResponse(parts=[TextPart(content=_strip_leading_mentions((c.text or "").strip()))])
-                    )
-                else:
-                    # Other users' messages become user prompts (with any attached images)
-                    message_history.append(
-                        ModelRequest(parts=[UserPromptPart(content=_build_user_content(c, effective_vision))])
-                    )
+        for past in turn.history:
+            if past.role == "assistant":
+                # The bot's own earlier messages become assistant responses. Adapters
+                # strip any platform mention prefix before handing them over, so the
+                # history can't prime the model to copy its prior reply verbatim.
+                message_history.append(ModelResponse(parts=[TextPart(content=past.text.strip())]))
+            else:
+                # Other users' messages become user prompts (with any attached images)
+                message_history.append(
+                    ModelRequest(parts=[UserPromptPart(content=_history_content(past, effective_vision))])
+                )
 
         # Build current user prompt
-        current_parts: list[str | ImageUrl] = []
-        if note.user.location:
-            current_parts.append(f"User location: {note.user.location}")
-        current_parts.append(f"{_user_handle(note.user)}: {note.text or ''}")
+        current_parts: list[str | TurnImage] = []
+        if turn.author.location:
+            current_parts.append(f"User location: {turn.author.location}")
+        current_parts.append(f"{turn.author.rendered}: {turn.text}")
         if current_images:
             current_parts.extend(current_images)
 
-        prompt: str | list[str | ImageUrl]
+        prompt: str | list[str | TurnImage]
         if len(current_parts) == 1 and isinstance(current_parts[0], str):
             prompt = current_parts[0]
         else:
             prompt = current_parts
 
         # Pre-fetch social credit score for the current user
-        handle = _user_handle(note.user)
-        score = await self._get_social_credit_score(handle)
-        # Lift the author-only restriction when the note's author is a designated
-        # privileged user (e.g. the operator), configured by user id.
-        unrestricted = note.user.id in self._config.social_credit_unrestricted_user_ids
-        # The bot's most recent reply in this thread (context is nearest-parent first), used by
-        # the verbatim-repeat output validator. None when the bot hasn't spoken in the thread.
-        previous_bot_reply = next(
-            (c.text for c in (context or []) if c.userId == bot_user_id and (c.text or "").strip()),
-            None,
-        )
+        score = await self._get_social_credit_score(turn.author.handle)
         deps = AgentDeps(
-            username=handle,
-            source_note_id=note.id,
+            # Prompt-facing, so use the rendered handle; scoring and memory key off
+            # `turn.author.handle` instead.
+            username=turn.author.rendered,
+            source_note_id=turn.source_id,
             social_credit_score=score,
-            social_credit_unrestricted=unrestricted,
-            previous_bot_reply=previous_bot_reply,
-            memory_writes_allowed=note.visibility not in _RESTRICTED_MEMORY_VISIBILITIES,
+            # The adapter decides privilege — it owns the platform's notion of identity.
+            social_credit_unrestricted=turn.author.privileged,
+            previous_bot_reply=turn.previous_reply,
+            memory_writes_allowed=turn.memory_writes_allowed,
+            char_budget=turn.char_budget,
         )
 
         run_kwargs: dict[str, Any] = {
@@ -532,44 +494,46 @@ class ChatAgent:
         # swallowed and can never cancel the reply.
         result, _, _ = await asyncio.gather(
             self._agent.run(prompt, **run_kwargs),
-            _guarded(self._maybe_score_message(note, context), "Message scoring"),
-            _guarded(self._maybe_ingest_note(note, context), "Note ingestion"),
+            _guarded(self._maybe_score_message(turn), "Message scoring"),
+            _guarded(self._maybe_ingest_note(turn), "Note ingestion"),
         )
         return result.output
 
-    def _render_context_lines(self, context: Optional[list[Note]]) -> list[str]:
-        """Render the prior thread chronologically as reference-only "handle: text" lines.
+    def _render_context_lines(self, history: list[HistoryTurn]) -> list[str]:
+        """Render the prior conversation chronologically as reference-only "handle: text"
+        lines.
 
-        ``context`` is newest-first (as built for ``message_history``), so reverse it.
-        Empty notes are dropped; the bot's own notes use the configured bot handle. Shared
-        by the note-ingestion and scoring side tasks so both see the same thread rendering.
+        ``history`` is oldest-first. Empty messages are dropped; the bot's own messages
+        use the configured bot handle. Shared by the note-ingestion and scoring side tasks
+        so both see the same thread rendering.
         """
         lines: list[str] = []
-        for c in reversed(context or []):
-            ctext = (c.text or "").strip()
-            if not ctext:
+        for past in history:
+            text = past.text.strip()
+            if not text:
                 continue
-            handle = self._config.bot_username if c.userId == self._config.bot_user_id else _user_handle(c.user)
-            lines.append(f"{handle}: {ctext}")
+            handle = past.author or self._config.bot_username
+            lines.append(f"{handle}: {text}")
         return lines
 
-    async def _maybe_score_message(self, note: Note, context: Optional[list[Note]] = None) -> None:
+    async def _maybe_score_message(self, turn: AgentTurn) -> None:
         """Classify the author's message and apply a bounded score delta.
 
         Applies to every author (privileged users included — the privileged flag
         only gates the manual adjust tool, not automatic scoring). Uses the isolated
         classifier (no tools, constrained output) so the score is decided by code,
-        not by anything the user can put in their message. The prior thread (``context``)
-        is passed to the classifier as reference-only material so tone is judged in context
-        (a curt reply read as hostile vs. friendly ribbing depending on what it answers).
-        Rate limited per user. Never raises — scoring must not break the reply path.
+        not by anything the user can put in their message. The prior conversation
+        (``turn.history``) is passed to the classifier as reference-only material so tone
+        is judged in context (a curt reply read as hostile vs. friendly ribbing depending
+        on what it answers). Rate limited per user. Never raises — scoring must not break
+        the reply path.
         """
         if self._score_agent is None or self._redis is None:
             return
-        text = (note.text or "").strip()
+        text = turn.text.strip()
         if not text:
             return
-        username = normalize_username(_user_handle(note.user))
+        username = normalize_username(turn.author.handle)
         cooldown_key = f"score_cooldown:{username}"
         try:
             # Skip the classifier call entirely while the user is on cooldown.
@@ -582,7 +546,7 @@ class ChatAgent:
             # We still never re-raise — the reply must not break.
             try:
                 scored = await self._score_agent.run(
-                    build_scoring_prompt(text, context=self._render_context_lines(context) or None),
+                    build_scoring_prompt(text, context=self._render_context_lines(turn.history) or None),
                     model_settings=_CLASSIFIER_MODEL_SETTINGS,
                 )
             except Exception:
@@ -635,30 +599,30 @@ class ChatAgent:
         self._auto_history.append(result.output)
         return result.output
 
-    async def _maybe_ingest_note(self, note: Note, context: Optional[list[Note]] = None) -> None:
-        """Let mem0 learn durable memories from the author's note.
+    async def _maybe_ingest_note(self, turn: AgentTurn) -> None:
+        """Let mem0 learn durable memories from the author's message.
 
         mem0 owns extraction, deduplication, and storage. This side task is guarded by
         ``_guarded`` in ``run`` and also catches its own errors so memory never breaks replies.
         """
         if self._memory is None or not self._config.memory_enabled or not self._config.memory_ingest_notes:
             return
-        # Followers-only and direct/specified notes may be replyable, but their
-        # restricted content must never enter the bot-global memory namespace.
-        if note.visibility in _RESTRICTED_MEMORY_VISIBILITIES:
+        # Restricted interactions may be replyable, but their content must never enter the
+        # bot-global memory namespace. The adapter owns that judgement per platform.
+        if not turn.memory_writes_allowed:
             return
-        text = (note.text or "").strip()
+        text = turn.text.strip()
         if not text:
             return
-        author = normalize_username(_user_handle(note.user))
+        author = normalize_username(turn.author.handle)
         try:
-            await self._memory.add_note(text=text, author=author, note_id=note.id)
+            await self._memory.add_note(text=text, author=author, note_id=turn.source_id, source=turn.source)
         except Exception:
             logfire.exception("Note memory ingestion failed (reply unaffected)", author=author)
 
-    async def get_author_score(self, note: Note) -> Optional[int]:
-        """Fetch the note author's social credit score (None if unset/no Redis)."""
-        return await self._get_social_credit_score(_user_handle(note.user))
+    async def get_score(self, handle: str) -> Optional[int]:
+        """Fetch a handle's social credit score (None if unset/no Redis)."""
+        return await self._get_social_credit_score(handle)
 
     async def _get_social_credit_score(self, username: str) -> Optional[int]:
         """Fetch the user's social credit score from Redis."""

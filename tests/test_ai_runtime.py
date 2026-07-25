@@ -1,4 +1,8 @@
-"""Tests for ChatAgent runtime behavior."""
+"""Tests for ChatAgent runtime behavior.
+
+`ChatAgent` speaks frontend-neutral `AgentTurn`s. The Misskey-specific translation
+(attachments, visibility, privileged user ids) is covered in `test_bot_utils.py`.
+"""
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -7,22 +11,22 @@ import pytest
 from pydantic_ai import ImageUrl
 
 from bot.ai import ChatAgent
-from bot.models import MiFile
+from bot.core import HistoryTurn
+
+
+_IMAGE = ImageUrl(url="https://media.example/1.png")
 
 
 @pytest.mark.anyio
-async def test_run_accepts_image_only_note(config, make_note):
+async def test_run_accepts_image_only_turn(config, make_turn):
     agent = ChatAgent(config)
-    note = make_note(
-        text=None,
-        files=[MiFile(id="f1", type="image/png", thumbnailUrl="https://media.example/1.png")],
-    )
+    turn = make_turn(text="", images=[_IMAGE])
 
     with (
         patch.object(agent, "_get_social_credit_score", AsyncMock(return_value=None)),
         patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="vision reply"))) as run_mock,
     ):
-        result = await agent.run(note)
+        result = await agent.run(turn)
 
     assert result == "vision reply"
     assert run_mock.await_args is not None
@@ -33,7 +37,14 @@ async def test_run_accepts_image_only_note(config, make_note):
 
 
 @pytest.mark.anyio
-async def test_run_routes_image_prompt_to_vision_model(make_config, make_note):
+async def test_run_rejects_turn_with_no_text_or_images(config, make_turn):
+    agent = ChatAgent(config)
+    with pytest.raises(ValueError):
+        await agent.run(make_turn(text=""))
+
+
+@pytest.mark.anyio
+async def test_run_routes_image_prompt_to_vision_model(make_config, make_turn):
     cfg = make_config(
         llm_models=[
             {"model": "openrouter:vision/model"},
@@ -44,23 +55,18 @@ async def test_run_routes_image_prompt_to_vision_model(make_config, make_note):
     assert agent._has_vision_model
     assert agent._vision_model is not None
 
-    note = make_note(
-        text=None,
-        files=[MiFile(id="f1", type="image/png", thumbnailUrl="https://media.example/1.png")],
-    )
-
     with (
         patch.object(agent, "_get_social_credit_score", AsyncMock(return_value=None)),
         patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="ok"))) as run_mock,
     ):
-        await agent.run(note)
+        await agent.run(make_turn(text="", images=[_IMAGE]))
 
     assert run_mock.await_args is not None
     assert run_mock.await_args.kwargs["model"] is agent._vision_model
 
 
 @pytest.mark.anyio
-async def test_run_skips_model_override_when_no_images(make_config, make_note):
+async def test_run_skips_model_override_when_no_images(make_config, make_turn):
     cfg = make_config(
         llm_models=[
             {"model": "openrouter:vision/model"},
@@ -68,34 +74,28 @@ async def test_run_skips_model_override_when_no_images(make_config, make_note):
         ]
     )
     agent = ChatAgent(cfg)
-    note = make_note(text="hi")
 
     with (
         patch.object(agent, "_get_social_credit_score", AsyncMock(return_value=None)),
         patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="ok"))) as run_mock,
     ):
-        await agent.run(note)
+        await agent.run(make_turn(text="hi"))
 
     assert run_mock.await_args is not None
     assert "model" not in run_mock.await_args.kwargs
 
 
 @pytest.mark.anyio
-async def test_run_drops_images_when_no_vision_model(make_config, make_note):
+async def test_run_drops_images_when_no_vision_model(make_config, make_turn):
     cfg = make_config(llm_models=[{"model": "openrouter:text/model", "vision": False}])
     agent = ChatAgent(cfg)
     assert not agent._has_vision_model
-
-    note = make_note(
-        text="look",
-        files=[MiFile(id="f1", type="image/png", thumbnailUrl="https://media.example/1.png")],
-    )
 
     with (
         patch.object(agent, "_get_social_credit_score", AsyncMock(return_value=None)),
         patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="ok"))) as run_mock,
     ):
-        await agent.run(note)
+        await agent.run(make_turn(text="look", images=[_IMAGE]))
 
     assert run_mock.await_args is not None
     prompt = run_mock.await_args.args[0]
@@ -105,32 +105,108 @@ async def test_run_drops_images_when_no_vision_model(make_config, make_note):
 
 
 @pytest.mark.anyio
-async def test_run_flags_unrestricted_for_privileged_author(make_config, make_note, make_user):
-    cfg = make_config(social_credit_unrestricted_user_ids=["admin-id"])
-    agent = ChatAgent(cfg)
-    note = make_note(text="judge bob", user=make_user(id="admin-id", username="boss"))
+async def test_run_prepends_author_location(config, make_turn):
+    agent = ChatAgent(config)
 
     with (
         patch.object(agent, "_get_social_credit_score", AsyncMock(return_value=None)),
         patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="ok"))) as run_mock,
     ):
-        await agent.run(note)
+        await agent.run(make_turn(text="hi", location="Berlin"))
+
+    assert run_mock.await_args is not None
+    prompt = run_mock.await_args.args[0]
+    assert prompt == ["User location: Berlin", "alice: hi"]
+
+
+@pytest.mark.anyio
+async def test_run_uses_display_for_prompt_and_handle_for_state(make_config, make_turn, fake_redis):
+    """The prompt shows the readable handle; scoring keys off the identity handle."""
+    agent = ChatAgent(make_config(), redis_client=fake_redis)
+    turn = make_turn(text="hi", handle="acp:abc123", display="alice (acp)")
+
+    with (
+        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="ok"))) as run_mock,
+        patch.object(agent._score_agent, "run", AsyncMock(return_value=SimpleNamespace(output="good"))),
+    ):
+        await agent.run(turn)
+
+    assert run_mock.await_args is not None
+    assert run_mock.await_args.args[0] == "alice (acp): hi"
+    assert run_mock.await_args.kwargs["deps"].username == "alice (acp)"
+    assert await fake_redis.get("score:acp:abc123") == "5"
+
+
+@pytest.mark.anyio
+async def test_run_passes_char_budget_to_deps(config, make_turn):
+    agent = ChatAgent(config)
+
+    with (
+        patch.object(agent, "_get_social_credit_score", AsyncMock(return_value=None)),
+        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="ok"))) as run_mock,
+    ):
+        await agent.run(make_turn(text="hi", char_budget=2720))
+
+    assert run_mock.await_args is not None
+    assert run_mock.await_args.kwargs["deps"].char_budget == 2720
+
+
+@pytest.mark.anyio
+async def test_run_uncapped_when_turn_has_no_budget(config, make_turn):
+    agent = ChatAgent(config)
+
+    with (
+        patch.object(agent, "_get_social_credit_score", AsyncMock(return_value=None)),
+        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="ok"))) as run_mock,
+    ):
+        await agent.run(make_turn(text="hi"))
+
+    assert run_mock.await_args is not None
+    assert run_mock.await_args.kwargs["deps"].char_budget is None
+
+
+@pytest.mark.anyio
+async def test_run_builds_message_history_from_turn(config, make_turn):
+    agent = ChatAgent(config)
+    history = [
+        HistoryTurn(role="user", text="first", author="bob"),
+        HistoryTurn(role="assistant", text="my answer"),
+    ]
+
+    with (
+        patch.object(agent, "_get_social_credit_score", AsyncMock(return_value=None)),
+        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="ok"))) as run_mock,
+    ):
+        await agent.run(make_turn(text="second", history=history))
+
+    assert run_mock.await_args is not None
+    messages = run_mock.await_args.kwargs["message_history"]
+    assert [m.parts[0].content for m in messages] == ["bob: first", "my answer"]
+
+
+@pytest.mark.anyio
+async def test_run_flags_unrestricted_for_privileged_author(config, make_turn):
+    agent = ChatAgent(config)
+
+    with (
+        patch.object(agent, "_get_social_credit_score", AsyncMock(return_value=None)),
+        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="ok"))) as run_mock,
+    ):
+        await agent.run(make_turn(text="judge bob", handle="boss", privileged=True))
 
     assert run_mock.await_args is not None
     assert run_mock.await_args.kwargs["deps"].social_credit_unrestricted is True
 
 
 @pytest.mark.anyio
-async def test_run_restricted_for_non_privileged_author(make_config, make_note, make_user):
-    cfg = make_config(social_credit_unrestricted_user_ids=["admin-id"])
-    agent = ChatAgent(cfg)
-    note = make_note(text="hi", user=make_user(id="rando-id", username="rando"))
+async def test_run_restricted_for_non_privileged_author(config, make_turn):
+    agent = ChatAgent(config)
 
     with (
         patch.object(agent, "_get_social_credit_score", AsyncMock(return_value=None)),
         patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="ok"))) as run_mock,
     ):
-        await agent.run(note)
+        await agent.run(make_turn(text="hi", handle="rando"))
 
     assert run_mock.await_args is not None
     assert run_mock.await_args.kwargs["deps"].social_credit_unrestricted is False
@@ -162,15 +238,14 @@ def test_score_model_uses_separate_chain_when_configured(make_config, fake_redis
 
 
 @pytest.mark.anyio
-async def test_run_auto_scores_non_privileged_message(make_config, make_note, fake_redis):
+async def test_run_auto_scores_non_privileged_message(make_config, make_turn, fake_redis):
     agent = ChatAgent(make_config(), redis_client=fake_redis)
-    note = make_note(text="what a lovely day")  # author = alice
 
     with (
         patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
         patch.object(agent._score_agent, "run", AsyncMock(return_value=SimpleNamespace(output="good"))) as score_mock,
     ):
-        out = await agent.run(note)
+        out = await agent.run(make_turn(text="what a lovely day"))
 
     assert out == "reply"
     assert score_mock.await_count == 1
@@ -180,16 +255,15 @@ async def test_run_auto_scores_non_privileged_message(make_config, make_note, fa
 
 
 @pytest.mark.anyio
-async def test_run_scoring_respects_cooldown(make_config, make_note, fake_redis):
+async def test_run_scoring_respects_cooldown(make_config, make_turn, fake_redis):
     agent = ChatAgent(make_config(), redis_client=fake_redis)
     await fake_redis.set("score_cooldown:alice", "1")  # already on cooldown
-    note = make_note(text="another banger")
 
     with (
         patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
         patch.object(agent._score_agent, "run", AsyncMock(return_value=SimpleNamespace(output="good"))) as score_mock,
     ):
-        await agent.run(note)
+        await agent.run(make_turn(text="another banger"))
 
     # Classifier is not even consulted while on cooldown, and no score is applied.
     assert score_mock.await_count == 0
@@ -197,15 +271,14 @@ async def test_run_scoring_respects_cooldown(make_config, make_note, fake_redis)
 
 
 @pytest.mark.anyio
-async def test_run_scoring_skips_neutral_without_consuming_cooldown(make_config, make_note, fake_redis):
+async def test_run_scoring_skips_neutral_without_consuming_cooldown(make_config, make_turn, fake_redis):
     agent = ChatAgent(make_config(), redis_client=fake_redis)
-    note = make_note(text="ok")
 
     with (
         patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
         patch.object(agent._score_agent, "run", AsyncMock(return_value=SimpleNamespace(output="neutral"))),
     ):
-        await agent.run(note)
+        await agent.run(make_turn(text="ok"))
 
     # Neutral => delta 0 => nothing written and cooldown NOT claimed (free retry).
     assert await fake_redis.get("score:alice") is None
@@ -213,11 +286,31 @@ async def test_run_scoring_skips_neutral_without_consuming_cooldown(make_config,
 
 
 @pytest.mark.anyio
-async def test_run_auto_scores_privileged_author_too(make_config, make_note, make_user, fake_redis):
+async def test_run_scoring_passes_history_as_context(make_config, make_turn, fake_redis):
+    """The classifier sees the prior conversation so tone is judged in context."""
+    agent = ChatAgent(make_config(), redis_client=fake_redis)
+    history = [
+        HistoryTurn(role="user", text="earlier question", author="bob"),
+        HistoryTurn(role="assistant", text="earlier answer"),
+    ]
+
+    with (
+        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
+        patch.object(agent._score_agent, "run", AsyncMock(return_value=SimpleNamespace(output="good"))) as score_mock,
+    ):
+        await agent.run(make_turn(text="short", history=history))
+
+    assert score_mock.await_args is not None
+    scoring_prompt = score_mock.await_args.args[0]
+    assert "bob: earlier question" in scoring_prompt
+    # The bot's own turns render under the configured bot handle.
+    assert "grok: earlier answer" in scoring_prompt
+
+
+@pytest.mark.anyio
+async def test_run_auto_scores_privileged_author_too(make_config, make_turn, fake_redis):
     """Privileged users are also auto-scored; the flag only gates the manual tool."""
-    cfg = make_config(social_credit_unrestricted_user_ids=["user-1"])
-    agent = ChatAgent(cfg, redis_client=fake_redis)
-    note = make_note(text="great thread", user=make_user(id="user-1", username="operator"))
+    agent = ChatAgent(make_config(), redis_client=fake_redis)
 
     with (
         patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
@@ -225,7 +318,7 @@ async def test_run_auto_scores_privileged_author_too(make_config, make_note, mak
             agent._score_agent, "run", AsyncMock(return_value=SimpleNamespace(output="exceptional"))
         ) as score_mock,
     ):
-        await agent.run(note)
+        await agent.run(make_turn(text="great thread", handle="operator", privileged=True))
 
     assert score_mock.await_count == 1
     # "exceptional" -> +10 (see QUALITY_DELTAS).
@@ -233,15 +326,14 @@ async def test_run_auto_scores_privileged_author_too(make_config, make_note, mak
 
 
 @pytest.mark.anyio
-async def test_run_scoring_failure_does_not_break_reply(make_config, make_note, fake_redis):
+async def test_run_scoring_failure_does_not_break_reply(make_config, make_turn, fake_redis):
     agent = ChatAgent(make_config(), redis_client=fake_redis)
-    note = make_note(text="hi")
 
     with (
         patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))),
         patch.object(agent._score_agent, "run", AsyncMock(side_effect=RuntimeError("classifier down"))),
     ):
-        out = await agent.run(note)
+        out = await agent.run(make_turn(text="hi"))
 
     # Scoring swallows its own errors; the reply still comes back.
     assert out == "reply"
@@ -250,7 +342,7 @@ async def test_run_scoring_failure_does_not_break_reply(make_config, make_note, 
     assert not await fake_redis.exists("score_cooldown:alice")
 
 
-# --- Note -> mem0 ingestion ---
+# --- turn -> mem0 ingestion ---
 
 
 def _memory_cfg(make_config, **extra):
@@ -263,81 +355,91 @@ def _memory_cfg(make_config, **extra):
 
 
 @pytest.mark.anyio
-async def test_run_ingests_note_with_mem0(make_config, make_note):
+async def test_run_ingests_turn_with_mem0(make_config, make_turn):
     mem = AsyncMock()
     agent = ChatAgent(_memory_cfg(make_config), memory=mem)
-    note = make_note(text="Python's latest version is 3.13")
 
     with patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))):
-        out = await agent.run(note)
+        out = await agent.run(make_turn(text="Python's latest version is 3.13"))
 
     assert out == "reply"
-    mem.add_note.assert_awaited_once_with(text="Python's latest version is 3.13", author="alice", note_id=note.id)
+    mem.add_note.assert_awaited_once_with(
+        text="Python's latest version is 3.13", author="alice", note_id="note-1", source="unknown"
+    )
 
 
 @pytest.mark.anyio
-async def test_run_note_ingestion_disabled_by_flag(make_config, make_note):
+async def test_run_ingestion_disabled_by_flag(make_config, make_turn):
     mem = AsyncMock()
     agent = ChatAgent(_memory_cfg(make_config, memory_ingest_notes=False), memory=mem)
-    note = make_note(text="Python's latest version is 3.13")
 
     with patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))):
-        await agent.run(note)
+        await agent.run(make_turn(text="Python's latest version is 3.13"))
 
     mem.add_note.assert_not_awaited()
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("visibility", ["followers", "specified"])
-async def test_run_note_ingestion_skips_restricted_notes_even_when_dm_replies_enabled(
-    make_config, make_note, visibility
-):
+async def test_run_ingestion_skips_turns_that_disallow_memory_writes(make_config, make_turn):
     mem = AsyncMock()
-    cfg = _memory_cfg(make_config, ignore_direct_messages=False)
-    agent = ChatAgent(cfg, memory=mem)
-    note = make_note(text="restricted account recovery code").model_copy(update={"visibility": visibility})
+    agent = ChatAgent(_memory_cfg(make_config), memory=mem)
+    turn = make_turn(text="restricted account recovery code", memory_writes_allowed=False)
 
     with patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="private reply"))) as run_mock:
-        out = await agent.run(note)
+        out = await agent.run(turn)
 
     assert out == "private reply"
+    assert run_mock.await_args is not None
     assert run_mock.await_args.kwargs["deps"].memory_writes_allowed is False
     mem.add_note.assert_not_awaited()
 
 
 @pytest.mark.anyio
-async def test_run_note_ingestion_skips_empty_text(make_config, make_note):
+async def test_run_ingestion_skips_empty_text(make_config, make_turn):
     mem = AsyncMock()
     agent = ChatAgent(_memory_cfg(make_config), memory=mem)
-    note = make_note(text="  ")
 
     with patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))):
-        await agent.run(note)
+        await agent.run(make_turn(text="  "))
 
     mem.add_note.assert_not_awaited()
 
 
 @pytest.mark.anyio
-async def test_run_note_ingestion_swallows_mem0_errors(make_config, make_note):
+async def test_run_ingestion_swallows_mem0_errors(make_config, make_turn):
     mem = AsyncMock()
     mem.add_note.side_effect = RuntimeError("mem0 down")
     agent = ChatAgent(_memory_cfg(make_config), memory=mem)
-    note = make_note(text="some durable world fact")
 
     with patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))):
-        out = await agent.run(note)
+        out = await agent.run(make_turn(text="some durable world fact"))
 
     assert out == "reply"
     mem.add_note.assert_awaited_once()
 
 
 @pytest.mark.anyio
-async def test_run_note_ingestion_normalizes_remote_author(make_config, make_note, make_user):
+async def test_run_ingestion_normalizes_author_handle(make_config, make_turn):
     mem = AsyncMock()
     agent = ChatAgent(_memory_cfg(make_config), memory=mem)
-    note = make_note(text="I use Arch btw", user=make_user(username="Alice", host="Remote.Example"))
 
     with patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))):
-        await agent.run(note)
+        await agent.run(make_turn(text="I use Arch btw", handle="Alice@Remote.Example"))
 
-    mem.add_note.assert_awaited_once_with(text="I use Arch btw", author="alice@remote.example", note_id=note.id)
+    mem.add_note.assert_awaited_once_with(
+        text="I use Arch btw", author="alice@remote.example", note_id="note-1", source="unknown"
+    )
+
+
+@pytest.mark.anyio
+async def test_run_ingestion_passes_the_turn_source_label(make_config, make_turn):
+    """Provenance follows the frontend, so ACP memories aren't tagged as Misskey notes."""
+    mem = AsyncMock()
+    agent = ChatAgent(_memory_cfg(make_config), memory=mem)
+    turn = make_turn(text="i keep three shrimp tanks", handle="acp:abc", source="acp_prompt")
+
+    with patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))):
+        await agent.run(turn)
+
+    assert mem.add_note.await_args is not None
+    assert mem.add_note.await_args.kwargs["source"] == "acp_prompt"

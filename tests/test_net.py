@@ -1,8 +1,9 @@
-"""Tests for the SSRF media-URL guard."""
+"""Tests for the SSRF media-URL guard and media fetching."""
 
+import httpx
 import pytest
 
-from bot.net import is_safe_media_url
+from bot.net import fetch_image, is_safe_media_url
 
 
 @pytest.mark.parametrize(
@@ -53,3 +54,94 @@ def test_allows_public_http_urls(url):
 )
 def test_blocks_unsafe_urls(url):
     assert is_safe_media_url(url) is False
+
+
+# --- media fetching (base64 vision mode) ------------------------------------
+
+
+def _transport(handler):
+    return httpx.MockTransport(handler)
+
+
+def _ok_image(request):
+    return httpx.Response(200, content=b"\x89PNG\r\n\x1a\n" + b"x" * 100, headers={"content-type": "image/png"})
+
+
+@pytest.mark.anyio
+async def test_fetch_image_returns_bytes_and_media_type():
+    data, media_type = await fetch_image(
+        "https://media.example/pic.png", timeout=5.0, max_bytes=1_000_000, transport=_transport(_ok_image)
+    )
+    assert data.startswith(b"\x89PNG")
+    assert media_type == "image/png"
+
+
+@pytest.mark.anyio
+async def test_fetch_image_refuses_unsafe_url_without_requesting():
+    """The SSRF guard is re-checked here, not just at extraction time."""
+    called = False
+
+    def handler(request):
+        nonlocal called
+        called = True
+        return _ok_image(request)
+
+    assert (
+        await fetch_image(
+            "http://169.254.169.254/latest/meta-data/", timeout=5.0, max_bytes=1_000_000, transport=_transport(handler)
+        )
+        is None
+    )
+    assert called is False
+
+
+@pytest.mark.anyio
+async def test_fetch_image_rejects_non_image_content_type():
+    def handler(request):
+        return httpx.Response(200, content=b"<html>", headers={"content-type": "text/html"})
+
+    assert (
+        await fetch_image(
+            "https://media.example/pic.png", timeout=5.0, max_bytes=1_000_000, transport=_transport(handler)
+        )
+        is None
+    )
+
+
+@pytest.mark.anyio
+async def test_fetch_image_rejects_oversized_body():
+    """A huge attacker-supplied file must not be buffered into the pod's memory."""
+
+    def handler(request):
+        return httpx.Response(200, content=b"x" * 5000, headers={"content-type": "image/png"})
+
+    assert (
+        await fetch_image("https://media.example/big.png", timeout=5.0, max_bytes=1000, transport=_transport(handler))
+        is None
+    )
+
+
+@pytest.mark.anyio
+async def test_fetch_image_returns_none_on_http_error():
+    def handler(request):
+        return httpx.Response(404)
+
+    assert (
+        await fetch_image(
+            "https://media.example/gone.png", timeout=5.0, max_bytes=1_000_000, transport=_transport(handler)
+        )
+        is None
+    )
+
+
+@pytest.mark.anyio
+async def test_fetch_image_returns_none_on_transport_error():
+    def handler(request):
+        raise httpx.ConnectError("boom")
+
+    assert (
+        await fetch_image(
+            "https://media.example/pic.png", timeout=5.0, max_bytes=1_000_000, transport=_transport(handler)
+        )
+        is None
+    )

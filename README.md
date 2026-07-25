@@ -1,8 +1,23 @@
 # Missbot
 
-Missbot is a Misskey/Fediverse chatbot built with Python and Pydantic AI. It
-listens to Misskey's streaming API, builds conversation context, runs a
-configurable LLM tool loop, and publishes the reply back into the thread.
+Missbot is a chatbot built with Python and Pydantic AI. It listens to Misskey's
+streaming API, builds conversation context, runs a configurable LLM tool loop,
+and publishes the reply back into the thread — and it serves that same agent
+over the Agent Client Protocol so ACP clients reach the same persona.
+
+## Frontends
+
+Missbot runs two frontends over one shared brain:
+
+- **Misskey/Fediverse** — WebSocket mentions, timeline auto-replies, autonomous
+  posts.
+- **ACP** — [Agent Client Protocol](https://agentclientprotocol.com) over stdio,
+  for clients like Zed, JetBrains, and [buzz-acp](https://github.com/block/buzz).
+
+Each is a thin adapter that translates its wire format into a neutral
+`AgentTurn`; the agent itself never sees a platform type. Persona, memories, and
+social credit live in Postgres and Redis, so an ACP process pointed at the same
+backends is the same bot, not a copy of it.
 
 ## Features
 
@@ -86,6 +101,34 @@ Or via Mise:
 mise run bot
 ```
 
+### As an ACP agent
+
+For clients that spawn agents as subprocesses (Zed, JetBrains), run the stdio
+mode and point the client at that command:
+
+```bash
+uv run python -m bot.acp stdio -c config.local.yaml
+```
+
+For remote consumers, serve over WebSocket instead:
+
+```bash
+uv run python -m bot.acp serve -c config.local.yaml \
+    --host 0.0.0.0 --port 8080 --token-env ACP_TOKEN
+```
+
+Remote clients bridge back to stdio ACP with
+[acpremote](https://github.com/vcoderun/acpkit), which is what a consumer such
+as buzz-acp is configured with:
+
+```bash
+acpremote mirror ws://your-host:8080/acp/ws --bearer-token "$ACP_TOKEN"
+```
+
+The endpoint serves `/acp/ws` for the socket, `/acp` for transport metadata, and
+`/healthz` as a probe. Because stdout carries the protocol, both modes send all
+logging to stderr.
+
 ## Memory Maintenance
 
 When long-term memory is enabled, inspect a cleanup pass before deleting
@@ -136,7 +179,9 @@ memory-cleanup schedule or timezone.
 
 ## Project Layout
 
-- [bot/bot.py](bot/bot.py) — WebSocket client and message routing
+- [bot/core.py](bot/core.py) — Frontend-neutral turn types shared by every adapter
+- [bot/bot.py](bot/bot.py) — Misskey adapter: WebSocket client and message routing
+- [bot/acp/](bot/acp/) — ACP adapter: protocol surface, sender attribution, sessions
 - [bot/ai.py](bot/ai.py) — Model fallback, prompts, vision routing, and concurrent side work
 - [bot/models.py](bot/models.py) — Runtime and configuration models
 - [bot/tools.py](bot/tools.py) — Built-in, social-credit, and memory tools

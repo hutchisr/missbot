@@ -2,7 +2,12 @@
 
 <!-- This file is the project doc; CLAUDE.md is just `@AGENTS.md`. Edit AGENTS.md, not CLAUDE.md. -->
 
-Misskey/Fediverse chatbot using Pydantic AI with LLM fallback, WebSocket streaming, an optional Redis-backed social credit system, and optional mem0 long-term memory backed by Postgres/pgvector.
+Pydantic AI chat agent with LLM fallback, an optional Redis-backed social credit system, and optional mem0 long-term memory backed by Postgres/pgvector. It serves **two frontends over one shared brain**:
+
+- **Misskey/Fediverse** (`bot/bot.py`) — WebSocket streaming, mentions, timeline auto-replies, autonomous posts
+- **ACP** (`bot/acp/`) — Agent Client Protocol over stdio, so ACP clients (Zed, JetBrains, [buzz-acp](https://github.com/block/buzz)) reach the same persona
+
+Both are thin adapters translating their wire format into the neutral `AgentTurn` in `bot/core.py`; `ChatAgent` never sees a platform type. Persona, memories, and scores live in Postgres and Redis, so a separate ACP process pointed at the same backends is genuinely the same bot rather than a copy of it.
 
 ## Commands
 
@@ -10,8 +15,16 @@ Misskey/Fediverse chatbot using Pydantic AI with LLM fallback, WebSocket streami
 # Install
 uv sync
 
-# Run
+# Run (Misskey frontend)
 uv run python -m bot -c config.local.yaml   # or: mise run bot
+
+# Run (ACP frontend — stdio JSON-RPC; clients that spawn subprocesses use this)
+uv run python -m bot.acp stdio -c config.local.yaml
+
+# Run (ACP frontend — WebSocket, for remote clients via `acpremote mirror`)
+uv run python -m bot.acp serve -c config.local.yaml --host 0.0.0.0 --port 8080 --token-env ACP_TOKEN
+# Consumer side (e.g. buzz-acp):
+#   BUZZ_ACP_AGENT_COMMAND="acpremote mirror ws://<host>:8080/acp/ws --bearer-token $ACP_TOKEN"
 
 # mem0 maintenance (the k8s CronJob runs the destructive form daily)
 uv run python -m bot.maintenance cleanup --dry-run -c config.local.yaml
@@ -44,6 +57,14 @@ mise run deploy     # Apply K8s manifests and restart
 # command line — the safety classifier blocks it, and you don't need it):
 kubectl exec -n cnpg pg-cluster-1 -- psql -U postgres -d grok -tAc "SELECT count(*) FROM missbot_memories"
 # Bot pod and memory-maintenance CronJob live in the `misskey` namespace (missbot-*), not `default`.
+
+# ACP endpoint (k8s/acp.yaml: Deployment + Service + Tailscale Ingress)
+kubectl -n misskey logs deployment/missbot-acp --tail=50
+curl -s https://missbot-acp.taile6e57.ts.net/healthz            # unauthenticated probe
+curl -s https://missbot-acp.taile6e57.ts.net/acp | jq           # transport metadata
+# The WebSocket requires ACP_TOKEN (in k8s/secrets.txt, gitignored). Consumers connect via:
+#   acpremote mirror wss://missbot-acp.taile6e57.ts.net/acp/ws --bearer-token "$ACP_TOKEN"
+# Private to the tailnet by design — the agent writes memories and moves social credit.
 ```
 
 **Important:** Always use `uv run` or `.venv/bin/python` — never bare `python`.
@@ -52,14 +73,20 @@ kubectl exec -n cnpg pg-cluster-1 -- psql -U postgres -d grok -tAc "SELECT count
 
 | File | Purpose |
 |------|---------|
-| `bot/bot.py` | WebSocket client, mention handling, context building, reply sending |
-| `bot/ai.py` | `ChatAgent` class — Pydantic AI agent with `FallbackModel`, vision support |
+| `bot/core.py` | Frontend-neutral turn types: `AgentTurn`, `HistoryTurn`, `TurnAuthor`. The contract every frontend adapter builds and `ChatAgent` consumes. No platform imports |
+| `bot/bot.py` | **Misskey adapter** — WebSocket client, mention handling, context building, reply sending. Owns all Misskey-specific translation: `_note_to_turn()`, `_user_handle()`, `_image_urls_for()` (with SSRF guard), visibility→memory rules, and the note-length budget |
+| `bot/acp/agent.py` | **ACP adapter** — `MissbotAgent(acp.Agent)`: `initialize` / `new_session` / `prompt` / `cancel` / `close_session` over stdio |
+| `bot/acp/identity.py` | `parse_sender()` — derives a caller identity from an ACP harness's message header, trusting only the region before the first `Content:` line and only the pubkey (never the display name) |
+| `bot/acp/session.py` | `AcpSession` + `SessionRegistry` — bounded per-session history and the in-flight task handle `session/cancel` interrupts |
+| `bot/acp/ws.py` | WebSocket transport wire-compatible with `acpremote mirror`: frame↔stream bridge, bearer auth, metadata/health routes. No acpremote dependency |
+| `bot/acp/__main__.py` | `python -m bot.acp {stdio,serve}` entry points. Routes **all** logging to stderr — stdout is the JSON-RPC channel |
+| `bot/ai.py` | `ChatAgent` class — Pydantic AI agent with `FallbackModel`, vision support. Consumes `AgentTurn`; the reply length cap is per-run (`AgentDeps.char_budget`), not baked into the agent |
 | `bot/models.py` | Pydantic models: `Config`, `Note`, `User`, `MiFile`, WS message types |
 | `bot/tools.py` | `build_tools()` factory — datetime, web search, search_users/notes, social credit tools; `apply_social_credit()` helper |
 | `bot/scoring.py` | Injection-resistant message classifier: `build_scoring_spec()` turns `Config.social_credit_categories` into the constrained output type + delta map + hardened instructions; `build_scoring_prompt()` fences untrusted input |
 | `bot/memory.py` | Thin async adapter around mem0's `AsyncMemory`; builds the mem0 config, scopes memories to the bot `agent_id`, and exposes the runtime plus maintenance read/delete paths |
 | `bot/maintenance.py` | Out-of-process mem0 cleanup CLI; selects expired, duplicate, stale, empty, and per-author overflow note memories, then deletes them through mem0 so entity links stay consistent. Driven by `k8s/maintenance.yaml` |
-| `bot/net.py` | `is_safe_media_url()` — SSRF guard for attacker-supplied image URLs (blocks private/reserved IPs and internal hosts) |
+| `bot/net.py` | `is_safe_media_url()` — SSRF guard for attacker-supplied image URLs (blocks private/reserved IPs and internal hosts); `fetch_image()` — bounded, guarded download used by `vision_image_mode: fetch` |
 | `bot/mcp.py` | `build_mcp_toolsets()` + `gate_names()` — streamable-HTTP MCP servers with allow/block and gate filtering |
 | `bot/api.py` | HTTP client utilities |
 | `bot/cli.py` | CLI entry point and argument parsing |
@@ -76,6 +103,9 @@ Optional fields:
 - `max_tokens` (default unset/`None`): the hard reply/auto-post length cap. When set it's wired into the reply and auto agents' `model_settings` by `ChatAgent._generation_settings` (alongside the sampling knobs below) and only sent then; when unset, models generate unboundedly and long replies get truncated at the Misskey note cap (`max_note_length`), which can make the bot resume/repeat itself on the next turn
 - `temperature`, `top_p`, `frequency_penalty`, `presence_penalty` (all default unset/`None`): sampling + anti-repetition knobs for the **reply and auto-post** models, applied via `ChatAgent._generation_settings`. Each is only sent to the model when set (so an unset one keeps the provider default and isn't sent to models that reject it). Positive `frequency_penalty`/`presence_penalty` curb the bot reusing its own phrasing turn-after-turn. Bounds: temperature 0–2, top_p 0–1, penalties −2–2. The social scoring classifier is unaffected (it keeps its own structured-output settings)
 - `vision`: bool (default `true`) — pass images directly to the main LLM
+- `vision_image_mode` (default `url`): `url` sends the media URL; `fetch` downloads the image and sends it inline as base64. **`fetch` is required by providers that refuse URLs** — Ollama Cloud answers `image URLs are not currently supported, please use base64 encoded data instead`. Fetching means this process retrieves attacker-supplied media, so `bot/net.py:fetch_image` re-checks the SSRF guard, requires an `image/*` content type, refuses redirects, streams with a byte cap, and uses a dedicated client (never `api_client`, which carries the Misskey token). A fetch failure drops that one image rather than the reply
+- `vision_max_image_bytes` (default `8388608`): per-image cap in `fetch` mode; the body is abandoned mid-stream once exceeded
+- **Model vision flags matter.** A bare string in `llm_models` defaults to `vision: true`. A model that cannot accept images must be declared `{model: ..., vision: false}`, or `ChatAgent` will route image prompts to it and burn a failed call. `_spec_supports_vision` builds a separate vision chain from the models that can (see `k8s/config.yaml`, where only `minimax-m3` accepts images)
 - `vision_models`: legacy, unused when `vision=true`
 - `system_prompt_auto` + `auto_post_interval`: autonomous posting (interval in seconds)
 - `searxng_url`, `searxng_user`, `searxng_password`: web search via SearXNG
@@ -94,7 +124,34 @@ Optional fields:
 - `http_timeout_seconds`: HTTP timeout (default 30.0)
 - `mcp_servers`: list of streamable-HTTP MCP servers (see below)
 - `memory_enabled` (default `false`): turn on mem0 long-term memory (see below). Requires `postgres_url` and `embedding_model`
+- `acp_*`: ACP frontend settings (see below); ignored by `python -m bot`
 - `channel`, `debug`
+
+### ACP frontend
+`python -m bot.acp` serves the same agent over the [Agent Client Protocol](https://agentclientprotocol.com) in two modes:
+
+- **`stdio`** — JSON-RPC on stdin/stdout, for clients that spawn agents as subprocesses (Zed, JetBrains).
+- **`serve`** — the same agent over WebSocket, for remote consumers. ACP's own HTTP transport is still a draft RFD and the SDK ships stdio only, so remote clients bridge via [acpremote](https://github.com/vcoderun/acpkit): `acpremote mirror ws://host:8080/acp/ws` turns the endpoint back into a local stdio ACP command, which is exactly what `BUZZ_ACP_AGENT_COMMAND` wants.
+
+```
+Buzz Relay ──WS──→ buzz-acp ──stdio──→ acpremote mirror ──WS──→ python -m bot.acp serve
+```
+
+`bot/acp/ws.py` implements acpremote's server contract directly rather than depending on the package — acpremote pins `websockets<16.0`, and adding it would downgrade the library the Misskey streaming client runs on. The contract: **one WebSocket text frame carries exactly one ACP JSON-RPC message** with no trailing newline (the SDK's `Connection` is newline-delimited, so the bridge strips it on send and re-adds it on receive), binary frames are an error, optional `Authorization: Bearer <token>`, plus `GET <mount>` metadata and `GET /healthz`. Routes default to `/acp`, `/acp/ws`, `/healthz` so `acpremote mirror` needs no extra flags.
+
+`serve` builds **one** `ChatAgent` shared by every connection (model chain, MCP sessions, Redis, memory) and one `MissbotAgent` adapter *per connection* — the adapter holds the client handle it pushes `session/update` through, so connections must not share one.
+
+Config fields:
+- `acp_default_identity` (default `acp`): identity used when no sender header parses. Namespaced `acp:<value>` so it can never collide with a fediverse handle
+- `acp_parse_sender_header` (default `true`): derive per-caller identity from the harness's `From:` header. Set false to key every ACP caller on `acp_default_identity`
+- `acp_max_history_turns` (default `20`): conversation turns retained per session; ACP sessions are long-lived, so history is bounded
+- `acp_max_sessions` (default `8`): concurrent session cap, the ACP analogue of `max_concurrent_handlers`
+
+**Identity and its limits.** ACP carries no per-sender field, so attribution comes out of the prompt text. `parse_sender()` reads **only the region before the first `Content:` line** — user text lands in `Content:` and after, so a message body structurally cannot reach the parsed region — and keys on the **pubkey**, never the user-settable display name. Failure falls back to `acp_default_identity`, never to an unattributed write. Two limits are real and not papered over: a *batched* prompt concatenates several event blocks, so only the first block's header is structurally safe; and the header format is buzz-acp's internal detail that may change. `acp_parse_sender_header: false` is the kill switch.
+
+**Differences from the Misskey path.** No character cap (`char_budget=None` — the note limit is Misskey's, not a universal one), no `fs/*` or `terminal/*` client capabilities (missbot is conversational, not a coding agent), no `session/load` (history is in-process and does not survive restart), and no auth methods (over stdio the trust boundary is *who spawned the process*). Client-supplied `cwd` and `mcpServers` on `session/new` are ignored — missbot brings its own toolset from config. Social credit scoring, the ignore threshold, memory ingestion, and `NO_REPLY` all behave exactly as on the Misskey path.
+
+**stdout is the protocol channel.** `bot/acp/__main__.py` points logfire's console exporter and `logging` at stderr. Anything printed to stdout corrupts the JSON-RPC stream and breaks the connection.
 
 ### Long-term memory
 Memory is delegated to mem0 OSS through `bot/memory.py:MemoryStore`, backed by Postgres/pgvector. The bot does not maintain its own entity graph, claim schema, agreement counts, consolidation job, or re-embedding CLI anymore. Off unless `memory_enabled: true`. Config fields:

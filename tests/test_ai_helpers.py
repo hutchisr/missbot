@@ -11,96 +11,55 @@ from pydantic_ai.models.openai import OpenAIChatModel
 from bot.ai import (
     AgentDeps,
     ChatAgent,
-    _build_user_content,
     _CLASSIFIER_MODEL_SETTINGS,
     _enforce_length,
-    _image_urls_for,
+    _history_content,
     _normalize_for_repeat,
     _resolve_model_spec,
     _spec_supports_vision,
     _strip_leading_mentions,
-    _user_handle,
 )
-from bot.models import CustomOpenAIModel, MiFile
+from bot.core import HistoryTurn
+from bot.models import CustomOpenAIModel
 
 
-def test_user_handle_local(make_user):
-    assert _user_handle(make_user(username="alice", host=None)) == "alice"
+def test_history_content_text_only():
+    turn = HistoryTurn(role="user", text="hi", author="alice")
+    assert _history_content(turn, vision=True) == "alice: hi"
 
 
-def test_user_handle_remote(make_user):
-    assert _user_handle(make_user(username="alice", host="remote.host")) == "alice@remote.host"
-
-
-def test_image_urls_for_vision_off(make_note):
-    note = make_note(files=[MiFile(id="f1", type="image/png", thumbnailUrl="https://media.example/1.png")])
-    assert _image_urls_for(note, vision=False) == []
-
-
-def test_image_urls_for_includes_image_and_video_thumbnails(make_note):
-    files = [
-        # Image: thumbnail used.
-        MiFile(id="f1", type="image/png", thumbnailUrl="https://media.example/1.png"),
-        # Video: Misskey renders an image thumbnail — use it (NOT the raw video url).
-        MiFile(
-            id="f2",
-            type="video/mp4",
-            thumbnailUrl="https://media.example/2-thumb.jpg",
-            url="https://media.example/2.mp4",
-        ),
-        # Video with no thumbnail: skipped (we must not feed the video file as an image).
-        MiFile(id="f3", type="video/mp4", thumbnailUrl=None, url="https://media.example/3.mp4"),
-        # Non-visual media: skipped.
-        MiFile(id="f4", type="audio/mpeg", thumbnailUrl="https://media.example/4.png"),
-        # Image with no thumbnail or url: skipped.
-        MiFile(id="f5", type="image/jpeg", thumbnailUrl=None),
-    ]
-    note = make_note(files=files)
-    urls = _image_urls_for(note, vision=True)
-    assert all(isinstance(u, ImageUrl) for u in urls)
-    assert [u.url for u in urls] == ["https://media.example/1.png", "https://media.example/2-thumb.jpg"]
-
-
-def test_image_urls_for_no_files(make_note):
-    note = make_note(files=None)
-    assert _image_urls_for(note, vision=True) == []
-
-
-def test_image_urls_for_drops_ssrf_urls(make_note):
-    """Attacker-controlled internal URLs are dropped even with a spoofed image type."""
-    files = [
-        MiFile(id="f1", type="image/png", thumbnailUrl="http://169.254.169.254/latest/meta-data/"),
-        MiFile(id="f2", type="image/png", url="http://missbot-redis.misskey.svc.cluster.local:6379/"),
-        MiFile(id="f3", type="image/png", thumbnailUrl="https://media.example/ok.png"),
-    ]
-    note = make_note(files=files)
-    urls = _image_urls_for(note, vision=True)
-    # Only the public URL survives.
-    assert [u.url for u in urls] == ["https://media.example/ok.png"]
-
-
-def test_build_user_content_text_only(make_note, make_user):
-    note = make_note(user=make_user(username="alice"), text="hi")
-    content = _build_user_content(note, vision=True)
-    assert content == "alice: hi"
-
-
-def test_build_user_content_with_images(make_note, make_user):
-    note = make_note(
-        user=make_user(username="bob", host="remote.host"),
+def test_history_content_with_images():
+    turn = HistoryTurn(
+        role="user",
         text="look",
-        files=[MiFile(id="f1", type="image/png", thumbnailUrl="https://media.example/1.png")],
+        author="bob@remote.host",
+        images=[ImageUrl(url="https://media.example/1.png")],
     )
-    content = _build_user_content(note, vision=True)
+    content = _history_content(turn, vision=True)
     assert isinstance(content, list)
     assert content[0] == "bob@remote.host: look"
     assert isinstance(content[1], ImageUrl)
 
 
-def test_build_user_content_empty_text(make_note):
-    note = make_note(text=None)
-    content = _build_user_content(note, vision=True)
-    assert content == "alice: "
+def test_history_content_drops_images_when_vision_off():
+    turn = HistoryTurn(
+        role="user",
+        text="look",
+        author="alice",
+        images=[ImageUrl(url="https://media.example/1.png")],
+    )
+    assert _history_content(turn, vision=False) == "alice: look"
+
+
+def test_history_content_without_author_is_unprefixed():
+    """Assistant turns carry no author, so they render as bare text."""
+    turn = HistoryTurn(role="assistant", text="my prior reply")
+    assert _history_content(turn, vision=True) == "my prior reply"
+
+
+def test_history_content_empty_text():
+    turn = HistoryTurn(role="user", text="", author="alice")
+    assert _history_content(turn, vision=True) == "alice: "
 
 
 def test_resolve_model_spec_passes_through_strings():
@@ -175,6 +134,27 @@ def test_enforce_length_retries_over_budget():
     # The overage and the limit are surfaced so the model can self-correct.
     assert "20" in str(exc.value)
     assert "10" in str(exc.value)
+
+
+def _budget_ctx(char_budget):
+    return SimpleNamespace(deps=AgentDeps(username="alice", char_budget=char_budget))
+
+
+def test_enforce_budget_applies_turn_budget():
+    with pytest.raises(ModelRetry) as exc:
+        ChatAgent._enforce_budget(None, _budget_ctx(10), "this is far too long")
+    assert "20" in str(exc.value)
+    assert "10" in str(exc.value)
+
+
+def test_enforce_budget_passes_within_turn_budget():
+    assert ChatAgent._enforce_budget(None, _budget_ctx(10), "exactly10!") == "exactly10!"
+
+
+def test_enforce_budget_uncapped_when_budget_is_none():
+    """Frontends without a platform cap (ACP) pass no budget, so nothing is gated."""
+    long_output = "x" * 100_000
+    assert ChatAgent._enforce_budget(None, _budget_ctx(None), long_output) == long_output
 
 
 def test_strip_leading_mentions():

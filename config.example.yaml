@@ -100,6 +100,32 @@ searxng_password: "yourpassword"
 #     allowed_tools: ["search"]
 #     # gate: research   # hide until the model calls enable_research()
 
+# Optional: how images reach the model.
+#   url   (default) send the media URL; cheapest, works with OpenRouter and most providers.
+#   fetch download the image and send it inline as base64. Required by providers that
+#         refuse URLs — Ollama Cloud answers "image URLs are not currently supported,
+#         please use base64 encoded data instead". Fetching makes the bot retrieve
+#         attacker-supplied media, so it is SSRF-checked, size-capped, and timed out.
+# vision_image_mode: url
+# vision_max_image_bytes: 8388608   # 8 MiB per image; oversized bodies are abandoned mid-stream
+#
+# Note: a model that cannot accept images at all should be marked `vision: false` in
+# llm_models, so image prompts route straight to one that can instead of failing first:
+#   llm_models:
+#     - model: ollama:some-text-only-model
+#       vision: false
+#     - ollama:some-vision-model
+
+# Optional: ACP frontend (`python -m bot.acp`). Ignored by the Misskey entry point.
+# ACP carries no per-sender identity field, so attribution is parsed out of the
+# harness's message header — only the region before the first "Content:" line is
+# trusted, and only the pubkey is used (never the display name). Parsing failures
+# fall back to acp_default_identity rather than writing unattributed.
+# acp_default_identity: acp     # namespaced as acp:<value>; never collides with a handle
+# acp_parse_sender_header: true # false => every ACP caller shares acp_default_identity
+# acp_max_history_turns: 20     # per-session history bound (sessions are long-lived)
+# acp_max_sessions: 8           # concurrent session cap
+
 # Optional: persistent long-term memory via mem0 (Postgres + pgvector). Off by default.
 # Adds the add_memory / search_memory tools. Requires postgres_url + embedding_model.
 # memory_enabled: false

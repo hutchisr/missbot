@@ -158,3 +158,46 @@ def test_cleanup_cli_requires_memory_enabled(make_config):
     assert result.exit_code != 0
     assert "memory_enabled" in result.output
     create.assert_not_awaited()
+
+
+# --- provenance labels across frontends -------------------------------------
+
+
+def test_retention_covers_every_inferred_source():
+    """A new frontend's source label must not become retention-exempt by accident."""
+    memories = [
+        _memory("misskey", "old misskey fact", created_at="2026-01-01T00:00:00+00:00"),
+        _memory("acp", "old acp fact", created_at="2026-01-01T00:00:00+00:00", source="acp_prompt", author="acp:abc"),
+    ]
+
+    candidates = plan_cleanup(memories, now=NOW, note_retention_days=90, max_memories_per_author=None)
+
+    assert {c.memory_id for c in candidates} == {"misskey", "acp"}
+    assert {c.reason for c in candidates} == {"retention"}
+
+
+def test_retention_still_protects_explicit_add_memory():
+    memories = [
+        _memory("explicit", "durable fact", created_at="2025-01-01T00:00:00+00:00", source="add_memory", author="grok")
+    ]
+
+    assert plan_cleanup(memories, now=NOW, note_retention_days=90, max_memories_per_author=None) == []
+
+
+def test_author_cap_covers_acp_memories():
+    memories = [
+        _memory(
+            f"m{i}",
+            f"acp fact {i}",
+            created_at=f"2026-07-1{i}T00:00:00+00:00",
+            source="acp_prompt",
+            author="acp:abc",
+        )
+        for i in range(1, 5)
+    ]
+
+    candidates = plan_cleanup(memories, now=NOW, note_retention_days=None, max_memories_per_author=2)
+
+    # Oldest two beyond the per-author cap are selected.
+    assert {c.memory_id for c in candidates} == {"m1", "m2"}
+    assert {c.reason for c in candidates} == {"author_limit"}

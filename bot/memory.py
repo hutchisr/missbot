@@ -225,9 +225,18 @@ class MemoryStore:
     def _filters(self) -> dict[str, str]:
         return {"agent_id": self._agent_id}
 
-    async def add_note(self, *, text: str, author: str, note_id: Optional[str] = None) -> dict[str, Any]:
+    async def add_note(
+        self,
+        *,
+        text: str,
+        author: str,
+        note_id: Optional[str] = None,
+        source: str = "misskey_note",
+    ) -> dict[str, Any]:
         metadata: dict[str, Any] = {
-            "source": "misskey_note",
+            # Which frontend inferred this memory. Anything other than "add_memory"
+            # counts as inferred and stays subject to retention and per-author caps.
+            "source": source,
             "author": _normalize_username(author),
         }
         if note_id:

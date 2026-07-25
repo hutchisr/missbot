@@ -8,13 +8,15 @@ from collections import deque
 from collections.abc import Callable, Coroutine
 from typing import Any, Optional
 from pydantic import ValidationError
+from pydantic_ai import BinaryContent, ImageUrl
 from redis.asyncio import Redis
 from websockets import ClientConnection, ConnectionClosed
 from websockets.asyncio.client import connect
 import httpx
 import logfire
 
-from .ai import ChatAgent, _image_urls_for
+from .ai import ChatAgent
+from .core import AgentTurn, HistoryTurn, TurnAuthor, TurnImage
 from .memory import MemoryStore
 from .models import (
     Config,
@@ -25,11 +27,76 @@ from .models import (
     Note,
     User,
 )
+from .net import fetch_image, is_safe_media_url
 from .api import api_client
 
 
 _REDIS_AUTO_REPLY_KEY = "global:last_auto_reply_time"
 _RECENT_NOTE_ID_LIMIT = 1024
+
+# Misskey visibilities whose content must never reach the bot-global memory namespace.
+_RESTRICTED_MEMORY_VISIBILITIES = frozenset({"followers", "specified"})
+
+# Chars reserved for the mention prefix send_note prepends (up to ``max_reply_mentions``
+# handles). Budgeting the reply below the raw note cap keeps the final note within the
+# platform limit; the agent's budget validator enforces it (no truncation backstop —
+# over-cap notes are refused).
+_MENTION_HEADROOM = 280
+
+
+def _user_handle(user: User) -> str:
+    """Get full handle: username for local, username@host for remote."""
+    if user.host:
+        return f"{user.username}@{user.host}"
+    return user.username
+
+
+def _image_urls_for(note: Note, vision: bool) -> list[ImageUrl]:
+    """Extract ImageUrl objects for a note's visual attachments.
+
+    Images use their thumbnail (falling back to the full image). Videos have no
+    image body, but Misskey renders an image thumbnail for them — use that so the
+    vision model can still see a frame. Never fall back to a video's raw ``url``
+    (that's the video file, not an image). Other media (audio, etc.) is skipped.
+    """
+    if not vision or not note.files:
+        return []
+
+    images: list[ImageUrl] = []
+    for file in note.files:
+        if file.type.startswith("image/"):
+            image_url = file.thumbnailUrl or file.url
+        elif file.type.startswith("video/"):
+            image_url = file.thumbnailUrl
+        else:
+            continue
+        if not image_url:
+            continue
+        # SSRF guard: the URL is attacker-controlled on federated notes.
+        if not is_safe_media_url(image_url):
+            logfire.warning("Dropping image with unsafe URL", url=image_url, file_id=file.id)
+            continue
+        images.append(ImageUrl(url=image_url))
+    return images
+
+
+async def _fetch_inline(images: list[ImageUrl], *, timeout: float, max_bytes: int) -> list[TurnImage]:
+    """Download each image so it can be sent inline as base64.
+
+    For providers that refuse image URLs (Ollama Cloud: "image URLs are not currently
+    supported, please use base64 encoded data instead"). An image that can't be fetched
+    is dropped rather than failing the note — a broken attachment shouldn't cost the
+    user their reply. Fetches run concurrently since a note can carry several.
+    """
+    results = await asyncio.gather(*(fetch_image(image.url, timeout=timeout, max_bytes=max_bytes) for image in images))
+    inline: list[TurnImage] = []
+    for image, fetched in zip(images, results):
+        if fetched is None:
+            logfire.warning("Dropping image that could not be fetched inline", url=image.url)
+            continue
+        data, media_type = fetched
+        inline.append(BinaryContent(data=data, media_type=media_type))
+    return inline
 
 
 class Bot:
@@ -86,7 +153,7 @@ class Bot:
         # reaches the LLM, no reply is sent, and the author isn't scored or ingested.
         threshold = self._config.social_credit_ignore_threshold
         if threshold is not None:
-            score = await self._agent.get_author_score(note)
+            score = await self._agent.get_score(_user_handle(note.user))
             if score is not None and score < threshold:
                 logfire.info(
                     "Ignoring low-social-credit author",
@@ -113,11 +180,76 @@ class Bot:
                     break
         if note.renote and (note.renote.text or note.renote.files):
             context.append(note.renote)
-        result = await self._agent.run(note=note, context=context)
+        result = await self._agent.run(await self._note_to_turn(note, context))
         if result.strip() == "NO_REPLY":
             logfire.info(f"Skipping reply to note {note.id} (NO_REPLY)")
             return
         await self.send_note(result, in_reply_to=note)
+
+    async def _media_for(self, note: Note) -> list[TurnImage]:
+        """Extract a note's images in whichever form the configured provider accepts.
+
+        ``url`` hands the provider the media URL (cheapest). ``fetch`` downloads it here
+        and sends bytes inline, which providers like Ollama Cloud require.
+        """
+        images = _image_urls_for(note, self._config.vision)
+        if not images or self._config.vision_image_mode != "fetch":
+            return list(images)
+        return await _fetch_inline(
+            images,
+            timeout=self._config.http_timeout_seconds,
+            max_bytes=self._config.vision_max_image_bytes,
+        )
+
+    async def _note_to_turn(self, note: Note, context: list[Note]) -> AgentTurn:
+        """Translate a Misskey note and its reply chain into a frontend-neutral turn.
+
+        Everything Misskey-specific lives here: handle formatting, attachment
+        extraction, the visibility rules that gate memory writes, privileged-author
+        lookup by user id, and the note-length budget. ``context`` is nearest-parent
+        first; ``AgentTurn.history`` is oldest-first.
+        """
+        author = TurnAuthor(
+            handle=_user_handle(note.user),
+            # Lift the author-only restriction when the note's author is a designated
+            # privileged user (e.g. the operator), configured by user id.
+            privileged=note.user.id in self._config.social_credit_unrestricted_user_ids,
+            location=note.user.location,
+        )
+
+        history: list[HistoryTurn] = []
+        for c in reversed(context):
+            if c.userId == self.user_id:
+                # Strip the leading @mention prefix send_note prepended, so the history
+                # doesn't prime the model to re-open (and copy) its prior reply verbatim.
+                history.append(HistoryTurn(role="assistant", text=self._strip_leading_mentions((c.text or "").strip())))
+            else:
+                history.append(
+                    HistoryTurn(
+                        role="user",
+                        text=c.text or "",
+                        author=_user_handle(c.user),
+                        images=await self._media_for(c),
+                    )
+                )
+
+        # The bot's most recent reply in this thread (context is nearest-parent first).
+        # None when the bot hasn't spoken in the thread.
+        previous_reply = next(
+            (c.text for c in context if c.userId == self.user_id and (c.text or "").strip()),
+            None,
+        )
+        return AgentTurn(
+            text=note.text or "",
+            author=author,
+            images=await self._media_for(note),
+            history=history,
+            char_budget=max(1, self._config.max_note_length - _MENTION_HEADROOM),
+            source_id=note.id,
+            source="misskey_note",
+            memory_writes_allowed=note.visibility not in _RESTRICTED_MEMORY_VISIBILITIES,
+            previous_reply=previous_reply,
+        )
 
     @logfire.instrument(extract_args=["output"])
     async def send_note(

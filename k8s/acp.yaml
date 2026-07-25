@@ -1,0 +1,126 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/name: missbot
+    app.kubernetes.io/component: acp
+  annotations:
+    reloader.stakater.com/auto: "true"
+  name: missbot-acp
+  namespace: misskey
+spec:
+  # Sessions and their history live in the process, so a second replica would
+  # strand a client's session on whichever pod it first connected to. Scale out
+  # only alongside session affinity.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: missbot
+      app.kubernetes.io/component: acp
+  strategy: {}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: missbot
+        app.kubernetes.io/component: acp
+    spec:
+      containers:
+        - image: lax.vultrcr.com/mercury/korg:latest
+          imagePullPolicy: Always
+          name: acp
+          # The image entrypoint is `python -m bot` (the Misskey frontend), so both
+          # command and args are replaced to run the ACP WebSocket server instead.
+          command: ["python", "-m", "bot.acp"]
+          args:
+            - serve
+            - -c
+            - /config.yaml
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8080"
+            - --token-env
+            - ACP_TOKEN
+          env:
+            - name: LOGFIRE_SERVICE_NAME
+              value: missbot-acp
+            - name: LOGFIRE_ENVIRONMENT
+              value: k8s
+          envFrom:
+            - secretRef:
+                name: missbot-secrets
+          ports:
+            - name: acp
+              containerPort: 8080
+          # /healthz is unauthenticated by design (see bot/acp/ws.py), so probes
+          # need no token.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: acp
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: acp
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          volumeMounts:
+            - name: config-volume
+              mountPath: /config.yaml
+              subPath: config.yaml
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "100m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+      volumes:
+        - name: config-volume
+          secret:
+            secretName: missbot-config
+status: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/name: missbot
+    app.kubernetes.io/component: acp
+  name: missbot-acp
+  namespace: misskey
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: missbot
+    app.kubernetes.io/component: acp
+  ports:
+    - name: acp
+      port: 8080
+      targetPort: acp
+---
+# Exposes the ACP endpoint on the tailnet as https://missbot-acp.taile6e57.ts.net,
+# with TLS terminated by Tailscale. Private to the tailnet — the agent writes
+# memories and moves social credit, so it is deliberately not publicly reachable.
+# Consumers connect with:
+#   acpremote mirror wss://missbot-acp.taile6e57.ts.net/acp/ws --bearer-token "$ACP_TOKEN"
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  labels:
+    app.kubernetes.io/name: missbot
+    app.kubernetes.io/component: acp
+  name: missbot-acp
+  namespace: misskey
+spec:
+  ingressClassName: tailscale
+  defaultBackend:
+    service:
+      name: missbot-acp
+      port:
+        number: 8080
+  tls:
+    - hosts:
+        - missbot-acp

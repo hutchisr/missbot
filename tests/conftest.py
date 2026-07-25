@@ -7,6 +7,9 @@ from typing import Any
 import pytest
 from fakeredis import FakeAsyncRedis
 
+from pydantic_ai import ImageUrl
+
+from bot.core import AgentTurn, HistoryTurn, TurnAuthor
 from bot.models import Config, MiFile, Note, User
 
 
@@ -82,6 +85,40 @@ def make_note(make_user):
             replyId=reply_id,
             mentions=mentions,
             files=files,
+        )
+
+    return _factory
+
+
+@pytest.fixture
+def make_turn():
+    """Factory for a frontend-neutral AgentTurn, as an adapter would build it."""
+
+    def _factory(
+        *,
+        text: str = "hello",
+        handle: str = "alice",
+        display: str | None = None,
+        privileged: bool = False,
+        location: str | None = None,
+        images: list[ImageUrl] | None = None,
+        history: list[HistoryTurn] | None = None,
+        char_budget: int | None = None,
+        source_id: str | None = "note-1",
+        source: str = "unknown",
+        memory_writes_allowed: bool = True,
+        previous_reply: str | None = None,
+    ) -> AgentTurn:
+        return AgentTurn(
+            text=text,
+            author=TurnAuthor(handle=handle, display=display, privileged=privileged, location=location),
+            images=images or [],
+            history=history or [],
+            char_budget=char_budget,
+            source_id=source_id,
+            source=source,
+            memory_writes_allowed=memory_writes_allowed,
+            previous_reply=previous_reply,
         )
 
     return _factory

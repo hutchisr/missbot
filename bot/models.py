@@ -338,6 +338,46 @@ class Config(BaseModel):
         default_factory=list,
         description="Streamable-HTTP MCP servers to expose as tools.",
     )
+    vision_image_mode: Literal["url", "fetch"] = Field(
+        default="url",
+        description="How images reach the model. 'url' sends the media URL (cheapest; works with "
+        "OpenRouter and most hosted providers). 'fetch' downloads the image and sends it inline as "
+        "base64 — required by providers that refuse URLs, e.g. Ollama Cloud answers 'image URLs are "
+        "not currently supported, please use base64 encoded data instead'. Fetching makes this "
+        "process retrieve attacker-supplied media, so it is bounded by vision_max_image_bytes and "
+        "http_timeout_seconds and re-checked against the SSRF guard.",
+    )
+    vision_max_image_bytes: int = Field(
+        default=8 * 1024 * 1024,
+        gt=0,
+        description="Maximum bytes downloaded per image when vision_image_mode='fetch'. The body is "
+        "streamed and abandoned once it exceeds this, so oversized media cannot exhaust memory.",
+    )
+    acp_default_identity: str = Field(
+        default="acp",
+        description="Identity used for ACP callers when no sender header can be parsed from the "
+        "prompt. Namespaced as 'acp:<value>' so it can never collide with a fediverse handle. "
+        "Only used by the `python -m bot.acp` frontend.",
+    )
+    acp_parse_sender_header: bool = Field(
+        default=True,
+        description="Parse the per-sender identity out of an ACP harness's message header "
+        "(buzz-acp emits 'From: <label> (npub: ..., hex: ...)'). Only the header region before the "
+        "first 'Content:' line is trusted, and only the pubkey is used — never the display name. "
+        "Set false to key every ACP caller on acp_default_identity instead.",
+    )
+    acp_max_history_turns: int = Field(
+        default=20,
+        gt=0,
+        description="Maximum conversation turns retained per ACP session. ACP sessions are "
+        "long-lived, so history is bounded to keep prompts from growing without limit.",
+    )
+    acp_max_sessions: int = Field(
+        default=8,
+        gt=0,
+        description="Maximum concurrent ACP sessions. Bounds provider, Redis, and memory load "
+        "the same way max_concurrent_handlers does for Misskey.",
+    )
     memory_enabled: bool = Field(
         default=False,
         description="Enable persistent long-term memory via mem0 (Postgres + pgvector). Off by default; "

@@ -79,6 +79,16 @@ def _source(memory: StoredMemory) -> str:
     return str(memory.metadata.get("source") or "").strip().lower()
 
 
+def _is_inferred(memory: StoredMemory) -> bool:
+    """Whether a memory was inferred from a conversation rather than explicitly saved.
+
+    Keyed on "not an explicit add_memory write" rather than on a specific frontend's
+    label, so every frontend's memories (misskey_note, acp_prompt, ...) stay subject to
+    retention and per-author caps while explicit `add_memory` entries stay protected.
+    """
+    return _source(memory) != "add_memory"
+
+
 def _author(memory: StoredMemory) -> str:
     return str(memory.metadata.get("author") or "").strip().lower()
 
@@ -138,19 +148,14 @@ def plan_cleanup(
         cutoff = now - timedelta(days=note_retention_days)
         for memory in records:
             created_at = _parse_datetime(memory.created_at)
-            if (
-                memory.id not in selected
-                and _source(memory) == "misskey_note"
-                and created_at is not None
-                and created_at < cutoff
-            ):
+            if memory.id not in selected and _is_inferred(memory) and created_at is not None and created_at < cutoff:
                 select(memory, "retention")
 
     if max_memories_per_author is not None:
         by_author: dict[str, list[StoredMemory]] = defaultdict(list)
         for memory in records:
             author = _author(memory)
-            if memory.id not in selected and _source(memory) == "misskey_note" and author:
+            if memory.id not in selected and _is_inferred(memory) and author:
                 by_author[author].append(memory)
 
         for author_memories in by_author.values():

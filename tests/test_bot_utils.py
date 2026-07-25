@@ -6,8 +6,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 from pydantic import ValidationError
+from pydantic_ai import BinaryContent, ImageUrl
 
-from bot.bot import Bot
+from bot.bot import Bot, _image_urls_for, _user_handle
+from bot.core import AgentTurn
 from bot.models import MiFile
 
 
@@ -15,6 +17,15 @@ from bot.models import MiFile
 def bot(config):
     """Build a Bot without spinning up the websocket."""
     return Bot(config=config)
+
+
+def _awaited_turn(run_mock) -> AgentTurn:
+    """Pull the AgentTurn the Bot handed to ChatAgent.run."""
+    run_mock.assert_awaited_once()
+    assert run_mock.await_args is not None
+    turn = run_mock.await_args.args[0]
+    assert isinstance(turn, AgentTurn)
+    return turn
 
 
 def test_format_handle_local(bot, make_user):
@@ -255,7 +266,9 @@ async def test_on_mention_processes_image_only_note(bot, make_note):
     ):
         await bot.on_mention(note)
 
-    run_mock.assert_awaited_once_with(note=note, context=[])
+    turn = _awaited_turn(run_mock)
+    assert turn.source_id == note.id
+    assert [i.url for i in turn.images] == ["https://media.example/1.png"]
     send_note_mock.assert_awaited_once_with("vision reply", in_reply_to=note)
 
 
@@ -286,7 +299,10 @@ async def test_on_mention_handles_dm_when_enabled(make_config, make_note):
     ):
         await bot.on_mention(note)
 
-    run_mock.assert_awaited_once_with(note=note, context=[])
+    turn = _awaited_turn(run_mock)
+    assert turn.source_id == note.id
+    # Replyable, but its content must stay out of the bot-global memory namespace.
+    assert turn.memory_writes_allowed is False
     send_note_mock.assert_awaited_once_with("dm reply", in_reply_to=note)
 
 
@@ -297,7 +313,7 @@ async def test_on_mention_ignores_author_below_score_threshold(make_config, make
     note = make_note(text="i am a menace")
 
     with (
-        patch.object(bot._agent, "get_author_score", AsyncMock(return_value=-60)),
+        patch.object(bot._agent, "get_score", AsyncMock(return_value=-60)),
         patch.object(bot._agent, "run", AsyncMock()) as run_mock,
         patch.object(bot, "send_note", AsyncMock()) as send_note_mock,
     ):
@@ -314,13 +330,13 @@ async def test_on_mention_replies_to_author_at_or_above_threshold(make_config, m
     note = make_note(text="hello")
 
     with (
-        patch.object(bot._agent, "get_author_score", AsyncMock(return_value=-50)),
+        patch.object(bot._agent, "get_score", AsyncMock(return_value=-50)),
         patch.object(bot._agent, "run", AsyncMock(return_value="reply")) as run_mock,
         patch.object(bot, "send_note", AsyncMock()) as send_note_mock,
     ):
         await bot.on_mention(note)
 
-    run_mock.assert_awaited_once_with(note=note, context=[])
+    assert _awaited_turn(run_mock).source_id == note.id
     send_note_mock.assert_awaited_once_with("reply", in_reply_to=note)
 
 
@@ -331,13 +347,13 @@ async def test_on_mention_does_not_ignore_unscored_author(make_config, make_note
     note = make_note(text="first time here")
 
     with (
-        patch.object(bot._agent, "get_author_score", AsyncMock(return_value=None)),
+        patch.object(bot._agent, "get_score", AsyncMock(return_value=None)),
         patch.object(bot._agent, "run", AsyncMock(return_value="reply")) as run_mock,
         patch.object(bot, "send_note", AsyncMock()) as send_note_mock,
     ):
         await bot.on_mention(note)
 
-    run_mock.assert_awaited_once_with(note=note, context=[])
+    assert _awaited_turn(run_mock).source_id == note.id
     send_note_mock.assert_awaited_once_with("reply", in_reply_to=note)
 
 
@@ -348,7 +364,7 @@ async def test_on_mention_skips_score_check_when_threshold_unset(make_config, ma
     note = make_note(text="hi")
 
     with (
-        patch.object(bot._agent, "get_author_score", AsyncMock()) as score_mock,
+        patch.object(bot._agent, "get_score", AsyncMock()) as score_mock,
         patch.object(bot._agent, "run", AsyncMock(return_value="reply")),
         patch.object(bot, "send_note", AsyncMock()),
     ):
@@ -595,3 +611,232 @@ def test_task_done_callback_logs_failures(bot):
         bot._task_done_callback(task)
 
     exception_mock.assert_called_once_with("Task failed with exception")
+
+
+# ---------------------------------------------------------------------------
+# Misskey -> neutral turn adaptation
+# ---------------------------------------------------------------------------
+
+
+def test_user_handle_local(make_user):
+    assert _user_handle(make_user(username="alice", host=None)) == "alice"
+
+
+def test_user_handle_remote(make_user):
+    assert _user_handle(make_user(username="alice", host="remote.host")) == "alice@remote.host"
+
+
+def test_image_urls_for_vision_off(make_note):
+    note = make_note(files=[MiFile(id="f1", type="image/png", thumbnailUrl="https://media.example/1.png")])
+    assert _image_urls_for(note, vision=False) == []
+
+
+def test_image_urls_for_includes_image_and_video_thumbnails(make_note):
+    files = [
+        # Image: thumbnail used.
+        MiFile(id="f1", type="image/png", thumbnailUrl="https://media.example/1.png"),
+        # Video: Misskey renders an image thumbnail — use it (NOT the raw video url).
+        MiFile(
+            id="f2",
+            type="video/mp4",
+            thumbnailUrl="https://media.example/2-thumb.jpg",
+            url="https://media.example/2.mp4",
+        ),
+        # Video with no thumbnail: skipped (we must not feed the video file as an image).
+        MiFile(id="f3", type="video/mp4", thumbnailUrl=None, url="https://media.example/3.mp4"),
+        # Non-visual media: skipped.
+        MiFile(id="f4", type="audio/mpeg", thumbnailUrl="https://media.example/4.png"),
+        # Image with no thumbnail or url: skipped.
+        MiFile(id="f5", type="image/jpeg", thumbnailUrl=None),
+    ]
+    note = make_note(files=files)
+    urls = _image_urls_for(note, vision=True)
+    assert all(isinstance(u, ImageUrl) for u in urls)
+    assert [u.url for u in urls] == ["https://media.example/1.png", "https://media.example/2-thumb.jpg"]
+
+
+def test_image_urls_for_no_files(make_note):
+    note = make_note(files=None)
+    assert _image_urls_for(note, vision=True) == []
+
+
+def test_image_urls_for_drops_ssrf_urls(make_note):
+    """Attacker-controlled internal URLs are dropped even with a spoofed image type."""
+    files = [
+        MiFile(id="f1", type="image/png", thumbnailUrl="http://169.254.169.254/latest/meta-data/"),
+        MiFile(id="f2", type="image/png", url="http://missbot-redis.misskey.svc.cluster.local:6379/"),
+        MiFile(id="f3", type="image/png", thumbnailUrl="https://media.example/ok.png"),
+    ]
+    note = make_note(files=files)
+    urls = _image_urls_for(note, vision=True)
+    # Only the public URL survives.
+    assert [u.url for u in urls] == ["https://media.example/ok.png"]
+
+
+@pytest.mark.anyio
+async def test_note_to_turn_maps_author_and_text(bot, make_note, make_user):
+    note = make_note(text="hi", user=make_user(username="alice", host="remote.host", location="Berlin"))
+    turn = await bot._note_to_turn(note, [])
+
+    assert turn.text == "hi"
+    assert turn.author.handle == "alice@remote.host"
+    assert turn.author.rendered == "alice@remote.host"
+    assert turn.author.location == "Berlin"
+    assert turn.author.privileged is False
+    assert turn.source_id == note.id
+
+
+@pytest.mark.anyio
+async def test_note_to_turn_empty_text_becomes_empty_string(bot, make_note):
+    assert (await bot._note_to_turn(make_note(text=None), [])).text == ""
+
+
+@pytest.mark.anyio
+async def test_note_to_turn_flags_privileged_author_by_user_id(make_config, make_note, make_user):
+    bot = Bot(config=make_config(social_credit_unrestricted_user_ids=["admin-id"]))
+    note = make_note(text="judge bob", user=make_user(id="admin-id", username="boss"))
+
+    assert (await bot._note_to_turn(note, [])).author.privileged is True
+
+
+@pytest.mark.anyio
+async def test_note_to_turn_budgets_below_note_cap(bot, make_note):
+    """The reply budget leaves headroom for the mention prefix send_note prepends."""
+    turn = await bot._note_to_turn(make_note(text="hi"), [])
+    assert turn.char_budget == bot._config.max_note_length - 280
+
+
+@pytest.mark.parametrize("visibility", ["followers", "specified"])
+@pytest.mark.anyio
+async def test_note_to_turn_blocks_memory_writes_for_restricted_notes(bot, make_note, visibility):
+    note = make_note(text="secret").model_copy(update={"visibility": visibility})
+    assert (await bot._note_to_turn(note, [])).memory_writes_allowed is False
+
+
+@pytest.mark.anyio
+async def test_note_to_turn_allows_memory_writes_for_public_notes(bot, make_note):
+    note = make_note(text="public thing").model_copy(update={"visibility": "public"})
+    assert (await bot._note_to_turn(note, [])).memory_writes_allowed is True
+
+
+@pytest.mark.anyio
+async def test_note_to_turn_orders_history_oldest_first(bot, make_note, make_user):
+    """`context` is nearest-parent first; the turn's history is chronological."""
+    older = make_note(id="n1", text="oldest", user=make_user(username="bob"))
+    newer = make_note(id="n2", text="middle", user=make_user(username="carol"))
+    # Nearest parent first, as on_mention builds it.
+    turn = await bot._note_to_turn(make_note(text="latest"), [newer, older])
+
+    assert [(h.role, h.author, h.text) for h in turn.history] == [
+        ("user", "bob", "oldest"),
+        ("user", "carol", "middle"),
+    ]
+
+
+@pytest.mark.anyio
+async def test_note_to_turn_marks_bot_notes_as_assistant_and_strips_mentions(bot, make_note, make_user):
+    bot_note = make_note(id="n1", text="@alice my earlier reply", user=make_user(id=bot.user_id, username="grok"))
+    turn = await bot._note_to_turn(make_note(text="follow-up"), [bot_note])
+
+    assert [(h.role, h.text) for h in turn.history] == [("assistant", "my earlier reply")]
+    # The repeat guard compares against the raw prior reply.
+    assert turn.previous_reply == "@alice my earlier reply"
+
+
+@pytest.mark.anyio
+async def test_note_to_turn_previous_reply_none_without_bot_notes(bot, make_note, make_user):
+    other = make_note(id="n1", text="someone else", user=make_user(username="bob"))
+    assert (await bot._note_to_turn(make_note(text="hi"), [other])).previous_reply is None
+
+
+@pytest.mark.anyio
+async def test_note_to_turn_carries_context_images(bot, make_note, make_user):
+    parent = make_note(
+        id="n1",
+        text="look at this",
+        user=make_user(username="bob"),
+        files=[MiFile(id="f1", type="image/png", thumbnailUrl="https://media.example/1.png")],
+    )
+    turn = await bot._note_to_turn(make_note(text="what is it"), [parent])
+
+    assert [i.url for i in turn.history[0].images] == ["https://media.example/1.png"]
+
+
+# --- vision image modes -----------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_media_for_defaults_to_urls(bot, make_note):
+    """Default mode hands the provider the URL — no fetching from this process."""
+    note = make_note(files=[MiFile(id="f1", type="image/png", thumbnailUrl="https://media.example/1.png")])
+
+    with patch("bot.bot.fetch_image", AsyncMock()) as fetch_mock:
+        media = await bot._media_for(note)
+
+    assert [m.url for m in media] == ["https://media.example/1.png"]
+    fetch_mock.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_media_for_fetch_mode_sends_bytes_inline(make_config, make_note):
+    """Providers that refuse URLs (Ollama Cloud) need BinaryContent instead."""
+    bot = Bot(config=make_config(vision_image_mode="fetch"))
+    note = make_note(files=[MiFile(id="f1", type="image/png", thumbnailUrl="https://media.example/1.png")])
+
+    with patch("bot.bot.fetch_image", AsyncMock(return_value=(b"\x89PNG-bytes", "image/png"))) as fetch_mock:
+        media = await bot._media_for(note)
+
+    assert len(media) == 1
+    assert isinstance(media[0], BinaryContent)
+    assert media[0].data == b"\x89PNG-bytes"
+    assert media[0].media_type == "image/png"
+    assert fetch_mock.await_args.kwargs["max_bytes"] == bot._config.vision_max_image_bytes
+
+
+@pytest.mark.anyio
+async def test_media_for_fetch_mode_drops_unfetchable_images(make_config, make_note):
+    """A broken attachment must not cost the user their reply."""
+    bot = Bot(config=make_config(vision_image_mode="fetch"))
+    note = make_note(
+        files=[
+            MiFile(id="f1", type="image/png", thumbnailUrl="https://media.example/broken.png"),
+            MiFile(id="f2", type="image/png", thumbnailUrl="https://media.example/ok.png"),
+        ]
+    )
+
+    with patch("bot.bot.fetch_image", AsyncMock(side_effect=[None, (b"ok-bytes", "image/png")])):
+        media = await bot._media_for(note)
+
+    assert len(media) == 1
+    assert media[0].data == b"ok-bytes"
+
+
+@pytest.mark.anyio
+async def test_media_for_fetch_mode_skips_fetch_when_no_images(make_config, make_note):
+    bot = Bot(config=make_config(vision_image_mode="fetch"))
+
+    with patch("bot.bot.fetch_image", AsyncMock()) as fetch_mock:
+        assert await bot._media_for(make_note(files=None)) == []
+
+    fetch_mock.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_note_to_turn_uses_fetch_mode_for_current_and_history(make_config, make_note, make_user):
+    bot = Bot(config=make_config(vision_image_mode="fetch"))
+    parent = make_note(
+        id="n1",
+        text="look",
+        user=make_user(username="bob"),
+        files=[MiFile(id="f1", type="image/png", thumbnailUrl="https://media.example/1.png")],
+    )
+    note = make_note(
+        text="and this",
+        files=[MiFile(id="f2", type="image/png", thumbnailUrl="https://media.example/2.png")],
+    )
+
+    with patch("bot.bot.fetch_image", AsyncMock(return_value=(b"bytes", "image/png"))):
+        turn = await bot._note_to_turn(note, [parent])
+
+    assert all(isinstance(i, BinaryContent) for i in turn.images)
+    assert all(isinstance(i, BinaryContent) for i in turn.history[0].images)
