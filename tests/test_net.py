@@ -69,9 +69,13 @@ def _ok_image(request):
 
 @pytest.mark.anyio
 async def test_fetch_image_returns_bytes_and_media_type():
-    data, media_type = await fetch_image(
+    result = await fetch_image(
         "https://media.example/pic.png", timeout=5.0, max_bytes=1_000_000, transport=_transport(_ok_image)
     )
+
+    # None is the "unusable image" signal, not a fetch of zero bytes.
+    assert result is not None
+    data, media_type = result
     assert data.startswith(b"\x89PNG")
     assert media_type == "image/png"
 

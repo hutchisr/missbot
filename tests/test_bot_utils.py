@@ -268,7 +268,11 @@ async def test_on_mention_processes_image_only_note(bot, make_note):
 
     turn = _awaited_turn(run_mock)
     assert turn.source_id == note.id
-    assert [i.url for i in turn.images] == ["https://media.example/1.png"]
+    assert len(turn.images) == 1
+    # url mode passes the media URL through rather than downloading it.
+    image = turn.images[0]
+    assert isinstance(image, ImageUrl)
+    assert image.url == "https://media.example/1.png"
     send_note_mock.assert_awaited_once_with("vision reply", in_reply_to=note)
 
 
@@ -790,6 +794,7 @@ async def test_media_for_fetch_mode_sends_bytes_inline(make_config, make_note):
     assert isinstance(media[0], BinaryContent)
     assert media[0].data == b"\x89PNG-bytes"
     assert media[0].media_type == "image/png"
+    assert fetch_mock.await_args is not None
     assert fetch_mock.await_args.kwargs["max_bytes"] == bot._config.vision_max_image_bytes
 
 
@@ -808,6 +813,8 @@ async def test_media_for_fetch_mode_drops_unfetchable_images(make_config, make_n
         media = await bot._media_for(note)
 
     assert len(media) == 1
+    # The surviving image is the second one — the broken fetch was dropped, not substituted.
+    assert isinstance(media[0], BinaryContent)
     assert media[0].data == b"ok-bytes"
 
 

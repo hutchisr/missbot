@@ -8,7 +8,7 @@ import pytest
 
 from bot.acp.agent import MissbotAgent, _text_from_blocks
 from bot.acp.session import SessionRegistry
-from bot.core import HistoryTurn
+from bot.core import AgentTurn, HistoryTurn
 
 _HEX = "a" * 64
 
@@ -28,6 +28,12 @@ def _block(content: str, *, hex_key: str = _HEX) -> str:
 
 async def _new_session(agent) -> str:
     return (await agent.new_session(cwd="/tmp")).session_id
+
+
+def _last_turn(run_mock) -> AgentTurn:
+    """Pull the AgentTurn the adapter most recently handed to ChatAgent.run."""
+    assert run_mock.await_args is not None
+    return run_mock.await_args.args[0]
 
 
 # --- initialize -------------------------------------------------------------
@@ -106,7 +112,7 @@ async def test_prompt_runs_turn_and_pushes_session_update(agent):
         resp = await agent.prompt(session_id=session_id, prompt=[_text(_block("hello"))])
 
     assert resp.stop_reason == "end_turn"
-    turn = run_mock.await_args.args[0]
+    turn = _last_turn(run_mock)
     # The full harness block reaches the model, metadata included.
     assert "Content: hello" in turn.text
     assert turn.author.handle == f"acp:{_HEX}"
@@ -127,7 +133,7 @@ async def test_prompt_falls_back_to_configured_identity(make_config):
     with patch.object(agent._agent, "run", AsyncMock(return_value="ok")) as run_mock:
         await agent.prompt(session_id=session_id, prompt=[_text("bare text, no header")])
 
-    assert run_mock.await_args.args[0].author.handle == "acp:buzz"
+    assert _last_turn(run_mock).author.handle == "acp:buzz"
 
 
 @pytest.mark.anyio
@@ -140,7 +146,7 @@ async def test_prompt_accumulates_session_history(agent):
         await agent.prompt(session_id=session_id, prompt=[_text(_block("two"))])
 
     # The second turn sees the first exchange.
-    second_turn = run_mock.await_args.args[0]
+    second_turn = _last_turn(run_mock)
     assert [(h.role, h.text) for h in second_turn.history][-1] == ("assistant", "first reply")
     assert second_turn.previous_reply == "first reply"
 
@@ -156,6 +162,7 @@ async def test_session_history_is_bounded(make_config):
             await agent.prompt(session_id=session_id, prompt=[_text(_block(f"msg {i}"))])
 
     session = agent._sessions.get(session_id)
+    assert session is not None
     # 2 turns => 2 user + 2 assistant messages retained.
     assert len(session.history) == 4
     assert "msg 4" in session.history[-2].text
@@ -236,6 +243,44 @@ async def test_prompt_skips_score_lookup_without_threshold(agent):
         await agent.prompt(session_id=session_id, prompt=[_text(_block("hello"))])
 
     score_mock.assert_not_awaited()
+
+
+# --- unimplemented protocol surface -----------------------------------------
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(lambda a: a.load_session(cwd="/tmp", session_id="s1"), id="session/load"),
+        pytest.param(lambda a: a.list_sessions(), id="session/list"),
+        pytest.param(lambda a: a.set_session_mode(session_id="s1", mode_id="fast"), id="session/set_mode"),
+        pytest.param(
+            lambda a: a.set_config_option(config_id="c", session_id="s1", value=True),
+            id="session/set_config_option",
+        ),
+        pytest.param(lambda a: a.fork_session(session_id="s1", cwd="/tmp"), id="session/fork"),
+        pytest.param(lambda a: a.resume_session(session_id="s1", cwd="/tmp"), id="session/resume"),
+        pytest.param(lambda a: a.ext_method("example/thing", {}), id="ext_method"),
+    ],
+)
+async def test_unsupported_requests_raise_method_not_found(agent, call):
+    """`acp.Agent` is a Protocol, so an unimplemented method is still *inherited*.
+
+    The SDK's router resolves handlers with `getattr`, so those stubs get routed and
+    return None, which it reports to the client as a success. A client probing
+    `session/load` would read that as "session restored". Answer with a real error.
+    """
+    with pytest.raises(acp.RequestError) as excinfo:
+        await call(agent)
+
+    assert excinfo.value.code == -32601
+
+
+@pytest.mark.anyio
+async def test_unsupported_notification_is_a_noop(agent):
+    """Notifications have no response channel — raising would only break the connection."""
+    await agent.ext_notification("example/ping", {})
 
 
 # --- cancellation -----------------------------------------------------------

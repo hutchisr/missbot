@@ -18,9 +18,12 @@ def test_agent_deps_defaults():
 def test_make_enable_gate_tool_sets_name_and_doc():
     tool = _make_enable_gate_tool("research", ["tavily", "exa"])
     assert tool.__name__ == "enable_research"
-    assert "research" in tool.__doc__
-    assert "tavily" in tool.__doc__
-    assert "exa" in tool.__doc__
+    # The docstring is the model's only hint about what calling the gate unlocks.
+    doc = tool.__doc__
+    assert doc is not None
+    assert "research" in doc
+    assert "tavily" in doc
+    assert "exa" in doc
 
 
 @pytest.mark.anyio

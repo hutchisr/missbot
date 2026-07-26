@@ -40,6 +40,9 @@ OPENROUTER_API_KEY=sk-dummy uv run pytest -q
 uv run ruff check bot/
 uv run ruff format --check bot/
 
+# Type check (config in pyproject.toml; bot/ and tests/ are both clean, keep them that way)
+uv run pyright
+
 # Docker
 docker build -t missbot . && docker run -v /path/to/config.yaml:/config.yaml missbot
 
@@ -151,6 +154,8 @@ Config fields:
 
 **Differences from the Misskey path.** No character cap (`char_budget=None` — the note limit is Misskey's, not a universal one), no `fs/*` or `terminal/*` client capabilities (missbot is conversational, not a coding agent), no `session/load` (history is in-process and does not survive restart), and no auth methods (over stdio the trust boundary is *who spawned the process*). Client-supplied `cwd` and `mcpServers` on `session/new` are ignored — missbot brings its own toolset from config. Social credit scoring, the ignore threshold, memory ingestion, and `NO_REPLY` all behave exactly as on the Misskey path.
 
+**Unsupported methods are declined explicitly.** `acp.Agent` is a `Protocol`, so any method `MissbotAgent` doesn't override is still *inherited* as a stub with an `...` body — and the SDK's router resolves handlers with `getattr`, so those stubs get routed and return `None`, which the connection reports to the client as a **success**. `bot/acp/agent.py` therefore implements `load_session`, `list_sessions`, `set_session_mode`, `set_config_option`, `fork_session`, `resume_session`, and `ext_method` as explicit `method_not_found` (-32601) refusals; `ext_notification` logs and drops, since a notification has no response channel to refuse through. Adding a method to the ACP surface means *replacing* one of these, not adding alongside it.
+
 **stdout is the protocol channel.** `bot/acp/__main__.py` points logfire's console exporter and `logging` at stderr. Anything printed to stdout corrupts the JSON-RPC stream and breaks the connection.
 
 ### Long-term memory
@@ -240,5 +245,6 @@ When `system_prompt_auto` and `auto_post_interval` are configured, `ChatAgent.ru
 After making changes, always:
 1. Check for IDE/compiler errors on modified files
 2. Run `uv run ruff check bot/` and `uv run ruff format --check bot/`
-3. Run the tests: `OPENROUTER_API_KEY=sk-dummy uv run pytest -q` (the dummy key is required for collection — see Commands)
-4. Fix any issues before considering the task complete
+3. Run `uv run pyright` — the tree is at zero errors, so any output is yours
+4. Run the tests: `OPENROUTER_API_KEY=sk-dummy uv run pytest -q` (the dummy key is required for collection — see Commands)
+5. Fix any issues before considering the task complete

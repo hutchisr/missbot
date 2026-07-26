@@ -25,6 +25,7 @@ dev = [
     "anyio>=4.0.0",
     "fakeredis>=2.20.0",
     "ipykernel>=7.1.0",
+    "pyright>=1.1.411",
     "pytest>=9.0.3",
     "pytest-cov>=5.0.0",
     "ruff>=0.15.6",
@@ -33,6 +34,25 @@ dev = [
 
 [tool.ruff]
 line-length = 120
+
+[tool.pyright]
+include = ["bot", "tests"]
+venvPath = "."
+venv = ".venv"
+# Check against the oldest interpreter the project claims to support, not whichever
+# one happens to be in .venv.
+pythonVersion = "3.13"
+
+[[tool.pyright.executionEnvironments]]
+root = "tests"
+# An execution environment resolves imports against its own root, so the project
+# root has to be added back or every `from bot... import` reads as unresolved.
+extraPaths = ["."]
+# Tests drive internals with duck-typed fakes: SimpleNamespace stands in for
+# RunContext/ToolDefinition, and unbound methods are called with self=None so a
+# pure function can be exercised without building a ChatAgent. Both are deliberate,
+# and neither survives being made type-correct without burying the test in casts.
+reportArgumentType = "none"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -117,8 +117,8 @@ def test_model_settings_identify_missbot(config):
         project_version = tomllib.load(project_file)["project"]["version"]
     expected_headers = {"User-Agent": f"Missbot/{project_version}"}
 
-    assert agent._generation_settings(30.0)["extra_headers"] == expected_headers
-    assert _CLASSIFIER_MODEL_SETTINGS["extra_headers"] == expected_headers
+    assert agent._generation_settings(30.0).get("extra_headers") == expected_headers
+    assert _CLASSIFIER_MODEL_SETTINGS.get("extra_headers") == expected_headers
 
 
 def test_enforce_length_passes_through_within_budget():

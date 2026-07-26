@@ -13,7 +13,7 @@ not a coding agent, so it never asks a client to read files or run commands.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Optional
+from typing import Any, NoReturn, Optional
 
 import acp
 import logfire
@@ -209,6 +209,70 @@ class MissbotAgent(acp.Agent):
             session.task.cancel()
         logfire.info("ACP session closed", session_id=session_id, live_sessions=len(self._sessions))
         return None
+
+    # --- deliberately unsupported ----------------------------------------
+    #
+    # `acp.Agent` is a Protocol, so every method left out here is still *inherited* as
+    # a stub with an `...` body. The SDK's router resolves handlers with `getattr`
+    # (acp/router.py:_resolve_handler), so those stubs get routed anyway and return
+    # None, which the connection then reports to the client as a success. Declining
+    # explicitly is the difference between "no such method" and a client concluding
+    # its `session/load` restored a session that never existed.
+
+    def _unsupported(self, method: str) -> NoReturn:
+        logfire.info("ACP method declined", method=method)
+        raise acp.RequestError.method_not_found(method)
+
+    async def load_session(
+        self,
+        cwd: str,
+        session_id: str,
+        mcp_servers: Optional[list[Any]] = None,
+        additional_directories: Optional[list[str]] = None,
+        **kwargs: Any,
+    ) -> NoReturn:
+        """History is in-process and does not survive a restart (`initialize` says so)."""
+        self._unsupported(acp.AGENT_METHODS["session_load"])
+
+    async def list_sessions(self, cwd: str | None = None, cursor: str | None = None, **kwargs: Any) -> NoReturn:
+        """Sessions are per-connection and not enumerable across clients."""
+        self._unsupported(acp.AGENT_METHODS["session_list"])
+
+    async def set_session_mode(self, session_id: str, mode_id: str, **kwargs: Any) -> NoReturn:
+        """One persona, one mode — `initialize` advertises no modes to select."""
+        self._unsupported(acp.AGENT_METHODS["session_set_mode"])
+
+    async def set_config_option(self, config_id: str, session_id: str, value: str | bool, **kwargs: Any) -> NoReturn:
+        """Configuration is the operator's, from config.yaml — not the client's to set."""
+        self._unsupported(acp.AGENT_METHODS["session_set_config_option"])
+
+    async def fork_session(
+        self,
+        session_id: str,
+        cwd: str,
+        additional_directories: Optional[list[str]] = None,
+        mcp_servers: Optional[list[Any]] = None,
+        **kwargs: Any,
+    ) -> NoReturn:
+        self._unsupported(acp.AGENT_METHODS["session_fork"])
+
+    async def resume_session(
+        self,
+        session_id: str,
+        cwd: str,
+        additional_directories: Optional[list[str]] = None,
+        mcp_servers: Optional[list[Any]] = None,
+        **kwargs: Any,
+    ) -> NoReturn:
+        self._unsupported(acp.AGENT_METHODS["session_resume"])
+
+    async def ext_method(self, method: str, params: dict[str, Any]) -> NoReturn:
+        """No `_`-prefixed extensions: the toolset comes from config, not the wire."""
+        self._unsupported(method)
+
+    async def ext_notification(self, method: str, params: dict[str, Any]) -> None:
+        """Notifications have no response channel, so an unknown one is dropped, not refused."""
+        logfire.info("ACP extension notification ignored", method=method)
 
 
 def _text_from_blocks(blocks: list[Any]) -> str:

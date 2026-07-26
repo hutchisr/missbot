@@ -67,7 +67,7 @@ def build_scoring_spec(categories: Sequence[ScoreCategory]) -> ScoringSpec:
     # output to those values. The names are only known at runtime; call __getitem__ directly
     # so the checker doesn't reject the non-literal subscript (Literal[names] is invalid as a
     # static type form). Result is typed Any (ScoringSpec.output_type).
-    output_type = Literal.__getitem__(names)
+    output_type = Literal.__getitem__(names)  # pyright: ignore[reportAttributeAccessIssue]
     deltas = {c.name: c.delta for c in categories}
     return ScoringSpec(output_type=output_type, deltas=deltas, instructions=instructions)
 
