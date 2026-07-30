@@ -173,6 +173,15 @@ class AutoDeps:
 
     image: Optional[GeneratedImage] = None
     """Set by `generate_image`; read back by `ChatAgent.run_auto`. One image per run."""
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
+    """Serializes `generate_image` calls against this run's deps.
+
+    pydantic-ai may run tool calls emitted in the same model turn concurrently
+    (`asyncio.create_task` per call), so the tool's own "already generated" check and the
+    write that follows it are a check-then-set race without this: two concurrent calls could
+    both observe `image is None` before either sets it, paying for two generations instead of
+    the intended one-per-post cap. The lock is per-run (fresh `AutoDeps` per `run_auto` call),
+    not process-wide, so it never serializes across unrelated runs."""
 
 
 def _make_enable_gate_tool(gate: str, servers: list[str]):
@@ -202,7 +211,10 @@ def _make_generate_image_tool(generator: ImageGenerator):
     Over-length inputs are refused rather than truncated, so the model gets a chance to
     comply instead of having its intent quietly rewritten. A second call in one run is
     refused too: the cap is one image per post, enforced here rather than trusted to the
-    prompt.
+    prompt. The whole body runs under `ctx.deps.lock` so that guarantee holds even when
+    pydantic-ai schedules two calls to this tool concurrently within one model turn — without
+    the lock, both calls could observe `ctx.deps.image is None` before either writes it,
+    generating (and paying for) two images instead of one.
     """
 
     async def generate_image(ctx: RunContext[AutoDeps], prompt: str, alt_text: str) -> str:
@@ -217,24 +229,25 @@ def _make_generate_image_tool(generator: ImageGenerator):
             alt_text: Short plain description of the finished picture, for people who cannot
                 see it. Not a copy of the prompt.
         """
-        if ctx.deps.image is not None:
-            return "An image is already attached to this post. Do not call generate_image again."
-        if len(prompt) > _MAX_IMAGE_PROMPT_CHARS:
-            return (
-                f"Refused: prompt is {len(prompt)} characters, over the {_MAX_IMAGE_PROMPT_CHARS}-character "
-                "limit. Call again with a shorter prompt."
-            )
-        if len(alt_text) > _MAX_IMAGE_ALT_CHARS:
-            return (
-                f"Refused: alt_text is {len(alt_text)} characters, over the {_MAX_IMAGE_ALT_CHARS}-character "
-                "limit. Call again with a shorter description."
-            )
+        async with ctx.deps.lock:
+            if ctx.deps.image is not None:
+                return "An image is already attached to this post. Do not call generate_image again."
+            if len(prompt) > _MAX_IMAGE_PROMPT_CHARS:
+                return (
+                    f"Refused: prompt is {len(prompt)} characters, over the {_MAX_IMAGE_PROMPT_CHARS}-character "
+                    "limit. Call again with a shorter prompt."
+                )
+            if len(alt_text) > _MAX_IMAGE_ALT_CHARS:
+                return (
+                    f"Refused: alt_text is {len(alt_text)} characters, over the {_MAX_IMAGE_ALT_CHARS}-character "
+                    "limit. Call again with a shorter description."
+                )
 
-        image = await generator.generate(prompt, alt_text)
-        if image is None:
-            return "Image generation failed. Finish the post without an image."
-        ctx.deps.image = image
-        return "Image generated and it will be attached to this post. Now write the post text."
+            image = await generator.generate(prompt, alt_text)
+            if image is None:
+                return "Image generation failed. Finish the post without an image."
+            ctx.deps.image = image
+            return "Image generated and it will be attached to this post. Now write the post text."
 
     return generate_image
 

@@ -4,6 +4,7 @@
 (attachments, visibility, privileged user ids) is covered in `test_bot_utils.py`.
 """
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -495,6 +496,54 @@ async def test_generate_image_tool_refuses_second_call():
     assert generator.calls == []
     assert deps.image is _GENERATED
     assert "already" in result.lower()
+
+
+class _RacyStubGenerator:
+    """Like `_StubGenerator`, but actually yields control mid-`generate()`.
+
+    `_StubGenerator.generate` never awaits anything real, so calling it under
+    `asyncio.gather` never lets a second concurrent call interleave — the first task runs to
+    completion in one scheduler step before the second ever starts. A real provider call does
+    yield (it's a network round trip), which is exactly what lets two `generate_image` tool
+    calls emitted in the same model turn race past the tool's "already generated" check before
+    either writes `ctx.deps.image`. This stub reproduces that yield with `asyncio.sleep(0)` so
+    a test can actually exercise the race window instead of merely asserting sequential calls.
+    """
+
+    def __init__(self, image):
+        self.image = image
+        self.calls: list[tuple[str, str]] = []
+
+    async def generate(self, prompt: str, alt_text: str):
+        self.calls.append((prompt, alt_text))
+        await asyncio.sleep(0)
+        return self.image
+
+
+@pytest.mark.anyio
+async def test_generate_image_tool_serializes_concurrent_calls():
+    """Two generate_image calls fired concurrently against one AutoDeps (as pydantic-ai's own
+    scheduler can do for two tool calls emitted in the same model turn) must not both slip
+    past the check-then-set guard: only one generation call happens and only one image is
+    stored. A test that merely calls the tool twice in sequence would not catch a regression
+    here, since the race only shows up under real concurrency.
+    """
+    generator = _RacyStubGenerator(_GENERATED)
+    tool = _make_generate_image_tool(generator)  # type: ignore[arg-type]
+    deps = AutoDeps()
+    ctx = SimpleNamespace(deps=deps)
+
+    results = await asyncio.gather(
+        tool(ctx, "a shrimp in a hat", "a shrimp"),  # type: ignore[arg-type]
+        tool(ctx, "a different shrimp entirely", "another shrimp"),  # type: ignore[arg-type]
+    )
+
+    assert len(generator.calls) == 1, "generator.generate() must be called at most once per run"
+    assert deps.image is _GENERATED
+    # Both messages contain "attached" ("already attached" vs. "will be attached"), so
+    # distinguish on "already" (refusal) vs. "generated" (the one call that actually ran).
+    assert sum(1 for r in results if "already" in r.lower()) == 1
+    assert sum(1 for r in results if "generated" in r.lower()) == 1
 
 
 @pytest.mark.anyio
