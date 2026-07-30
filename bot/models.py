@@ -353,6 +353,49 @@ class Config(BaseModel):
         description="Maximum bytes downloaded per image when vision_image_mode='fetch'. The body is "
         "streamed and abandoned once it exceeds this, so oversized media cannot exhaust memory.",
     )
+    image_gen_enabled: bool = Field(
+        default=False,
+        description="Let the autonomous-post agent generate an image for its note via the generate_image "
+        "tool. Requires image_gen_model. Auto posts only — the reply path and ACP never receive the tool.",
+    )
+    image_gen_model: Optional[str] = Field(
+        default=None,
+        description="Image model id sent to the images endpoint (e.g. 'google/gemini-2.5-flash-image').",
+    )
+    image_gen_base_url: AnyHttpUrl = Field(
+        default=AnyHttpUrl("https://openrouter.ai/api/v1"),
+        description="OpenAI-compatible base URL for image generation (POSTed to <base_url>/images/generations).",
+    )
+    image_gen_api_key: Optional[str] = Field(
+        default=None,
+        description="API key for the image endpoint. Use image_gen_api_key_env to load from env instead.",
+    )
+    image_gen_api_key_env: str = Field(
+        default="OPENROUTER_API_KEY",
+        description="Environment variable holding the image endpoint's API key (used when image_gen_api_key "
+        "is unset). When neither resolves, requests are sent unauthenticated — which is valid for a keyless "
+        "self-hosted endpoint, so it warns rather than failing startup.",
+    )
+    image_gen_size: Optional[str] = Field(
+        default=None,
+        description="Optional `size` request param (e.g. '1024x1024'). Sent only when set, so backends that "
+        "reject the field are unaffected while it is omitted.",
+    )
+    image_gen_timeout_seconds: float = Field(
+        default=120.0,
+        gt=0,
+        description="HTTP timeout for one image generation request. Image models are much slower than chat.",
+    )
+    image_gen_max_bytes: int = Field(
+        default=8 * 1024 * 1024,
+        gt=0,
+        description="Maximum decoded image size accepted from the provider. A larger image is dropped and the "
+        "post goes out as text only.",
+    )
+    image_gen_mark_sensitive: bool = Field(
+        default=False,
+        description="Upload generated images with isSensitive set, so Misskey blurs them behind a click.",
+    )
     acp_default_identity: str = Field(
         default="acp",
         description="Identity used for ACP callers when no sender header can be parsed from the "
@@ -517,4 +560,10 @@ class Config(BaseModel):
                 f"embedding_dimensions ({self.embedding_dimensions}) must equal embedding_dim ({self.embedding_dim}) "
                 "— it only tells the embeddings API to truncate to the stored column size."
             )
+        return self
+
+    @model_validator(mode="after")
+    def check_image_gen_config(self) -> "Config":
+        if self.image_gen_enabled and not self.image_gen_model:
+            raise ValueError("image_gen_model is required when image_gen_enabled is true")
         return self

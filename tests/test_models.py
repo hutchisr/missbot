@@ -208,3 +208,28 @@ def test_score_categories_reject_empty_list(make_config):
 def test_score_category_rejects_blank_name():
     with pytest.raises(ValidationError):
         ScoreCategory(name="   ", delta=1, description="x")
+
+
+def test_image_gen_enabled_requires_model(make_config):
+    """A master switch with no model would fail at the first generation attempt instead."""
+    with pytest.raises(ValidationError):
+        make_config(image_gen_enabled=True)
+
+
+def test_image_gen_defaults(make_config):
+    cfg = make_config(image_gen_enabled=True, image_gen_model="google/gemini-2.5-flash-image")
+
+    assert str(cfg.image_gen_base_url).rstrip("/") == "https://openrouter.ai/api/v1"
+    assert cfg.image_gen_api_key_env == "OPENROUTER_API_KEY"
+    assert cfg.image_gen_api_key is None
+    assert cfg.image_gen_size is None
+    assert cfg.image_gen_timeout_seconds == 120.0
+    assert cfg.image_gen_max_bytes == 8 * 1024 * 1024
+    assert cfg.image_gen_mark_sensitive is False
+
+
+def test_image_gen_off_by_default(make_config):
+    cfg = make_config()
+
+    assert cfg.image_gen_enabled is False
+    assert cfg.image_gen_model is None
