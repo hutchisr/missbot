@@ -90,6 +90,7 @@ curl -s https://missbot-acp.taile6e57.ts.net/acp | jq           # transport meta
 | `bot/memory.py` | Thin async adapter around mem0's `AsyncMemory`; builds the mem0 config, scopes memories to the bot `agent_id`, and exposes the runtime plus maintenance read/delete paths |
 | `bot/maintenance.py` | Out-of-process mem0 cleanup CLI; selects expired, duplicate, stale, empty, and per-author overflow note memories, then deletes them through mem0 so entity links stay consistent. Driven by `k8s/maintenance.yaml` |
 | `bot/net.py` | `is_safe_media_url()` — SSRF guard for attacker-supplied image URLs (blocks private/reserved IPs and internal hosts); `fetch_image()` — bounded, guarded download used by `vision_image_mode: fetch` |
+| `bot/imagegen.py` | `ImageGenerator` + `GeneratedImage` — OpenAI-compatible `/images/generations` client for auto-post images. Validates by magic bytes (PNG/JPEG/GIF/WebP, SVG refused), caps the response body and decoded size, and uses a dedicated client so the Misskey token never reaches the provider |
 | `bot/mcp.py` | `build_mcp_toolsets()` + `gate_names()` — streamable-HTTP MCP servers with allow/block and gate filtering |
 | `bot/api.py` | HTTP client utilities |
 | `bot/cli.py` | CLI entry point and argument parsing |
@@ -111,6 +112,14 @@ Optional fields:
 - **Model vision flags matter.** A bare string in `llm_models` defaults to `vision: true`. A model that cannot accept images must be declared `{model: ..., vision: false}`, or `ChatAgent` will route image prompts to it and burn a failed call. `_spec_supports_vision` builds a separate vision chain from the models that can (see `k8s/config.yaml`, where only `minimax-m3` accepts images)
 - `vision_models`: legacy, unused when `vision=true`
 - `system_prompt_auto` + `auto_post_interval`: autonomous posting (interval in seconds)
+- `image_gen_enabled` (default `false`): give the autonomous-post agent a `generate_image` tool so it can illustrate its own post. Auto posts only — the tool is built with `RunContext[AutoDeps]`, a different deps type than the reply agent's `Agent[AgentDeps, str]`, so it is a type error to hand it to the reply or ACP agent rather than a config toggle away from leaking there. Requires `image_gen_model`
+- `image_gen_model`: image model id sent to the endpoint (e.g. `google/gemini-2.5-flash-image`)
+- `image_gen_base_url` (default `https://openrouter.ai/api/v1`): OpenAI-compatible base URL; the request goes to `<base_url>/images/generations`
+- `image_gen_api_key` / `image_gen_api_key_env` (default env `OPENROUTER_API_KEY`): same resolution order as `bot/memory.py`'s embedding/extraction keys — explicit key first, then the env var, and if neither resolves the request is sent unauthenticated (a warning is logged, since that's valid for a keyless self-hosted endpoint rather than a misconfiguration)
+- `image_gen_size` (default unset/`None`): optional `size` request param (e.g. `1024x1024`); sent only when set, so backends that reject the field are unaffected
+- `image_gen_timeout_seconds` (default `120`): HTTP timeout for one generation call; image models are much slower than chat
+- `image_gen_max_bytes` (default `8388608`): cap on the decoded image; checked against the base64 length before decoding (so an over-cap image is dropped without ever materializing it) and again after
+- `image_gen_mark_sensitive` (default `false`): upload with `isSensitive` set so Misskey blurs the image behind a click
 - `searxng_url`, `searxng_user`, `searxng_password`: web search via SearXNG
 - `redis_url`, `redis_password`, `redis_db`: Redis for social credit system
 - `social_credit_auto_score` (default `true`): score every author's message via an isolated, tool-less classifier whose category is mapped to a fixed delta (−10…+10) in code — users can't dictate their own score (privileged users are scored too; the flag only gates the manual adjust tool)
@@ -229,7 +238,7 @@ For tools needing `RunContext`, use the signature `async def my_tool(ctx: RunCon
 5. Reply sent via Misskey API with proper mention formatting
 
 ### Autonomous posting
-When `system_prompt_auto` and `auto_post_interval` are configured, `ChatAgent.run_auto()` generates unprompted timeline posts on a timer.
+When `system_prompt_auto` and `auto_post_interval` are configured, `ChatAgent.run_auto()` generates unprompted timeline posts on a timer. `run_auto()` returns `AutoPost(text, image)` rather than a bare string: when `image_gen_enabled`, `generate_image` is registered on the auto agent only (never the reply agent — its tool signature is `RunContext[AutoDeps]`, a deps type the reply agent's `Agent[AgentDeps, str]` cannot accept, so the auto-post-only scope is enforced by the type checker, not just by convention), and a call that succeeds leaves its `GeneratedImage` on `AutoDeps.image` for `run_auto()` to read back after the run completes. `Bot.post_autonomous` uploads that image to `drive/files/create` before calling `notes/create` only when `post.image` is set (never when `image_gen_enabled` is off, or when the tool declined or failed), and the upload itself fails soft: an upload error just posts the text alone rather than blocking or retrying the note.
 
 ## Available Tools (runtime)
 - `current_datetime_tool` — always available
@@ -239,6 +248,7 @@ When `system_prompt_auto` and `auto_post_interval` are configured, `ChatAgent.ru
 - Long-term memory tools (when `memory_enabled`): `add_memory` (passes text to mem0 `add`, except in private interactions) and `search_memory` (mem0 `search` results, fenced as untrusted data). Public user notes are also ingested automatically when `memory_ingest_notes=true`; private/specified notes are not. Not given to the auto-agent
 - `enable_<gate>` — one per unique `gate` value in `mcp_servers`; model calls it to unlock gated MCP tools
 - MCP tools — from each configured `mcp_servers` entry, name-prefixed per `tool_prefix`
+- `generate_image` — **auto posts only** (when `image_gen_enabled`). The model writes the image prompt and its alt text; one image per post, over-length prompt/alt refused, failure degrades to a text-only post
 
 ## Verification
 

@@ -116,6 +116,23 @@ searxng_password: "yourpassword"
 #       vision: false
 #     - ollama:some-vision-model
 
+# --- Auto-post image generation (optional, off by default) -------------------
+# The autonomous-post agent gets a `generate_image(prompt, alt_text)` tool and decides for
+# itself whether a post is worth illustrating. One image per post. The reply path and the
+# ACP frontend never receive the tool.
+#
+# Talks to an OpenAI-compatible POST <image_gen_base_url>/images/generations endpoint
+# (OpenRouter, OpenAI, or a self-hosted shim). Returned bytes are validated by magic bytes —
+# PNG/JPEG/GIF/WebP only, SVG refused — and capped at image_gen_max_bytes.
+# image_gen_enabled: true
+# image_gen_model: google/gemini-2.5-flash-image
+# image_gen_base_url: https://openrouter.ai/api/v1
+# image_gen_api_key_env: OPENROUTER_API_KEY   # or image_gen_api_key: sk-...
+# image_gen_size: 1024x1024        # sent only when set; omit for the provider default
+# image_gen_timeout_seconds: 120
+# image_gen_max_bytes: 8388608
+# image_gen_mark_sensitive: false   # true uploads with isSensitive so Misskey blurs it
+
 # Optional: ACP frontend (`python -m bot.acp`). Ignored by the Misskey entry point.
 # ACP carries no per-sender identity field, so attribution is parsed out of the
 # harness's message header — only the region before the first "Content:" line is
