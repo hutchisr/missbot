@@ -13,6 +13,8 @@ from typing import Literal, Optional, Union
 
 from pydantic_ai import BinaryContent, ImageUrl
 
+from .imagegen import GeneratedImage
+
 
 @dataclass(frozen=True)
 class TurnAuthor:
@@ -77,3 +79,16 @@ class AgentTurn:
     bot-global memory namespace. The adapter owns that judgement."""
     previous_reply: Optional[str] = None
     """The bot's most recent reply in this conversation, for the repeat guard."""
+
+
+@dataclass(frozen=True)
+class AutoPost:
+    """Result of one autonomous-post run.
+
+    Neutral like the turn types above: an image is bytes plus a media type, nothing
+    platform-specific. The adapter decides how to attach it (Misskey uploads to drive and
+    passes `fileIds`).
+    """
+
+    text: str
+    image: Optional[GeneratedImage] = None

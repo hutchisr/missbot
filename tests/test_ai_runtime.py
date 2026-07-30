@@ -10,8 +10,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from pydantic_ai import ImageUrl
 
-from bot.ai import ChatAgent
+from bot.ai import AutoDeps, ChatAgent, _make_generate_image_tool
 from bot.core import HistoryTurn
+from bot.imagegen import GeneratedImage
 
 
 _IMAGE = ImageUrl(url="https://media.example/1.png")
@@ -443,3 +444,144 @@ async def test_run_ingestion_passes_the_turn_source_label(make_config, make_turn
 
     assert mem.add_note.await_args is not None
     assert mem.add_note.await_args.kwargs["source"] == "acp_prompt"
+
+
+_GENERATED = GeneratedImage(data=b"\x89PNG\r\n\x1a\nbytes", media_type="image/png", prompt="p", alt_text="a")
+
+
+class _StubGenerator:
+    """Stands in for ImageGenerator; records calls and returns a canned result."""
+
+    def __init__(self, image=None):
+        self.image = image
+        self.calls: list[tuple[str, str]] = []
+
+    async def generate(self, prompt: str, alt_text: str):
+        self.calls.append((prompt, alt_text))
+        return self.image
+
+
+def _auto_config(make_config, **overrides):
+    return make_config(
+        system_prompt_auto="Post something.",
+        image_gen_enabled=True,
+        image_gen_model="test/image-model",
+        **overrides,
+    )
+
+
+@pytest.mark.anyio
+async def test_generate_image_tool_stashes_image_on_deps():
+    generator = _StubGenerator(_GENERATED)
+    tool = _make_generate_image_tool(generator)  # type: ignore[arg-type]
+    deps = AutoDeps()
+
+    result = await tool(SimpleNamespace(deps=deps), "a shrimp in a hat", "a shrimp")  # type: ignore[arg-type]
+
+    assert deps.image is _GENERATED
+    assert generator.calls == [("a shrimp in a hat", "a shrimp")]
+    assert "attached" in result.lower()
+
+
+@pytest.mark.anyio
+async def test_generate_image_tool_refuses_second_call():
+    """One image per post: a retry loop must not run up the provider bill."""
+    generator = _StubGenerator(_GENERATED)
+    tool = _make_generate_image_tool(generator)  # type: ignore[arg-type]
+    deps = AutoDeps(image=_GENERATED)
+
+    result = await tool(SimpleNamespace(deps=deps), "another one", "another")  # type: ignore[arg-type]
+
+    assert generator.calls == []
+    assert deps.image is _GENERATED
+    assert "already" in result.lower()
+
+
+@pytest.mark.anyio
+async def test_generate_image_tool_refuses_overlong_prompt():
+    generator = _StubGenerator(_GENERATED)
+    tool = _make_generate_image_tool(generator)  # type: ignore[arg-type]
+    deps = AutoDeps()
+
+    result = await tool(SimpleNamespace(deps=deps), "x" * 1001, "a shrimp")  # type: ignore[arg-type]
+
+    assert generator.calls == []
+    assert deps.image is None
+    assert "refused" in result.lower()
+
+
+@pytest.mark.anyio
+async def test_generate_image_tool_refuses_overlong_alt_text():
+    generator = _StubGenerator(_GENERATED)
+    tool = _make_generate_image_tool(generator)  # type: ignore[arg-type]
+    deps = AutoDeps()
+
+    result = await tool(SimpleNamespace(deps=deps), "a shrimp", "y" * 513)  # type: ignore[arg-type]
+
+    assert generator.calls == []
+    assert deps.image is None
+    assert "refused" in result.lower()
+
+
+@pytest.mark.anyio
+async def test_generate_image_tool_reports_failure():
+    generator = _StubGenerator(None)
+    tool = _make_generate_image_tool(generator)  # type: ignore[arg-type]
+    deps = AutoDeps()
+
+    result = await tool(SimpleNamespace(deps=deps), "a shrimp", "a shrimp")  # type: ignore[arg-type]
+
+    assert deps.image is None
+    assert "without an image" in result.lower()
+
+
+def test_auto_agent_gets_image_tool_when_enabled(make_config):
+    agent = ChatAgent(_auto_config(make_config))
+
+    assert agent._image_generator is not None
+    assert agent._auto_agent is not None
+    assert "generate_image" in agent._auto_agent._function_toolset.tools
+
+
+def test_auto_agent_has_no_image_tool_when_disabled(make_config):
+    agent = ChatAgent(make_config(system_prompt_auto="Post something."))
+
+    assert agent._image_generator is None
+    assert agent._auto_agent is not None
+    assert "generate_image" not in agent._auto_agent._function_toolset.tools
+
+
+def test_reply_agent_never_gets_image_tool(make_config):
+    """Auto-post-only is the point; the reply agent must not see the tool."""
+    agent = ChatAgent(_auto_config(make_config))
+
+    assert "generate_image" not in agent._agent._function_toolset.tools
+
+
+@pytest.mark.anyio
+async def test_run_auto_returns_text_only_when_no_image(make_config):
+    agent = ChatAgent(_auto_config(make_config))
+    assert agent._auto_agent is not None
+
+    with patch.object(agent._auto_agent, "run", AsyncMock(return_value=SimpleNamespace(output="post text"))):
+        post = await agent.run_auto()
+
+    assert post.text == "post text"
+    assert post.image is None
+
+
+@pytest.mark.anyio
+async def test_run_auto_carries_image_generated_during_the_run(make_config):
+    agent = ChatAgent(_auto_config(make_config))
+    assert agent._auto_agent is not None
+
+    async def fake_run(prompt, **kwargs):
+        # What the tool does mid-run: stash the image on the deps object.
+        kwargs["deps"].image = _GENERATED
+        return SimpleNamespace(output="post text")
+
+    with patch.object(agent._auto_agent, "run", AsyncMock(side_effect=fake_run)):
+        post = await agent.run_auto()
+
+    assert post.text == "post text"
+    assert post.image is _GENERATED

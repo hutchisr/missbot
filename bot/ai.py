@@ -29,7 +29,8 @@ from pydantic_ai.settings import ModelSettings
 import logfire
 from redis.asyncio import Redis
 
-from .core import AgentTurn, HistoryTurn, TurnImage
+from .core import AgentTurn, AutoPost, HistoryTurn, TurnImage
+from .imagegen import GeneratedImage, ImageGenerator
 from .mcp import build_mcp_toolsets, gate_names
 from .memory import MemoryStore
 from .models import Config, CustomOpenAIModel
@@ -160,6 +161,20 @@ class AgentDeps:
     surfaces with different limits. Drives both the length instruction and its validator."""
 
 
+@dataclass
+class AutoDeps:
+    """Runtime dependencies for the autonomous-post agent.
+
+    Exists so `generate_image` has somewhere to put its result: a tool returns a *string* to
+    the model, so the bytes have to travel out-of-band. Typing the tool `RunContext[AutoDeps]`
+    is also what confines image generation to auto posts — the reply agent is
+    `Agent[AgentDeps, str]`, so handing it this tool is a type error, not a quiet change.
+    """
+
+    image: Optional[GeneratedImage] = None
+    """Set by `generate_image`; read back by `ChatAgent.run_auto`. One image per run."""
+
+
 def _make_enable_gate_tool(gate: str, servers: list[str]):
     """Build an `enable_<gate>` tool that opens gate for the rest of the run."""
     server_list = ", ".join(servers)
@@ -175,6 +190,53 @@ def _make_enable_gate_tool(gate: str, servers: list[str]):
         "The tools become visible on the next model turn."
     )
     return enable_gate
+
+
+_MAX_IMAGE_PROMPT_CHARS = 1000
+_MAX_IMAGE_ALT_CHARS = 512  # Misskey's drive `comment` limit
+
+
+def _make_generate_image_tool(generator: ImageGenerator):
+    """Build the auto-post-only `generate_image` tool.
+
+    Over-length inputs are refused rather than truncated, so the model gets a chance to
+    comply instead of having its intent quietly rewritten. A second call in one run is
+    refused too: the cap is one image per post, enforced here rather than trusted to the
+    prompt.
+    """
+
+    async def generate_image(ctx: RunContext[AutoDeps], prompt: str, alt_text: str) -> str:
+        """Generate one image to attach to the post you are writing.
+
+        Call this when the post lands better with a picture. Write your post text as usual —
+        the image is attached to that text, never a replacement for it. One image per post.
+
+        Args:
+            prompt: What to draw, as a standalone description. The image model sees only this,
+                so include the subject, style, and any text that should appear in the image.
+            alt_text: Short plain description of the finished picture, for people who cannot
+                see it. Not a copy of the prompt.
+        """
+        if ctx.deps.image is not None:
+            return "An image is already attached to this post. Do not call generate_image again."
+        if len(prompt) > _MAX_IMAGE_PROMPT_CHARS:
+            return (
+                f"Refused: prompt is {len(prompt)} characters, over the {_MAX_IMAGE_PROMPT_CHARS}-character "
+                "limit. Call again with a shorter prompt."
+            )
+        if len(alt_text) > _MAX_IMAGE_ALT_CHARS:
+            return (
+                f"Refused: alt_text is {len(alt_text)} characters, over the {_MAX_IMAGE_ALT_CHARS}-character "
+                "limit. Call again with a shorter description."
+            )
+
+        image = await generator.generate(prompt, alt_text)
+        if image is None:
+            return "Image generation failed. Finish the post without an image."
+        ctx.deps.image = image
+        return "Image generated and it will be attached to this post. Now write the post text."
+
+    return generate_image
 
 
 async def _guarded(coro: Awaitable[object], label: str) -> None:
@@ -331,12 +393,20 @@ class ChatAgent:
         # Reject a reply that just parrots the bot's prior turn in the same thread.
         self._agent.output_validator(self._reject_verbatim_repeat)
 
-        self._auto_agent: Optional[Agent[Any, str]] = None
+        self._image_generator: Optional[ImageGenerator] = None
+        if config.image_gen_enabled:
+            # Auto posts only: the tool is typed RunContext[AutoDeps], so it cannot be added
+            # to the reply agent without a type error.
+            self._image_generator = ImageGenerator(config)
+            auto_tools.append(_make_generate_image_tool(self._image_generator))
+
+        self._auto_agent: Optional[Agent[AutoDeps, str]] = None
         self._auto_history: deque[str] = deque(maxlen=10)
         if config.system_prompt_auto:
             self._auto_agent = Agent(
                 model,
                 output_type=str,
+                deps_type=AutoDeps,
                 instructions=[config.system_prompt_auto, _length_instruction(config.max_note_length)],
                 tools=auto_tools,
                 retries=3,
@@ -580,9 +650,9 @@ class ChatAgent:
         except Exception:
             logfire.exception("Unexpected error applying automatic score (reply unaffected)", username=username)
 
-    @logfire.instrument(extract_args=False, record_return=True)
-    async def run_auto(self) -> str:
-        """Generate an autonomous post with no user input."""
+    @logfire.instrument(extract_args=False)
+    async def run_auto(self) -> AutoPost:
+        """Generate an autonomous post, with an image when the model chose to draw one."""
         if not self._auto_agent:
             raise ValueError("No system_prompt_auto configured")
 
@@ -591,13 +661,18 @@ class ChatAgent:
             message_history.append(ModelRequest(parts=[UserPromptPart(content="Generate a post for the timeline.")]))
             message_history.append(ModelResponse(parts=[TextPart(content=past_post)]))
 
+        deps = AutoDeps()
         result = await self._auto_agent.run(
             "Generate a post for the timeline.",
             message_history=message_history,
             model_settings=self._generation_settings(300.0),
+            deps=deps,
         )
         self._auto_history.append(result.output)
-        return result.output
+        # `record_return` is deliberately off: the return now carries raw image bytes, which
+        # would be base64'd into a span attribute. Log the text and a flag instead.
+        logfire.info("Generated autonomous post", text=result.output, has_image=deps.image is not None)
+        return AutoPost(text=result.output, image=deps.image)
 
     async def _maybe_ingest_note(self, turn: AgentTurn) -> None:
         """Let mem0 learn durable memories from the author's message.
