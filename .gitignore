@@ -25,3 +25,7 @@ test.ipynb
 mise.local.toml
 
 .claude
+
+# Local agent planning artifacts — specs, plans, and SDD run state stay out of the repo
+docs/superpowers/
+.superpowers/
