@@ -970,6 +970,22 @@ async def test_post_autonomous_posts_text_when_upload_returns_no_id(bot):
 
 
 @pytest.mark.anyio
+async def test_post_autonomous_posts_text_when_upload_returns_non_dict(bot):
+    """A 2xx body that's valid JSON but not an object (e.g. a bare list) must not crash the post."""
+    drive = MagicMock()
+    drive.json.return_value = ["unexpected", "shape"]
+    post_mock = _drive_then_note(drive, _note_response())
+
+    with (
+        patch.object(bot._agent, "run_auto", AsyncMock(return_value=AutoPost(text="shrimp", image=_GENERATED_IMAGE))),
+        patch("bot.bot.api_client.post", post_mock),
+    ):
+        await bot.post_autonomous()
+
+    assert post_mock.await_args_list[-1].kwargs["json"] == {"text": "shrimp", "visibility": "public"}
+
+
+@pytest.mark.anyio
 async def test_post_autonomous_skips_upload_when_text_over_cap(bot):
     """The length check comes first, so an unusable post never spends an upload."""
     long_text = "z" * (bot._config.max_note_length + 200)

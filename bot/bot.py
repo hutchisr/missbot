@@ -457,10 +457,13 @@ class Bot:
                 files=files,
             )
             response.raise_for_status()
-            file_id = response.json().get("id")
+            payload = response.json()
         except (httpx.HTTPError, ValueError):
             logfire.exception("Image upload failed; posting without the image")
             return None
+        # A 2xx body can be valid JSON that isn't an object (None, a list, a bare
+        # scalar) — treat any non-dict shape as "no id" rather than let .get() raise.
+        file_id = payload.get("id") if isinstance(payload, dict) else None
         if not file_id:
             logfire.warning("drive/files/create returned no file id; posting without the image")
             return None
