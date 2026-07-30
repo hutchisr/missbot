@@ -9,7 +9,8 @@ from pydantic import ValidationError
 from pydantic_ai import BinaryContent, ImageUrl
 
 from bot.bot import Bot, _image_urls_for, _user_handle
-from bot.core import AgentTurn
+from bot.core import AgentTurn, AutoPost
+from bot.imagegen import GeneratedImage
 from bot.models import MiFile
 
 
@@ -579,7 +580,7 @@ async def test_post_autonomous_raises_on_oversized_output(bot):
     long_output = "z" * (limit + 200)
 
     with (
-        patch.object(bot._agent, "run_auto", AsyncMock(return_value=long_output)),
+        patch.object(bot._agent, "run_auto", AsyncMock(return_value=AutoPost(text=long_output))),
         patch("bot.bot.api_client.post", AsyncMock(return_value=MagicMock())) as post_mock,
     ):
         with pytest.raises(ValueError):
@@ -594,7 +595,7 @@ async def test_post_autonomous_posts_public_note(bot):
     response.json.return_value = {"createdNote": {"id": "auto-1"}}
 
     with (
-        patch.object(bot._agent, "run_auto", AsyncMock(return_value="hello timeline")) as run_auto_mock,
+        patch.object(bot._agent, "run_auto", AsyncMock(return_value=AutoPost(text="hello timeline"))) as run_auto_mock,
         patch("bot.bot.api_client.post", AsyncMock(return_value=response)) as post_mock,
     ):
         await bot.post_autonomous()
@@ -847,3 +848,138 @@ async def test_note_to_turn_uses_fetch_mode_for_current_and_history(make_config,
 
     assert all(isinstance(i, BinaryContent) for i in turn.images)
     assert all(isinstance(i, BinaryContent) for i in turn.history[0].images)
+
+
+_GENERATED_IMAGE = GeneratedImage(
+    data=b"\x89PNG\r\n\x1a\nbytes",
+    media_type="image/png",
+    prompt="a shrimp in a tiny hat",
+    alt_text="a shrimp wearing a hat",
+)
+
+
+def _drive_then_note(drive_response, note_response):
+    """api_client.post side effect routing by URL: drive upload, then note creation."""
+
+    async def post(url, *args, **kwargs):
+        if "drive/files/create" in url:
+            return drive_response
+        return note_response
+
+    return AsyncMock(side_effect=post)
+
+
+def _note_response(note_id: str = "auto-1"):
+    response = MagicMock()
+    response.json.return_value = {"createdNote": {"id": note_id}}
+    return response
+
+
+@pytest.mark.anyio
+async def test_post_autonomous_attaches_generated_image(bot):
+    drive = MagicMock()
+    drive.json.return_value = {"id": "file-1"}
+    post_mock = _drive_then_note(drive, _note_response())
+
+    with (
+        patch.object(bot._agent, "run_auto", AsyncMock(return_value=AutoPost(text="shrimp", image=_GENERATED_IMAGE))),
+        patch("bot.bot.api_client.post", post_mock),
+    ):
+        await bot.post_autonomous()
+
+    assert post_mock.await_count == 2
+    upload_call, note_call = post_mock.await_args_list
+    # Upload must happen before the note that references the file.
+    assert "drive/files/create" in upload_call.args[0]
+    assert note_call.args[0] == "https://example.test/api/notes/create"
+    assert note_call.kwargs["json"] == {
+        "text": "shrimp",
+        "visibility": "public",
+        "fileIds": ["file-1"],
+    }
+
+
+@pytest.mark.anyio
+async def test_post_autonomous_upload_sends_alt_text_and_sensitivity(bot):
+    drive = MagicMock()
+    drive.json.return_value = {"id": "file-1"}
+    post_mock = _drive_then_note(drive, _note_response())
+
+    with (
+        patch.object(bot._agent, "run_auto", AsyncMock(return_value=AutoPost(text="shrimp", image=_GENERATED_IMAGE))),
+        patch("bot.bot.api_client.post", post_mock),
+    ):
+        await bot.post_autonomous()
+
+    upload = post_mock.await_args_list[0]
+    assert upload.kwargs["data"] == {"isSensitive": "false", "comment": "a shrimp wearing a hat"}
+    filename, content, media_type = upload.kwargs["files"]["file"]
+    assert filename.endswith(".png")
+    assert content == _GENERATED_IMAGE.data
+    assert media_type == "image/png"
+
+
+@pytest.mark.anyio
+async def test_post_autonomous_marks_sensitive_when_configured(bot):
+    bot._config.image_gen_mark_sensitive = True
+    drive = MagicMock()
+    drive.json.return_value = {"id": "file-1"}
+    post_mock = _drive_then_note(drive, _note_response())
+
+    with (
+        patch.object(bot._agent, "run_auto", AsyncMock(return_value=AutoPost(text="shrimp", image=_GENERATED_IMAGE))),
+        patch("bot.bot.api_client.post", post_mock),
+    ):
+        await bot.post_autonomous()
+
+    assert post_mock.await_args_list[0].kwargs["data"]["isSensitive"] == "true"
+
+
+@pytest.mark.anyio
+async def test_post_autonomous_posts_text_when_upload_fails(bot):
+    """Losing the image beats losing the post."""
+    drive = MagicMock()
+    drive.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "boom", request=MagicMock(), response=MagicMock(status_code=500)
+    )
+    post_mock = _drive_then_note(drive, _note_response())
+
+    with (
+        patch.object(bot._agent, "run_auto", AsyncMock(return_value=AutoPost(text="shrimp", image=_GENERATED_IMAGE))),
+        patch("bot.bot.api_client.post", post_mock),
+    ):
+        await bot.post_autonomous()
+
+    note_call = post_mock.await_args_list[-1]
+    assert note_call.kwargs["json"] == {"text": "shrimp", "visibility": "public"}
+
+
+@pytest.mark.anyio
+async def test_post_autonomous_posts_text_when_upload_returns_no_id(bot):
+    drive = MagicMock()
+    drive.json.return_value = {}
+    post_mock = _drive_then_note(drive, _note_response())
+
+    with (
+        patch.object(bot._agent, "run_auto", AsyncMock(return_value=AutoPost(text="shrimp", image=_GENERATED_IMAGE))),
+        patch("bot.bot.api_client.post", post_mock),
+    ):
+        await bot.post_autonomous()
+
+    assert post_mock.await_args_list[-1].kwargs["json"] == {"text": "shrimp", "visibility": "public"}
+
+
+@pytest.mark.anyio
+async def test_post_autonomous_skips_upload_when_text_over_cap(bot):
+    """The length check comes first, so an unusable post never spends an upload."""
+    long_text = "z" * (bot._config.max_note_length + 200)
+    post_mock = AsyncMock()
+
+    with (
+        patch.object(bot._agent, "run_auto", AsyncMock(return_value=AutoPost(text=long_text, image=_GENERATED_IMAGE))),
+        patch("bot.bot.api_client.post", post_mock),
+    ):
+        with pytest.raises(ValueError):
+            await bot.post_autonomous()
+
+    post_mock.assert_not_awaited()

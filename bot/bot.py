@@ -17,6 +17,7 @@ import logfire
 
 from .ai import ChatAgent
 from .core import AgentTurn, HistoryTurn, TurnAuthor, TurnImage
+from .imagegen import GeneratedImage
 from .memory import MemoryStore
 from .models import (
     Config,
@@ -438,18 +439,54 @@ class Bot:
         return True
 
     @logfire.instrument(extract_args=False)
+    async def _upload_image(self, image: GeneratedImage) -> Optional[str]:
+        """Upload a generated image to the bot's drive; return its file id, or None.
+
+        Fail-soft on purpose: an upload failure costs the image, not the post. Note that
+        `RetryTransport` only replays GET/HEAD/OPTIONS, so an ambiguous upload POST is never
+        retried into a duplicate drive file.
+        """
+        data = {"isSensitive": "true" if self._config.image_gen_mark_sensitive else "false"}
+        if image.alt_text:
+            data["comment"] = image.alt_text
+        files = {"file": (f"generated.{image.extension}", image.data, image.media_type)}
+        try:
+            response = await api_client.post(
+                f"{self.url}api/drive/files/create",
+                data=data,
+                files=files,
+            )
+            response.raise_for_status()
+            file_id = response.json().get("id")
+        except (httpx.HTTPError, ValueError):
+            logfire.exception("Image upload failed; posting without the image")
+            return None
+        if not file_id:
+            logfire.warning("drive/files/create returned no file id; posting without the image")
+            return None
+        logfire.info("Uploaded generated image", file_id=file_id, media_type=image.media_type)
+        return file_id
+
+    @logfire.instrument(extract_args=False)
     async def post_autonomous(self):
         """Generate and post an autonomous note to the timeline."""
-        result = await self._agent.run_auto()
+        post = await self._agent.run_auto()
         limit = self._config.max_note_length
-        if len(result) > limit:
+        if len(post.text) > limit:
             raise ValueError(
-                f"Autonomous post is {len(result)} chars, over the {limit}-char note cap "
+                f"Autonomous post is {len(post.text)} chars, over the {limit}-char note cap "
                 "(model ignored its length budget); refusing to send."
             )
+
+        payload: dict[str, object] = {"text": post.text, "visibility": "public"}
+        if post.image is not None:
+            file_id = await self._upload_image(post.image)
+            if file_id:
+                payload["fileIds"] = [file_id]
+
         response = await api_client.post(
             f"{self.url}api/notes/create",
-            json={"text": result, "visibility": "public"},
+            json=payload,
         )
         response.raise_for_status()
         note_id = response.json().get("createdNote", {}).get("id")
