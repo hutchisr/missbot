@@ -167,8 +167,13 @@ class AutoDeps:
 
     Exists so `generate_image` has somewhere to put its result: a tool returns a *string* to
     the model, so the bytes have to travel out-of-band. Typing the tool `RunContext[AutoDeps]`
-    is also what confines image generation to auto posts — the reply agent is
-    `Agent[AgentDeps, str]`, so handing it this tool is a type error, not a quiet change.
+    does NOT by itself confine it to auto posts — pyright accepts handing it to the reply agent
+    too, since `build_tools()` returns `list[Callable[..., object]]` (erasing the deps type at
+    the append site) and pydantic-ai's `tools=` parameter is a ParamSpec-gradual signature that
+    never compares `RunContext[AutoDeps]` against `RunContext[AgentDeps]`. What actually confines
+    it: `generate_image` is appended only to `auto_tools`, a list built and passed only to
+    `self._auto_agent` in `ChatAgent.__init__`; the reply agent is built from a separate `tools`
+    list that never receives it. `test_reply_agent_never_gets_image_tool` pins the separation.
     """
 
     image: Optional[GeneratedImage] = None
@@ -229,6 +234,11 @@ def _make_generate_image_tool(generator: ImageGenerator):
             alt_text: Short plain description of the finished picture, for people who cannot
                 see it. Not a copy of the prompt.
         """
+        # Fail fast, not billed: pyright does not stop this tool from being handed to the
+        # wrong agent (see the AutoDeps docstring), so if it ever is, this turns the misuse
+        # into a free precondition failure instead of an AttributeError after paying a
+        # provider for a generation nobody can use.
+        assert isinstance(ctx.deps, AutoDeps)
         async with ctx.deps.lock:
             if ctx.deps.image is not None:
                 return "An image is already attached to this post. Do not call generate_image again."
@@ -408,8 +418,11 @@ class ChatAgent:
 
         self._image_generator: Optional[ImageGenerator] = None
         if config.image_gen_enabled:
-            # Auto posts only: the tool is typed RunContext[AutoDeps], so it cannot be added
-            # to the reply agent without a type error.
+            # Auto posts only: appended to auto_tools, never to the reply agent's `tools`
+            # list above. The RunContext[AutoDeps] typing does not enforce this by itself —
+            # pyright accepts the tool on either agent (see the AutoDeps docstring) — so the
+            # separation is structural (which list it's appended to), pinned by
+            # test_reply_agent_never_gets_image_tool.
             self._image_generator = ImageGenerator(config)
             auto_tools.append(_make_generate_image_tool(self._image_generator))
 

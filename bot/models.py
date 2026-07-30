@@ -566,4 +566,8 @@ class Config(BaseModel):
     def check_image_gen_config(self) -> "Config":
         if self.image_gen_enabled and not self.image_gen_model:
             raise ValueError("image_gen_model is required when image_gen_enabled is true")
+        if self.image_gen_enabled and not self.system_prompt_auto:
+            raise ValueError(
+                "system_prompt_auto is required when image_gen_enabled is true (the tool is auto-post-only)"
+            )
         return self

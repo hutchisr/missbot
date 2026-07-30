@@ -14,6 +14,7 @@ from bot.imagegen import GeneratedImage, ImageGenerator
 _PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 64
 _JPEG = b"\xff\xd8\xff" + b"y" * 64
 _GIF = b"GIF89a" + b"z" * 64
+_GIF87 = b"GIF87a" + b"z" * 64
 _WEBP = b"RIFF" + b"\x00\x00\x00\x00" + b"WEBP" + b"w" * 64
 _SVG = b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'
 
@@ -21,6 +22,7 @@ _SVG = b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>
 @pytest.fixture
 def image_config(make_config):
     return make_config(
+        system_prompt_auto="Post something.",
         image_gen_enabled=True,
         image_gen_model="test/image-model",
         image_gen_api_key="image-key",
@@ -52,6 +54,7 @@ def _generator(image_config, transport) -> ImageGenerator:
         (_PNG, "image/png", "png"),
         (_JPEG, "image/jpeg", "jpg"),
         (_GIF, "image/gif", "gif"),
+        (_GIF87, "image/gif", "gif"),
         (_WEBP, "image/webp", "webp"),
     ],
 )
@@ -92,6 +95,7 @@ async def test_generate_sends_model_prompt_and_key(image_config):
 async def test_generate_sends_size_only_when_configured(make_config):
     captured: list[httpx.Request] = []
     cfg = make_config(
+        system_prompt_auto="Post something.",
         image_gen_enabled=True,
         image_gen_model="test/image-model",
         image_gen_api_key="image-key",
@@ -109,6 +113,7 @@ async def test_generate_reads_key_from_env(make_config, monkeypatch):
     monkeypatch.setenv("IMAGE_KEY_FROM_ENV", "env-key")
     captured: list[httpx.Request] = []
     cfg = make_config(
+        system_prompt_auto="Post something.",
         image_gen_enabled=True,
         image_gen_model="test/image-model",
         image_gen_api_key_env="IMAGE_KEY_FROM_ENV",
@@ -125,6 +130,7 @@ async def test_generate_omits_auth_header_when_no_key_resolves(make_config, monk
     monkeypatch.delenv("MISSING_IMAGE_KEY", raising=False)
     captured: list[httpx.Request] = []
     cfg = make_config(
+        system_prompt_auto="Post something.",
         image_gen_enabled=True,
         image_gen_model="test/image-model",
         image_gen_api_key_env="MISSING_IMAGE_KEY",
@@ -154,6 +160,7 @@ async def test_generate_refuses_unrecognized_format(image_config):
 @pytest.mark.anyio
 async def test_generate_drops_oversized_image(make_config):
     cfg = make_config(
+        system_prompt_auto="Post something.",
         image_gen_enabled=True,
         image_gen_model="test/image-model",
         image_gen_api_key="image-key",
@@ -165,9 +172,31 @@ async def test_generate_drops_oversized_image(make_config):
 
 
 @pytest.mark.anyio
+async def test_generate_drops_image_over_post_decode_size_cap(make_config):
+    """Distinct from test_generate_drops_oversized_image: that test trips the pre-decode
+    base64-length check. This payload is short enough to pass the pre-decode check (136
+    base64 chars <= the (max_bytes*4)//3+4 = 137 allowance) but decodes to 102 bytes, over
+    the 100-byte cap — so only the post-decode check catches it."""
+    cfg = make_config(
+        system_prompt_auto="Post something.",
+        image_gen_enabled=True,
+        image_gen_model="test/image-model",
+        image_gen_api_key="image-key",
+        image_gen_max_bytes=100,
+    )
+    payload = b"x" * 102
+    encoded = base64.b64encode(payload).decode()
+    assert len(encoded) == 136
+    gen = ImageGenerator(cfg, transport=_responder({"data": [{"b64_json": encoded}]}))
+
+    assert await gen.generate("draw a shrimp", "a shrimp") is None
+
+
+@pytest.mark.anyio
 async def test_generate_drops_oversized_response_body(make_config):
     """A broken or hostile endpoint must not balloon the pod's memory with one JSON body."""
     cfg = make_config(
+        system_prompt_auto="Post something.",
         image_gen_enabled=True,
         image_gen_model="test/image-model",
         image_gen_api_key="image-key",
@@ -188,6 +217,7 @@ async def test_generate_drops_oversized_response_body(make_config):
         {"data": [{}]},
         {"data": [{"b64_json": ""}]},
         {"data": "not-a-list"},
+        {"data": ["not-an-object"]},
         {"data": [{"b64_json": "!!!not-base64!!!"}]},
     ],
 )
@@ -200,6 +230,16 @@ async def test_generate_returns_none_on_unusable_payload(image_config, body):
 @pytest.mark.anyio
 async def test_generate_returns_none_on_invalid_json(image_config):
     gen = _generator(image_config, _responder(b"<html>gateway error</html>"))
+
+    assert await gen.generate("draw a shrimp", "a shrimp") is None
+
+
+@pytest.mark.anyio
+async def test_generate_returns_none_on_non_object_json_body(image_config):
+    """A 2xx body can be valid JSON that isn't an object (e.g. a bare list or scalar) — the
+    top-level `not isinstance(parsed, dict)` guard in `_post`, distinct from the `data`-field
+    guards in `_extract_b64` covered above."""
+    gen = _generator(image_config, _responder([1, 2, 3]))
 
     assert await gen.generate("draw a shrimp", "a shrimp") is None
 

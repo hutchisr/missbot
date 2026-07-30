@@ -446,11 +446,16 @@ class Bot:
         `RetryTransport` only replays GET/HEAD/OPTIONS, so an ambiguous upload POST is never
         retried into a duplicate drive file.
         """
-        data = {"isSensitive": "true" if self._config.image_gen_mark_sensitive else "false"}
-        if image.alt_text:
-            data["comment"] = image.alt_text
-        files = {"file": (f"generated.{image.extension}", image.data, image.media_type)}
         try:
+            # Built inside the try: `.extension` looks up `media_type` in a fixed map and
+            # raises KeyError for anything not in it. Unreachable today (media_type is always
+            # sniffed by ImageGenerator), but GeneratedImage is a public frozen dataclass
+            # anyone can construct, and this is the one spot a non-HTTP error could still
+            # escape and cost the whole post rather than just the image.
+            data = {"isSensitive": "true" if self._config.image_gen_mark_sensitive else "false"}
+            if image.alt_text:
+                data["comment"] = image.alt_text
+            files = {"file": (f"generated.{image.extension}", image.data, image.media_type)}
             response = await api_client.post(
                 f"{self.url}api/drive/files/create",
                 data=data,
@@ -458,7 +463,7 @@ class Bot:
             )
             response.raise_for_status()
             payload = response.json()
-        except (httpx.HTTPError, ValueError):
+        except (httpx.HTTPError, ValueError, KeyError):
             logfire.exception("Image upload failed; posting without the image")
             return None
         # A 2xx body can be valid JSON that isn't an object (None, a list, a bare

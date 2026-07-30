@@ -216,8 +216,20 @@ def test_image_gen_enabled_requires_model(make_config):
         make_config(image_gen_enabled=True)
 
 
+def test_image_gen_enabled_requires_auto_prompt(make_config):
+    """Without system_prompt_auto there is no auto agent, so the tool would build an
+    ImageGenerator (and warn about a missing key) for nothing — no agent ever gets it."""
+    with pytest.raises(ValidationError) as exc:
+        make_config(image_gen_enabled=True, image_gen_model="google/gemini-2.5-flash-image")
+    assert "system_prompt_auto" in str(exc.value)
+
+
 def test_image_gen_defaults(make_config):
-    cfg = make_config(image_gen_enabled=True, image_gen_model="google/gemini-2.5-flash-image")
+    cfg = make_config(
+        system_prompt_auto="Post something.",
+        image_gen_enabled=True,
+        image_gen_model="google/gemini-2.5-flash-image",
+    )
 
     assert str(cfg.image_gen_base_url).rstrip("/") == "https://openrouter.ai/api/v1"
     assert cfg.image_gen_api_key_env == "OPENROUTER_API_KEY"

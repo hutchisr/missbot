@@ -44,7 +44,7 @@ _MAGIC_MEDIA_TYPES: tuple[tuple[bytes, str], ...] = (
 
 _EXTENSIONS = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp"}
 
-# Slack for the JSON envelope around the base64 payload when capping the response body.
+# slack for the JSON envelope around the base64 payload when capping the response body.
 _ENVELOPE_ALLOWANCE = 64 * 1024
 
 
@@ -150,7 +150,11 @@ class ImageGenerator:
                             return None
                         chunks.append(chunk)
         except httpx.HTTPError:
-            logfire.warning("Image generation request failed", model=self._model)
+            # This is the only operator signal for the entire provider leg — every downstream
+            # failure is silent by design (fail-soft: the tool reports failure, the post goes
+            # out as text). logfire.exception (not .warning) attaches the exception, so a 401
+            # bad key, a 404 wrong path, a read timeout, and a DNS failure remain distinguishable.
+            logfire.exception("Image generation request failed", model=self._model)
             return None
 
         try:
@@ -167,7 +171,10 @@ class ImageGenerator:
 def _extract_b64(body: dict[str, object]) -> Optional[str]:
     """Pull ``data[0].b64_json`` out of the response, or None if it isn't there."""
     data = body.get("data")
-    if not isinstance(data, list) or not data:
+    if not isinstance(data, list):
+        logfire.warning("Image generation response 'data' field was not a list")
+        return None
+    if not data:
         logfire.warning("Image generation response contained no data entries")
         return None
     first = data[0]

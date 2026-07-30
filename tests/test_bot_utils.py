@@ -986,6 +986,27 @@ async def test_post_autonomous_posts_text_when_upload_returns_non_dict(bot):
 
 
 @pytest.mark.anyio
+async def test_post_autonomous_posts_text_when_image_extension_unknown(bot):
+    """GeneratedImage is a public frozen dataclass anyone can construct; a media_type outside
+    the extension map must not escape _upload_image as a bare KeyError and cost the whole
+    post. The files/data dict (including the `.extension` lookup) is built inside the try,
+    and the except tuple now covers KeyError alongside httpx.HTTPError/ValueError."""
+    unmapped_image = GeneratedImage(data=b"bytes", media_type="image/heic", prompt="p", alt_text="a")
+    post_mock = AsyncMock(return_value=_note_response())
+
+    with (
+        patch.object(bot._agent, "run_auto", AsyncMock(return_value=AutoPost(text="shrimp", image=unmapped_image))),
+        patch("bot.bot.api_client.post", post_mock),
+    ):
+        await bot.post_autonomous()
+
+    # The KeyError fires while building the upload request, before any drive POST is made,
+    # so the only api_client.post call is the note creation itself.
+    assert post_mock.await_count == 1
+    assert post_mock.await_args_list[-1].kwargs["json"] == {"text": "shrimp", "visibility": "public"}
+
+
+@pytest.mark.anyio
 async def test_post_autonomous_skips_upload_when_text_over_cap(bot):
     """The length check comes first, so an unusable post never spends an upload."""
     long_text = "z" * (bot._config.max_note_length + 200)
