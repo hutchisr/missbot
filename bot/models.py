@@ -355,8 +355,9 @@ class Config(BaseModel):
     )
     image_gen_enabled: bool = Field(
         default=False,
-        description="Let the autonomous-post agent generate an image for its note via the generate_image "
-        "tool. Requires image_gen_model. Auto posts only — the reply path and ACP never receive the tool.",
+        description="Let the autonomous-post agent generate an image before choosing an optional caption via "
+        "the generate_image tool. Requires image_gen_model. Auto posts only — the reply path and ACP never "
+        "receive the tool.",
     )
     image_gen_model: Optional[str] = Field(
         default=None,

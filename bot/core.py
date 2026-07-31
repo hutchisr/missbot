@@ -83,7 +83,7 @@ class AgentTurn:
 
 @dataclass(frozen=True)
 class AutoPost:
-    """Result of one autonomous-post run.
+    """Result of one autonomous-post run; ``text`` may be empty when ``image`` is set.
 
     Neutral like the turn types above: an image is bytes plus a media type, nothing
     platform-specific. The adapter decides how to attach it (Misskey uploads to drive and

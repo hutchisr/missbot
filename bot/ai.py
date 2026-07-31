@@ -208,6 +208,18 @@ def _make_enable_gate_tool(gate: str, servers: list[str]):
 
 _MAX_IMAGE_PROMPT_CHARS = 1000
 _MAX_IMAGE_ALT_CHARS = 512  # Misskey's drive `comment` limit
+_IMAGE_ONLY_OUTPUT = "[[IMAGE_ONLY]]"
+_AUTO_IMAGE_INSTRUCTION = f"""Image-post workflow:
+- Decide whether the post needs an image before composing any final post text.
+- If it does, your first response must be only a generate_image tool call. Do not emit a
+  draft caption alongside or before that call; text from a tool-calling turn is intermediate
+  and will not be published.
+- After the image succeeds, either output the final caption or output exactly
+  {_IMAGE_ONLY_OUTPUT} to publish the image by itself. The marker is internal and is never
+  posted as text.
+- If you do not generate an image, output a normal text post. Never use the image-only marker
+  unless generate_image succeeded.
+"""
 
 
 def _make_generate_image_tool(generator: ImageGenerator):
@@ -223,10 +235,11 @@ def _make_generate_image_tool(generator: ImageGenerator):
     """
 
     async def generate_image(ctx: RunContext[AutoDeps], prompt: str, alt_text: str) -> str:
-        """Generate one image to attach to the post you are writing.
+        """Generate one image for an autonomous post, before writing its optional caption.
 
-        Call this when the post lands better with a picture. Write your post text as usual —
-        the image is attached to that text, never a replacement for it. One image per post.
+        Call this as the first action when the post lands better with a picture; do not write
+        draft post text before or alongside the tool call. Afterward, the image may be posted
+        with a caption or by itself. One image per post.
 
         Args:
             prompt: What to draw, as a standalone description. The image model sees only this,
@@ -257,7 +270,10 @@ def _make_generate_image_tool(generator: ImageGenerator):
             if image is None:
                 return "Image generation failed. Finish the post without an image."
             ctx.deps.image = image
-            return "Image generated and it will be attached to this post. Now write the post text."
+            return (
+                "Image generated and it will be attached. Now either write the final caption or "
+                f"respond with exactly {_IMAGE_ONLY_OUTPUT} to post the image without text."
+            )
 
     return generate_image
 
@@ -429,16 +445,20 @@ class ChatAgent:
         self._auto_agent: Optional[Agent[AutoDeps, str]] = None
         self._auto_history: deque[str] = deque(maxlen=10)
         if config.system_prompt_auto:
+            auto_instructions = [config.system_prompt_auto, _length_instruction(config.max_note_length)]
+            if config.image_gen_enabled:
+                auto_instructions.append(_AUTO_IMAGE_INSTRUCTION)
             self._auto_agent = Agent(
                 model,
                 output_type=str,
                 deps_type=AutoDeps,
-                instructions=[config.system_prompt_auto, _length_instruction(config.max_note_length)],
+                instructions=auto_instructions,
                 tools=auto_tools,
                 retries=3,
             )
             # No mention prefix on auto posts, so the budget is the full note cap.
             self._auto_agent.output_validator(_enforce_length(config.max_note_length))
+            self._auto_agent.output_validator(self._validate_auto_output)
 
         # Isolated, tool-less classifier for auto-scoring: treats the message as untrusted
         # data and emits only a fixed category, mapped to a bounded delta in code (bot/scoring.py).
@@ -678,7 +698,7 @@ class ChatAgent:
 
     @logfire.instrument(extract_args=False)
     async def run_auto(self) -> AutoPost:
-        """Generate an autonomous post, with an image when the model chose to draw one."""
+        """Generate an autonomous text, image, or combined post."""
         if not self._auto_agent:
             raise ValueError("No system_prompt_auto configured")
 
@@ -694,11 +714,38 @@ class ChatAgent:
             model_settings=self._generation_settings(300.0),
             deps=deps,
         )
-        self._auto_history.append(result.output)
+        text = result.output
+        # A mocked/custom Agent can bypass registered validators, so keep the publication
+        # boundary defensive as well. Real runs have already normalized this marker in
+        # `_validate_auto_output`, where an invalid marker gets a model retry.
+        if text.strip() == _IMAGE_ONLY_OUTPUT:
+            if deps.image is None:
+                raise ValueError("Autonomous post requested image-only output without generating an image")
+            text = ""
+        if not text.strip() and deps.image is None:
+            raise ValueError("Autonomous post has neither text nor an image")
+
+        history_text = text
+        if not history_text.strip() and deps.image is not None:
+            history_text = f"[image-only post: {deps.image.alt_text}]"
+        self._auto_history.append(history_text)
         # `record_return` is deliberately off: the return now carries raw image bytes, which
         # would be base64'd into a span attribute. Log the text and a flag instead.
-        logfire.info("Generated autonomous post", text=result.output, has_image=deps.image is not None)
-        return AutoPost(text=result.output, image=deps.image)
+        logfire.info("Generated autonomous post", text=text, has_image=deps.image is not None)
+        return AutoPost(text=text, image=deps.image)
+
+    @staticmethod
+    def _validate_auto_output(ctx: RunContext[AutoDeps], output: str) -> str:
+        """Normalize the internal image-only marker and reject contentless posts."""
+        if output.strip() == _IMAGE_ONLY_OUTPUT:
+            if ctx.deps.image is None:
+                raise ModelRetry(
+                    f"{_IMAGE_ONLY_OUTPUT} is valid only after generate_image succeeds. Write a text post instead."
+                )
+            return ""
+        if not output.strip() and ctx.deps.image is None:
+            raise ModelRetry("The post has neither text nor an image. Write a text post or generate an image.")
+        return output
 
     async def _maybe_ingest_note(self, turn: AgentTurn) -> None:
         """Let mem0 learn durable memories from the author's message.

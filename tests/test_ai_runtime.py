@@ -9,9 +9,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from pydantic_ai import ImageUrl
+from pydantic_ai import ImageUrl, ModelRetry
 
-from bot.ai import AutoDeps, ChatAgent, _make_generate_image_tool
+from bot.ai import AutoDeps, ChatAgent, _IMAGE_ONLY_OUTPUT, _make_generate_image_tool
 from bot.core import HistoryTurn
 from bot.imagegen import GeneratedImage
 
@@ -482,6 +482,7 @@ async def test_generate_image_tool_stashes_image_on_deps():
     assert deps.image is _GENERATED
     assert generator.calls == [("a shrimp in a hat", "a shrimp")]
     assert "attached" in result.lower()
+    assert "without text" in result.lower()
 
 
 @pytest.mark.anyio
@@ -634,3 +635,48 @@ async def test_run_auto_carries_image_generated_during_the_run(make_config):
 
     assert post.text == "post text"
     assert post.image is _GENERATED
+
+
+@pytest.mark.anyio
+async def test_run_auto_normalizes_image_only_output_and_records_image_history(make_config):
+    agent = ChatAgent(_auto_config(make_config))
+    assert agent._auto_agent is not None
+
+    async def fake_run(prompt, **kwargs):
+        kwargs["deps"].image = _GENERATED
+        return SimpleNamespace(output=_IMAGE_ONLY_OUTPUT)
+
+    with patch.object(agent._auto_agent, "run", AsyncMock(side_effect=fake_run)):
+        post = await agent.run_auto()
+
+    assert post.text == ""
+    assert post.image is _GENERATED
+    assert list(agent._auto_history) == ["[image-only post: a]"]
+
+
+def test_auto_output_validator_allows_image_without_caption():
+    ctx = SimpleNamespace(deps=AutoDeps(image=_GENERATED))
+
+    assert ChatAgent._validate_auto_output(ctx, _IMAGE_ONLY_OUTPUT) == ""  # type: ignore[arg-type]
+
+
+def test_auto_output_validator_retries_image_only_marker_without_image():
+    ctx = SimpleNamespace(deps=AutoDeps())
+
+    with pytest.raises(ModelRetry, match="valid only after generate_image succeeds"):
+        ChatAgent._validate_auto_output(ctx, _IMAGE_ONLY_OUTPUT)  # type: ignore[arg-type]
+
+
+@pytest.mark.anyio
+async def test_run_auto_rejects_image_only_marker_without_image(make_config):
+    """Keep the publication boundary safe even when a mocked/custom Agent skips validators."""
+    agent = ChatAgent(_auto_config(make_config))
+    assert agent._auto_agent is not None
+
+    with patch.object(
+        agent._auto_agent,
+        "run",
+        AsyncMock(return_value=SimpleNamespace(output=_IMAGE_ONLY_OUTPUT)),
+    ):
+        with pytest.raises(ValueError, match="without generating an image"):
+            await agent.run_auto()

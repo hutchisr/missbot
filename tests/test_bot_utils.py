@@ -607,6 +607,18 @@ async def test_post_autonomous_posts_public_note(bot):
     )
 
 
+@pytest.mark.anyio
+async def test_post_autonomous_rejects_contentless_note(bot):
+    with (
+        patch.object(bot._agent, "run_auto", AsyncMock(return_value=AutoPost(text=""))),
+        patch("bot.bot.api_client.post", AsyncMock()) as post_mock,
+    ):
+        with pytest.raises(ValueError, match="neither text nor an image"):
+            await bot.post_autonomous()
+
+    post_mock.assert_not_awaited()
+
+
 def test_task_done_callback_logs_failures(bot):
     task = MagicMock()
     task.cancelled.return_value = False
@@ -900,6 +912,26 @@ async def test_post_autonomous_attaches_generated_image(bot):
 
 
 @pytest.mark.anyio
+async def test_post_autonomous_publishes_generated_image_without_text(bot):
+    drive = MagicMock()
+    drive.json.return_value = {"id": "file-1"}
+    post_mock = _drive_then_note(drive, _note_response())
+
+    with (
+        patch.object(bot._agent, "run_auto", AsyncMock(return_value=AutoPost(text="", image=_GENERATED_IMAGE))),
+        patch("bot.bot.api_client.post", post_mock),
+    ):
+        await bot.post_autonomous()
+
+    assert post_mock.await_count == 2
+    note_call = post_mock.await_args_list[1]
+    assert note_call.kwargs["json"] == {
+        "visibility": "public",
+        "fileIds": ["file-1"],
+    }
+
+
+@pytest.mark.anyio
 async def test_post_autonomous_upload_sends_alt_text_and_sensitivity(bot):
     drive = MagicMock()
     drive.json.return_value = {"id": "file-1"}
@@ -952,6 +984,24 @@ async def test_post_autonomous_posts_text_when_upload_fails(bot):
 
     note_call = post_mock.await_args_list[-1]
     assert note_call.kwargs["json"] == {"text": "shrimp", "visibility": "public"}
+
+
+@pytest.mark.anyio
+async def test_post_autonomous_skips_image_only_note_when_upload_fails(bot):
+    drive = MagicMock()
+    drive.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "boom", request=MagicMock(), response=MagicMock(status_code=500)
+    )
+    post_mock = _drive_then_note(drive, _note_response())
+
+    with (
+        patch.object(bot._agent, "run_auto", AsyncMock(return_value=AutoPost(text="", image=_GENERATED_IMAGE))),
+        patch("bot.bot.api_client.post", post_mock),
+    ):
+        await bot.post_autonomous()
+
+    assert post_mock.await_count == 1
+    assert "drive/files/create" in post_mock.await_args_list[0].args[0]
 
 
 @pytest.mark.anyio

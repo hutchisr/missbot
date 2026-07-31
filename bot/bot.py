@@ -477,7 +477,7 @@ class Bot:
 
     @logfire.instrument(extract_args=False)
     async def post_autonomous(self):
-        """Generate and post an autonomous note to the timeline."""
+        """Generate and post an autonomous text, image, or combined note."""
         post = await self._agent.run_auto()
         limit = self._config.max_note_length
         if len(post.text) > limit:
@@ -485,12 +485,22 @@ class Bot:
                 f"Autonomous post is {len(post.text)} chars, over the {limit}-char note cap "
                 "(model ignored its length budget); refusing to send."
             )
+        has_text = bool(post.text.strip())
+        if not has_text and post.image is None:
+            raise ValueError("Autonomous post has neither text nor an image; refusing to send")
 
-        payload: dict[str, object] = {"text": post.text, "visibility": "public"}
+        payload: dict[str, object] = {"visibility": "public"}
+        if has_text:
+            payload["text"] = post.text
         if post.image is not None:
             file_id = await self._upload_image(post.image)
             if file_id:
                 payload["fileIds"] = [file_id]
+            elif not has_text:
+                # Misskey requires some note content. An image-only composition cannot fall
+                # back to text if its upload fails, so do not issue a doomed notes/create.
+                logfire.warning("Image-only autonomous post skipped because its image upload failed")
+                return
 
         response = await api_client.post(
             f"{self.url}api/notes/create",
