@@ -29,6 +29,11 @@ uv run python -m bot.acp serve -c config.local.yaml --host 0.0.0.0 --port 8080 -
 # mem0 maintenance (the k8s CronJob runs the destructive form daily)
 uv run python -m bot.maintenance cleanup --dry-run -c config.local.yaml
 uv run python -m bot.maintenance cleanup -c config.local.yaml
+# Embedding-model migration (stop every memory reader/writer before the live form).
+# The live form takes full timestamped backups and atomically replaces only the
+# vector columns in both the memory and entity tables.
+uv run python -m bot.maintenance reembed --dry-run -c config.local.yaml
+uv run python -m bot.maintenance reembed -c config.local.yaml
 
 # Test
 # OPENROUTER_API_KEY must be set or test collection errors out: importing the agents
@@ -169,7 +174,7 @@ Config fields:
 **stdout is the protocol channel.** `bot/acp/__main__.py` points logfire's console exporter and `logging` at stderr. Anything printed to stdout corrupts the JSON-RPC stream and breaks the connection.
 
 ### Long-term memory
-Memory is delegated to mem0 OSS through `bot/memory.py:MemoryStore`, backed by Postgres/pgvector. The bot does not maintain its own entity graph, claim schema, agreement counts, consolidation job, or re-embedding CLI anymore. Off unless `memory_enabled: true`. Config fields:
+Memory is delegated to mem0 OSS through `bot/memory.py:MemoryStore`, backed by Postgres/pgvector. The bot does not maintain its own entity graph, claim schema, agreement counts, or consolidation job. `bot.maintenance reembed` performs controlled embedding-model migrations in place: it validates the new endpoint/dimension, precomputes every memory and entity vector, creates full timestamped backup tables, then replaces both vector columns atomically. Stop all memory readers/writers before running its live form. Off unless `memory_enabled: true`. Config fields:
 - `postgres_url` (required when enabled): Postgres DSN for mem0's pgvector backend; the server must have the `vector` extension available
 - `memory_collection_name` (default `missbot_memories`): Postgres table/collection mem0 uses for memories
 - `memory_history_db_path` (default unset): optional SQLite path for mem0's local message/history database; leave unset for mem0's default

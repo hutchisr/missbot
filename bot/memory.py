@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterator, Optional, Union
+from typing import Any, Iterator, Literal, Optional, Union, cast
 
 import logfire
 
@@ -279,6 +280,16 @@ class MemoryStore:
             show_expired=True,
         )
         return [StoredMemory.from_mem0(item) for item in result.get("results", []) if item.get("id")]
+
+    async def embed_batch(
+        self,
+        texts: list[str],
+        *,
+        action: Literal["add", "search", "update"] = "update",
+    ) -> list[list[float]]:
+        """Embed exact texts with the configured mem0 embedder for maintenance."""
+        result = await asyncio.to_thread(self._client.embedding_model.embed_batch, texts, action)
+        return cast(list[list[float]], result)
 
     async def delete(self, memory_id: str) -> None:
         """Delete one memory through mem0, including its entity-store links."""

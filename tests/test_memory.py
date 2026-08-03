@@ -225,6 +225,18 @@ async def test_add_saves_bot_authored_memory(make_config):
 
 
 @pytest.mark.anyio
+async def test_embed_batch_uses_configured_mem0_embedder(make_config):
+    client = MagicMock()
+    client.embedding_model.embed_batch.return_value = [[0.1, 0.2], [0.3, 0.4]]
+    store = MemoryStore(client, _memory_cfg(make_config))
+
+    result = await store.embed_batch(["one", "two"], action="update")
+
+    assert result == [[0.1, 0.2], [0.3, 0.4]]
+    client.embedding_model.embed_batch.assert_called_once_with(["one", "two"], "update")
+
+
+@pytest.mark.anyio
 async def test_search_maps_mem0_results(make_config):
     client = AsyncMock()
     client.search.return_value = {

@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from click.testing import CliRunner
 
-from bot.maintenance import cleanup, cli, plan_cleanup
+from bot.maintenance import VectorRecord, cleanup, cli, plan_cleanup, reembed
 from bot.memory import StoredMemory
 
 
@@ -158,6 +158,112 @@ def test_cleanup_cli_requires_memory_enabled(make_config):
     assert result.exit_code != 0
     assert "memory_enabled" in result.output
     create.assert_not_awaited()
+
+
+def _vector_records() -> dict[str, list[VectorRecord]]:
+    return {
+        "missbot_memories": [
+            VectorRecord("missbot_memories", "00000000-0000-0000-0000-000000000001", "one", 1024),
+            VectorRecord("missbot_memories", "00000000-0000-0000-0000-000000000002", "two", 1024),
+        ],
+        "missbot_memories_entities": [
+            VectorRecord("missbot_memories_entities", "00000000-0000-0000-0000-000000000003", "entity", 1024)
+        ],
+    }
+
+
+@pytest.mark.anyio
+async def test_reembed_dry_run_probes_without_writing(make_config):
+    store = AsyncMock()
+    store.embed_batch.return_value = [[0.0] * 1024]
+    config = _memory_cfg(make_config)
+
+    with (
+        patch("bot.maintenance._load_vector_records", return_value=_vector_records()),
+        patch("bot.maintenance._replace_vectors") as replace_vectors,
+    ):
+        summary = await reembed(store, config, dry_run=True)
+
+    store.embed_batch.assert_awaited_once_with(["Missbot re-embedding preflight"], action="update")
+    replace_vectors.assert_not_called()
+    assert summary["tables"] == {"missbot_memories": 2, "missbot_memories_entities": 1}
+    assert summary["updated"] == 0
+
+
+@pytest.mark.anyio
+async def test_reembed_batches_both_tables_and_writes_once(make_config):
+    store = AsyncMock()
+    store.embed_batch.side_effect = [
+        [[0.0] * 1024],
+        [[0.1] * 1024, [0.2] * 1024],
+        [[0.3] * 1024],
+    ]
+    config = _memory_cfg(make_config)
+    backup_tables = {
+        "missbot_memories": "missbot_memories_backup_test",
+        "missbot_memories_entities": "missbot_memories_entities_backup_test",
+    }
+
+    with (
+        patch("bot.maintenance._load_vector_records", return_value=_vector_records()),
+        patch("bot.maintenance._replace_vectors", return_value=backup_tables) as replace_vectors,
+    ):
+        summary = await reembed(store, config, batch_size=2, backup_suffix="test")
+
+    assert store.embed_batch.await_count == 3
+    replace_vectors.assert_called_once()
+    call = replace_vectors.call_args
+    assert call.args[0] == config.postgres_url
+    assert call.kwargs["expected_dim"] == 1024
+    assert call.kwargs["backup_suffix"] == "test"
+    assert summary["updated"] == 3
+    assert summary["backup_tables"] == backup_tables
+
+
+@pytest.mark.anyio
+async def test_reembed_refuses_wrong_endpoint_dimension(make_config):
+    store = AsyncMock()
+    store.embed_batch.return_value = [[0.0] * 768]
+    config = _memory_cfg(make_config)
+
+    with (
+        patch("bot.maintenance._load_vector_records", return_value=_vector_records()),
+        patch("bot.maintenance._replace_vectors") as replace_vectors,
+    ):
+        with pytest.raises(ValueError, match="dimension 768"):
+            await reembed(store, config)
+
+    replace_vectors.assert_not_called()
+
+
+def test_reembed_cli_runs_and_closes_store(make_config):
+    config = _memory_cfg(make_config)
+    store = AsyncMock()
+    runner = CliRunner()
+    summary = {
+        "dry_run": True,
+        "embedding_model": "embed/model",
+        "embedding_dim": 1024,
+        "tables": {},
+        "total_rows": 0,
+        "probe_ok": True,
+        "backup_tables": {},
+        "updated": 0,
+    }
+
+    with (
+        patch("bot.maintenance.logfire.configure"),
+        patch("bot.maintenance.load_config", return_value=config),
+        patch("bot.maintenance.MemoryStore.create", AsyncMock(return_value=store)),
+        patch("bot.maintenance.reembed", AsyncMock(return_value=summary)) as reembed_mock,
+    ):
+        result = runner.invoke(cli, ["reembed", "--dry-run", "--batch-size", "32", "-c", "x.yaml"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["dry_run"] is True
+    assert reembed_mock.await_args is not None
+    assert reembed_mock.await_args.kwargs["batch_size"] == 32
+    store.close.assert_awaited_once()
 
 
 # --- provenance labels across frontends -------------------------------------
