@@ -178,6 +178,13 @@ class AutoDeps:
 
     image: Optional[GeneratedImage] = None
     """Set by `generate_image`; read back by `ChatAgent.run_auto`. One image per run."""
+    image_attempted: bool = False
+    """Whether this run has already called the image provider.
+
+    A final-output recovery pass can turn a leaked ``[meme: ...]`` description into an
+    image, but it must not make a second paid request after the model already called the
+    tool and that request failed.
+    """
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
     """Serializes `generate_image` calls against this run's deps.
 
@@ -209,6 +216,14 @@ def _make_enable_gate_tool(gate: str, servers: list[str]):
 _MAX_IMAGE_PROMPT_CHARS = 1000
 _MAX_IMAGE_ALT_CHARS = 512  # Misskey's drive `comment` limit
 _IMAGE_ONLY_OUTPUT = "[[IMAGE_ONLY]]"
+_AUTO_IMAGE_DESCRIPTION_RE = re.compile(
+    r"^\s*(?:\*\[(?P<emphasized>[^\]\r\n]+)\]\*|\[(?P<plain>[^\]\r\n]+)\])(?P<caption>[\s\S]*)$"
+)
+_AUTO_IMAGE_LABEL_RE = re.compile(
+    r"^(?:meme|image|picture|photo(?:graph)?|illustration|drawing|comic|poster|concept\s+art|infographic|painting)\s*:",
+    re.IGNORECASE,
+)
+_AUTO_LEGACY_MEME_RE = re.compile(r"^(?:boomer(?:-tier)?|cringe)\s+meme\b", re.IGNORECASE)
 _AUTO_IMAGE_INSTRUCTION = f"""Image-post workflow:
 - Decide whether the post needs an image before composing any final post text.
 - If it does, your first response must be only a generate_image tool call. Do not emit a
@@ -217,9 +232,40 @@ _AUTO_IMAGE_INSTRUCTION = f"""Image-post workflow:
 - After the image succeeds, either output the final caption or output exactly
   {_IMAGE_ONLY_OUTPUT} to publish the image by itself. The marker is internal and is never
   posted as text.
-- If you do not generate an image, output a normal text post. Never use the image-only marker
-  unless generate_image succeeded.
+- Never imitate an image with bracketed prose such as *[meme: ...]*, [image: ...], or a
+  similar description. Call generate_image instead. If image generation fails, write a
+  normal text-only post without an image description.
+- If you do not generate an image, output a normal text post. Never use the image-only
+  marker unless generate_image succeeded.
 """
+
+
+def _split_auto_image_description(output: str) -> Optional[tuple[str, str]]:
+    """Return a leading image description and its caption, if ``output`` contains one.
+
+    Smaller models sometimes write the visual direction into the post instead of calling
+    ``generate_image``. Keep this deliberately narrow: only a leading square-bracketed span
+    starting with an explicit visual-medium label qualifies. The one legacy prompt form
+    (``boomer-tier meme ...``) is supported too; ordinary stage directions remain text.
+    """
+    match = _AUTO_IMAGE_DESCRIPTION_RE.fullmatch(output)
+    if match is None:
+        return None
+    description = (match.group("emphasized") or match.group("plain")).strip()
+    if not (_AUTO_IMAGE_LABEL_RE.match(description) or _AUTO_LEGACY_MEME_RE.match(description)):
+        return None
+    caption = match.group("caption").strip()
+    # More than one directive is ambiguous and could leak the second one as caption text.
+    if caption and _split_auto_image_description(caption) is not None:
+        return None
+    return description, caption
+
+
+def _image_description_alt_text(description: str) -> str:
+    """Fit a model-written visual description into Misskey's drive comment limit."""
+    if len(description) <= _MAX_IMAGE_ALT_CHARS:
+        return description
+    return f"{description[: _MAX_IMAGE_ALT_CHARS - 1].rstrip()}…"
 
 
 def _make_generate_image_tool(generator: ImageGenerator):
@@ -255,6 +301,8 @@ def _make_generate_image_tool(generator: ImageGenerator):
         async with ctx.deps.lock:
             if ctx.deps.image is not None:
                 return "An image is already attached to this post. Do not call generate_image again."
+            if ctx.deps.image_attempted:
+                return "Image generation was already attempted and failed. Finish the post without an image."
             if len(prompt) > _MAX_IMAGE_PROMPT_CHARS:
                 return (
                     f"Refused: prompt is {len(prompt)} characters, over the {_MAX_IMAGE_PROMPT_CHARS}-character "
@@ -266,6 +314,7 @@ def _make_generate_image_tool(generator: ImageGenerator):
                     "limit. Call again with a shorter description."
                 )
 
+            ctx.deps.image_attempted = True
             image = await generator.generate(prompt, alt_text)
             if image is None:
                 return "Image generation failed. Finish the post without an image."
@@ -715,6 +764,41 @@ class ChatAgent:
             deps=deps,
         )
         text = result.output
+        image_description = _split_auto_image_description(text)
+        if image_description is not None:
+            description, caption = image_description
+            if deps.image is not None:
+                # The model called the tool but redundantly narrated the resulting picture.
+                # Keep only the actual post caption.
+                text = caption
+            elif self._image_generator is not None and not deps.image_attempted:
+                # Recovery for models that describe a visual instead of calling their tool.
+                # This is after the agent run, so no model retry can turn one provider call
+                # into several. On provider failure the original text remains as the existing
+                # fail-soft fallback. ImageGenerator handles expected provider failures itself;
+                # keep this boundary defensive against an unexpected implementation error too.
+                if len(description) > _MAX_IMAGE_PROMPT_CHARS:
+                    logfire.warning(
+                        "Autonomous image description exceeds prompt limit; retaining text fallback",
+                        length=len(description),
+                        limit=_MAX_IMAGE_PROMPT_CHARS,
+                    )
+                else:
+                    deps.image_attempted = True
+                    try:
+                        image = await self._image_generator.generate(
+                            description,
+                            _image_description_alt_text(description),
+                        )
+                    except Exception:
+                        logfire.exception("Autonomous image-description recovery failed; retaining text fallback")
+                        image = None
+                    if image is not None:
+                        deps.image = image
+                        text = caption
+                        logfire.info("Converted autonomous image description to generated image")
+                    else:
+                        logfire.warning("Could not convert autonomous image description; retaining text fallback")
         # A mocked/custom Agent can bypass registered validators, so keep the publication
         # boundary defensive as well. Real runs have already normalized this marker in
         # `_validate_auto_output`, where an invalid marker gets a model retry.

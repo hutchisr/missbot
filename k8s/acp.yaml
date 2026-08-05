@@ -12,7 +12,8 @@ spec:
   # Sessions and their history live in the process, so a second replica would
   # strand a client's session on whichever pod it first connected to. Scale out
   # only alongside session affinity.
-  replicas: 1
+  # Temporarily disabled; restore to 1 to re-enable the ACP endpoint.
+  replicas: 0
   selector:
     matchLabels:
       app.kubernetes.io/name: missbot

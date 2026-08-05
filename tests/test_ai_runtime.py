@@ -585,6 +585,21 @@ async def test_generate_image_tool_reports_failure():
     assert "without an image" in result.lower()
 
 
+@pytest.mark.anyio
+async def test_generate_image_tool_does_not_retry_provider_after_failure():
+    generator = _StubGenerator(None)
+    tool = _make_generate_image_tool(generator)  # type: ignore[arg-type]
+    deps = AutoDeps()
+    ctx = SimpleNamespace(deps=deps)
+
+    first = await tool(ctx, "a shrimp", "a shrimp")  # type: ignore[arg-type]
+    second = await tool(ctx, "a different shrimp", "another shrimp")  # type: ignore[arg-type]
+
+    assert generator.calls == [("a shrimp", "a shrimp")]
+    assert "without an image" in first.lower()
+    assert "already attempted" in second.lower()
+
+
 def test_auto_agent_gets_image_tool_when_enabled(make_config):
     agent = ChatAgent(_auto_config(make_config))
 
@@ -635,6 +650,144 @@ async def test_run_auto_carries_image_generated_during_the_run(make_config):
 
     assert post.text == "post text"
     assert post.image is _GENERATED
+
+
+@pytest.mark.anyio
+async def test_run_auto_turns_leaked_meme_description_into_image(make_config):
+    agent = ChatAgent(_auto_config(make_config))
+    assert agent._auto_agent is not None
+    assert agent._image_generator is not None
+    output = '*[meme: tired office worker vs smug robot, text "I DIDN\'T FIRE THEM. THE MARKET DID."]* lol true'
+
+    with (
+        patch.object(agent._auto_agent, "run", AsyncMock(return_value=SimpleNamespace(output=output))),
+        patch.object(agent._image_generator, "generate", AsyncMock(return_value=_GENERATED)) as generate_mock,
+    ):
+        post = await agent.run_auto()
+
+    assert post.text == "lol true"
+    assert post.image is _GENERATED
+    generate_mock.assert_awaited_once_with(
+        'meme: tired office worker vs smug robot, text "I DIDN\'T FIRE THEM. THE MARKET DID."',
+        'meme: tired office worker vs smug robot, text "I DIDN\'T FIRE THEM. THE MARKET DID."',
+    )
+
+
+@pytest.mark.anyio
+async def test_run_auto_leaves_nonvisual_stage_direction_as_text(make_config):
+    agent = ChatAgent(_auto_config(make_config))
+    assert agent._auto_agent is not None
+    assert agent._image_generator is not None
+    output = "*[checks watch]* still waiting lol"
+
+    with (
+        patch.object(agent._auto_agent, "run", AsyncMock(return_value=SimpleNamespace(output=output))),
+        patch.object(agent._image_generator, "generate", AsyncMock(return_value=_GENERATED)) as generate_mock,
+    ):
+        post = await agent.run_auto()
+
+    assert post.text == output
+    assert post.image is None
+    generate_mock.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_run_auto_does_not_treat_image_word_in_an_action_as_a_visual_description(make_config):
+    agent = ChatAgent(_auto_config(make_config))
+    assert agent._auto_agent is not None
+    assert agent._image_generator is not None
+    output = "*[deletes image cache]* fixed"
+
+    with (
+        patch.object(agent._auto_agent, "run", AsyncMock(return_value=SimpleNamespace(output=output))),
+        patch.object(agent._image_generator, "generate", AsyncMock(return_value=_GENERATED)) as generate_mock,
+    ):
+        post = await agent.run_auto()
+
+    assert post.text == output
+    assert post.image is None
+    generate_mock.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_run_auto_strips_redundant_description_after_tool_generated_image(make_config):
+    agent = ChatAgent(_auto_config(make_config))
+    assert agent._auto_agent is not None
+    assert agent._image_generator is not None
+    output = "*[photo: a shrimp at a keyboard]* working"
+
+    async def fake_run(prompt, **kwargs):
+        kwargs["deps"].image = _GENERATED
+        kwargs["deps"].image_attempted = True
+        return SimpleNamespace(output=output)
+
+    with (
+        patch.object(agent._auto_agent, "run", AsyncMock(side_effect=fake_run)),
+        patch.object(agent._image_generator, "generate", AsyncMock(return_value=_GENERATED)) as generate_mock,
+    ):
+        post = await agent.run_auto()
+
+    assert post.text == "working"
+    assert post.image is _GENERATED
+    generate_mock.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_run_auto_does_not_retry_description_after_tool_generation_failed(make_config):
+    agent = ChatAgent(_auto_config(make_config))
+    assert agent._auto_agent is not None
+    assert agent._image_generator is not None
+    output = "*[meme: an expensive failure]* still text"
+
+    async def fake_run(prompt, **kwargs):
+        kwargs["deps"].image_attempted = True
+        return SimpleNamespace(output=output)
+
+    with (
+        patch.object(agent._auto_agent, "run", AsyncMock(side_effect=fake_run)),
+        patch.object(agent._image_generator, "generate", AsyncMock(return_value=_GENERATED)) as generate_mock,
+    ):
+        post = await agent.run_auto()
+
+    assert post.text == output
+    assert post.image is None
+    generate_mock.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_run_auto_keeps_description_when_recovery_generation_fails(make_config):
+    agent = ChatAgent(_auto_config(make_config))
+    assert agent._auto_agent is not None
+    assert agent._image_generator is not None
+    output = "[boomer meme comparing regulation to a virus] lol"
+
+    with (
+        patch.object(agent._auto_agent, "run", AsyncMock(return_value=SimpleNamespace(output=output))),
+        patch.object(agent._image_generator, "generate", AsyncMock(return_value=None)) as generate_mock,
+    ):
+        post = await agent.run_auto()
+
+    assert post.text == output
+    assert post.image is None
+    generate_mock.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_run_auto_keeps_description_when_recovery_generation_raises(make_config):
+    agent = ChatAgent(_auto_config(make_config))
+    assert agent._auto_agent is not None
+    assert agent._image_generator is not None
+    output = "*[picture: a rocket made of office chairs]* ship it"
+
+    with (
+        patch.object(agent._auto_agent, "run", AsyncMock(return_value=SimpleNamespace(output=output))),
+        patch.object(agent._image_generator, "generate", AsyncMock(side_effect=RuntimeError("boom"))) as generate_mock,
+    ):
+        post = await agent.run_auto()
+
+    assert post.text == output
+    assert post.image is None
+    generate_mock.assert_awaited_once()
 
 
 @pytest.mark.anyio
