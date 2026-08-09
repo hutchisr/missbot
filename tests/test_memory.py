@@ -2,11 +2,15 @@
 
 import os
 from datetime import date, datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
+from openai import OpenAI
 
 from bot.memory import MemorySearchResult, MemoryStore, StoredMemory, _mem0_config, _suppress_openrouter_autodetect
+from bot.provider import PROJECT_VERSION
 
 
 def _memory_cfg(make_config, **extra):
@@ -160,6 +164,65 @@ async def test_create_builds_async_memory(make_config):
     assert isinstance(store, MemoryStore)
     from_config.assert_called_once()
     assert from_config.call_args.args[0]["vector_store"]["provider"] == "pgvector"
+
+
+@pytest.mark.anyio
+async def test_create_identifies_mem0_extraction_and_embedding_requests(make_config):
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        if request.url.path.endswith("/chat/completions"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chat-1",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "test-model",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [{"object": "embedding", "embedding": [0.1, 0.2], "index": 0}],
+                "model": "test-embedding-model",
+                "usage": {"prompt_tokens": 1, "total_tokens": 1},
+            },
+        )
+
+    cfg = _memory_cfg(make_config)
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        client = MagicMock()
+        client.llm = SimpleNamespace(
+            client=OpenAI(api_key="test-key", base_url="https://provider.example/v1", http_client=http_client)
+        )
+        client.embedding_model = SimpleNamespace(
+            client=OpenAI(api_key="test-key", base_url="https://provider.example/v1", http_client=http_client)
+        )
+
+        with patch("bot.memory.AsyncMemory.from_config", return_value=client):
+            await MemoryStore.create(cfg)
+
+        client.llm.client.chat.completions.create(
+            model="test-model",
+            messages=[{"role": "user", "content": "extract this"}],
+        )
+        client.embedding_model.client.embeddings.create(model="test-embedding-model", input="embed this")
+
+    assert len(captured) == 2
+    for request in captured:
+        assert request.headers["user-agent"] == f"Missbot/{PROJECT_VERSION}"
+        assert request.headers["http-referer"] == "rad://zLseUdKik1qrsiTonrjSoPGYbC6g"
+        assert request.headers["x-openrouter-title"] == f"missbot-{PROJECT_VERSION}"
 
 
 @pytest.mark.anyio

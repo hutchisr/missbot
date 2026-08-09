@@ -34,7 +34,7 @@ import logfire
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
-from ..ai import _load_project_version
+from ..provider import PROJECT_VERSION
 
 # acpremote's defaults; matching them means `acpremote mirror ws://host:8080/acp/ws`
 # works with no extra flags.
@@ -80,7 +80,7 @@ def build_metadata(*, paths: ServerPaths, auth_required: bool) -> dict[str, Any]
     return {
         "transport_kind": _TRANSPORT_KIND,
         "transport_version": _TRANSPORT_VERSION,
-        "package_version": _load_project_version(),
+        "package_version": PROJECT_VERSION,
         "auth_required": auth_required,
         "supported_auth_modes": ["bearer"] if auth_required else [],
         "max_size": DEFAULT_MAX_SIZE,

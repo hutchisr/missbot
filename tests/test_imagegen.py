@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 from bot.imagegen import GeneratedImage, ImageGenerator
+from bot.provider import PROJECT_VERSION
 
 
 _PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 64
@@ -85,6 +86,9 @@ async def test_generate_sends_model_prompt_and_key(image_config):
     assert request.method == "POST"
     assert str(request.url) == "https://openrouter.ai/api/v1/images/generations"
     assert request.headers["authorization"] == "Bearer image-key"
+    assert request.headers["user-agent"] == f"Missbot/{PROJECT_VERSION}"
+    assert request.headers["http-referer"] == "rad://zLseUdKik1qrsiTonrjSoPGYbC6g"
+    assert request.headers["x-openrouter-title"] == f"missbot-{PROJECT_VERSION}"
     # The Misskey token must never reach a third-party provider.
     assert "secret-token" not in str(request.headers)
     sent = json.loads(request.content)

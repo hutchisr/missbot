@@ -1,13 +1,11 @@
 import asyncio
 import os
 import re
-import tomllib
 from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
-from pathlib import Path
 from typing import Any, Optional, Union, cast
 
 import httpx
@@ -40,6 +38,7 @@ from .imagegen import GeneratedImage, ImageGenerator
 from .mcp import build_mcp_toolsets, gate_names
 from .memory import MemoryStore
 from .models import Config, ModelSpec
+from .provider import provider_request_headers
 from .scoring import ScoringSpec, build_scoring_prompt, build_scoring_spec
 from .tools import apply_social_credit, build_tools, normalize_username
 
@@ -452,16 +451,6 @@ async def _guarded(coro: Awaitable[object], label: str) -> None:
 _FALLBACK_ON = (ModelAPIError, httpx.TimeoutException)
 
 
-def _load_project_version() -> str:
-    with (Path(__file__).resolve().parents[1] / "pyproject.toml").open("rb") as project_file:
-        project_version = tomllib.load(project_file)["project"]["version"]
-    if not isinstance(project_version, str):
-        raise TypeError("project.version must be a string")
-    return project_version
-
-
-_USER_AGENT = f"Missbot/{_load_project_version()}"
-
 # Run settings for constrained-output classifier agents (currently social scoring).
 # Their output types force a tool call (`tool_choice`), which
 # thinking-mode endpoints reject ("Thinking mode does not support this tool_choice") — so
@@ -470,7 +459,7 @@ _USER_AGENT = f"Missbot/{_load_project_version()}"
 # The two ``openrouter_*`` keys are ignored by non-OpenRouter models.
 _CLASSIFIER_MODEL_SETTINGS: ModelSettings = OpenRouterModelSettings(
     timeout=60.0,
-    extra_headers={"User-Agent": _USER_AGENT},
+    extra_headers=provider_request_headers(),
     openrouter_reasoning={"enabled": False},
     openrouter_provider={"require_parameters": True},
 )
@@ -673,14 +662,14 @@ class ChatAgent:
     def _generation_settings(self, timeout: float) -> ModelSettings:
         """Model settings for the reply/auto agents: the configured token cap
         (``max_tokens`` — otherwise unused), any configured sampling/anti-repetition
-        knobs, the versioned Missbot user agent, and a per-call timeout.
+        knobs, versioned Missbot identification headers, and a per-call timeout.
 
         ``max_tokens`` and the sampling params are only included when set in config, so
         unset ones keep the provider default (and aren't sent to models that reject them).
         """
         settings: ModelSettings = {
             "timeout": timeout,
-            "extra_headers": {"User-Agent": _USER_AGENT},
+            "extra_headers": provider_request_headers(),
         }
         if self._config.max_tokens is not None:
             settings["max_tokens"] = self._config.max_tokens

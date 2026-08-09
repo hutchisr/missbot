@@ -196,7 +196,11 @@ def test_model_settings_identify_missbot(config):
     agent = ChatAgent(config)
     with (Path(__file__).parents[1] / "pyproject.toml").open("rb") as project_file:
         project_version = tomllib.load(project_file)["project"]["version"]
-    expected_headers = {"User-Agent": f"Missbot/{project_version}"}
+    expected_headers = {
+        "User-Agent": f"Missbot/{project_version}",
+        "HTTP-Referer": "rad://zLseUdKik1qrsiTonrjSoPGYbC6g",
+        "X-OpenRouter-Title": f"missbot-{project_version}",
+    }
 
     assert agent._generation_settings(30.0).get("extra_headers") == expected_headers
     assert _CLASSIFIER_MODEL_SETTINGS.get("extra_headers") == expected_headers

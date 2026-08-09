@@ -12,6 +12,7 @@ from typing import Any, Iterator, Literal, Optional, Union, cast
 import logfire
 
 from .models import Config, ModelSpec
+from .provider import provider_request_headers
 
 # mem0 enables anonymous PostHog telemetry by default. Keep the bot quiet unless the
 # operator explicitly opts in before process start.
@@ -193,6 +194,32 @@ def _mem0_config(config: Config) -> dict[str, Any]:
     return mem0_config
 
 
+def _identify_mem0_provider_clients(client: AsyncMemory) -> None:
+    """Add Missbot identification to mem0's extraction and embedding clients.
+
+    mem0 2.0's OpenAI embedder has no custom-header config field. Both OpenAI-backed
+    components do expose their underlying OpenAI SDK client, whose public ``with_options``
+    method creates an equivalent client with additional default headers.
+    """
+    for component_name in ("llm", "embedding_model"):
+        component = getattr(client, component_name, None)
+        if component is None:
+            logfire.warning(
+                "Unable to attach provider identification headers to mem0 component",
+                component=component_name,
+            )
+            continue
+        sdk_client = getattr(component, "client", None)
+        with_options = getattr(sdk_client, "with_options", None)
+        if not callable(with_options):
+            logfire.warning(
+                "Unable to attach provider identification headers to mem0 component",
+                component=component_name,
+            )
+            continue
+        component.client = with_options(default_headers=provider_request_headers())
+
+
 _DEFAULT_MEMORY_INSTRUCTIONS = (
     "Extract only durable, generally useful facts that could help future conversations. "
     "Prefer stable facts about people, projects, places, preferences, recurring context, and instance lore. "
@@ -214,6 +241,7 @@ class MemoryStore:
         mem0_config = _mem0_config(config)
         with _suppress_openrouter_autodetect():
             client = AsyncMemory.from_config(mem0_config)
+        _identify_mem0_provider_clients(client)
         store = cls(client, config)
         logfire.info(
             "mem0 memory ready",

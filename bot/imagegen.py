@@ -31,6 +31,7 @@ import httpx
 import logfire
 
 from .models import Config
+from .provider import provider_request_headers
 
 
 # Formats Misskey can serve safely, keyed by their magic bytes. WebP needs a split check
@@ -132,7 +133,9 @@ class ImageGenerator:
 
     async def _post(self, payload: dict[str, object]) -> Optional[dict[str, object]]:
         """POST the request and return the parsed body, capping how much is read."""
-        headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
+        headers = provider_request_headers()
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
         cap = self._max_bytes * 2 + _ENVELOPE_ALLOWANCE
         chunks: list[bytes] = []
         try:

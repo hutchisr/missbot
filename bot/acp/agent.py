@@ -20,10 +20,11 @@ import logfire
 from acp import schema
 from redis.asyncio import Redis
 
-from ..ai import ChatAgent, _load_project_version
+from ..ai import ChatAgent
 from ..core import AgentTurn, TurnAuthor
 from ..memory import MemoryStore
 from ..models import Config
+from ..provider import PROJECT_VERSION
 from .identity import parse_sender
 from .session import SessionRegistry
 
@@ -92,7 +93,7 @@ class MissbotAgent(acp.Agent):
             # Over stdio the trust boundary is process spawn — whoever launched this
             # process already holds the config, token, and database credentials.
             auth_methods=[],
-            agent_info=schema.Implementation(name=_AGENT_NAME, version=_load_project_version()),
+            agent_info=schema.Implementation(name=_AGENT_NAME, version=PROJECT_VERSION),
         )
 
     async def authenticate(self, method_id: str, **kwargs: Any) -> Optional[acp.AuthenticateResponse]:
