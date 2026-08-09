@@ -29,6 +29,12 @@ class TurnAuthor:
     """
     display: Optional[str] = None
     """Handle as rendered into the prompt. Falls back to ``handle``."""
+    user_id: Optional[str] = None
+    """Stable platform identity used for provenance-based trust decisions.
+
+    Misskey supplies its user id; ACP supplies its namespaced pubkey identity.
+    Display names and handles must never be substituted for this value.
+    """
     privileged: bool = False
     """Author may manually adjust anyone's social credit (see `AgentDeps`)."""
     location: Optional[str] = None

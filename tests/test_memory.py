@@ -187,7 +187,12 @@ async def test_add_note_scopes_to_bot_agent_and_records_author(make_config):
     client = AsyncMock()
     store = MemoryStore(client, _memory_cfg(make_config))
 
-    await store.add_note(text="I use Arch btw", author="Alice@Remote.Example", note_id="note-1")
+    await store.add_note(
+        text="I use Arch btw",
+        author="Alice@Remote.Example",
+        author_user_id="user-123",
+        note_id="note-1",
+    )
 
     client.add.assert_awaited_once()
     kwargs = client.add.await_args.kwargs
@@ -196,6 +201,7 @@ async def test_add_note_scopes_to_bot_agent_and_records_author(make_config):
     assert kwargs["metadata"] == {
         "source": "misskey_note",
         "author": "alice@remote.example",
+        "author_user_id": "user-123",
         "source_note_id": "note-1",
     }
     assert date.fromisoformat(kwargs["expiration_date"]) == datetime.now(timezone.utc).date() + timedelta(days=90)
@@ -210,6 +216,7 @@ async def test_add_note_can_disable_expiration(make_config):
     await store.add_note(text="I use Arch btw", author="alice")
 
     assert client.add.await_args.kwargs["expiration_date"] is None
+    assert "author_user_id" not in client.add.await_args.kwargs["metadata"]
 
 
 @pytest.mark.anyio

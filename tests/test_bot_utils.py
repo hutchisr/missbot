@@ -698,6 +698,7 @@ async def test_note_to_turn_maps_author_and_text(bot, make_note, make_user):
     assert turn.text == "hi"
     assert turn.author.handle == "alice@remote.host"
     assert turn.author.rendered == "alice@remote.host"
+    assert turn.author.user_id == note.user.id
     assert turn.author.location == "Berlin"
     assert turn.author.privileged is False
     assert turn.source_id == note.id

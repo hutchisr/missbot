@@ -159,7 +159,9 @@ class MissbotAgent(acp.Agent):
 
         turn = AgentTurn(
             text=text,
-            author=TurnAuthor(handle=identity.key, display=identity.label),
+            # parse_sender keys on the harness-supplied pubkey and namespaces it
+            # as acp:<key>, making it stable enough for provenance trust checks.
+            author=TurnAuthor(handle=identity.key, display=identity.label, user_id=identity.key),
             history=list(session.history),
             # No platform length cap here — that budget is Misskey's note limit.
             char_budget=None,

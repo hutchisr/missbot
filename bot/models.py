@@ -1,5 +1,5 @@
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, WebsocketUrl, field_validator, model_validator
-from typing import List, Literal, Optional, Union
+from typing import Any, List, Literal, Optional, Union
 
 
 _ALLOW_EXTRA = ConfigDict(extra="allow")
@@ -80,21 +80,28 @@ class MiWebsocketMessage(BaseModel):
     body: Optional[MiWebsocketMessageBody] = None
 
 
-class CustomOpenAIModel(BaseModel):
-    """Rich entry for the `llm_models` list.
+ModelAPIType = Literal["openai-chat", "openai-responses", "anthropic"]
 
-    Two forms:
-    - Custom OpenAI-compatible endpoint: set `base_url` (e.g. self-hosted vLLM,
-      Modal). `model` is the name sent in API requests.
-    - Pydantic-AI provider string with extra metadata: omit `base_url` and put
-      a string like `"openrouter:foo/bar"` in `model`. Useful when you need to
-      attach `vision: false` to a string-form model.
+
+class ModelSpec(BaseModel):
+    """Rich model entry for the `llm_models` and `score_models` lists.
+
+    Omit `api_type` and `base_url` to use `model` as a Pydantic-AI
+    `provider:model` string with extra metadata such as `vision`. Set
+    `api_type` to select a concrete API family, optionally at a custom
+    `base_url`. For backward compatibility, setting only `base_url` selects
+    `openai-chat`.
     """
 
-    model: str = Field(description="Model name (custom endpoint) or pydantic-ai 'provider:model' string.")
+    model: str = Field(description="Model name, or a pydantic-ai 'provider:model' string when api_type is unset.")
+    api_type: Optional[ModelAPIType] = Field(
+        default=None,
+        description="API family to use. Omit to infer from a provider:model string, or to retain the "
+        "openai-chat default when base_url is set.",
+    )
     base_url: Optional[AnyHttpUrl] = Field(
         default=None,
-        description="OpenAI-compatible base URL. Omit to use `model` as a pydantic-ai provider string.",
+        description="Optional API base URL. Supports OpenAI Chat Completions, OpenAI Responses, and Anthropic APIs.",
     )
     api_key: Optional[str] = Field(
         default=None, description="API key to send to the endpoint. Use api_key_env to load from env instead."
@@ -103,11 +110,21 @@ class CustomOpenAIModel(BaseModel):
         default=None,
         description="Environment variable name to read the API key from (preferred over hard-coding api_key).",
     )
+    extra_body: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Additional JSON request-body parameters sent only to this model. Use for provider-specific "
+        "features that Pydantic AI does not expose as first-class settings.",
+    )
     vision: bool = Field(
         default=True,
         description="Whether this model can handle image input. Set to false for text-only models so "
         "image-bearing prompts skip them in the fallback chain.",
     )
+
+
+# Compatibility for code importing the old, overly specific name. Config files
+# do not encode this Python class name, so no YAML migration is needed.
+CustomOpenAIModel = ModelSpec
 
 
 class MCPServerConfig(BaseModel):
@@ -179,10 +196,10 @@ class Config(BaseModel):
     ws_url: WebsocketUrl = Field(description="ws_url")
     token: str = Field(description="token")
     channel: Optional[str] = None
-    llm_models: List[Union[str, CustomOpenAIModel]] = Field(
+    llm_models: List[Union[str, ModelSpec]] = Field(
         description="LLM models. Strings use pydantic-ai 'provider:model' format "
-        "(e.g. 'openrouter:anthropic/claude-3.5-sonnet'). Dicts configure custom "
-        "OpenAI-compatible endpoints (see CustomOpenAIModel)."
+        "(e.g. 'openrouter:anthropic/claude-3.5-sonnet'). Dicts add metadata or "
+        "select an API family and optional custom endpoint (see ModelSpec)."
     )
     vision: bool = Field(default=True, description="Enable vision (pass images directly to the main LLM)")
     vision_models: Optional[List[str]] = Field(
@@ -299,7 +316,7 @@ class Config(BaseModel):
         "this value are ignored entirely: the note is never passed to the LLM and no reply is sent "
         "(nor are they scored or ingested). Leave unset to never ignore on score.",
     )
-    score_models: List[Union[str, CustomOpenAIModel]] = Field(
+    score_models: List[Union[str, ModelSpec]] = Field(
         default_factory=list,
         description="Models for the social-credit message classifier (same forms as llm_models). "
         "Defaults to llm_models when empty. Classification is a simple labeling task, so a smaller / "
@@ -513,6 +530,12 @@ class Config(BaseModel):
         default=True,
         description="When memory is enabled, auto-ingest each incoming user note through mem0. Set false to "
         "disable note learning while keeping add_memory / search_memory available.",
+    )
+    memory_trusted_user_ids: List[str] = Field(
+        default_factory=list,
+        description="Stable platform user ids whose auto-ingested memories are not treated as hearsay. "
+        "Misskey uses its user id; ACP uses the namespaced acp:<pubkey> identity. Handles and display names "
+        "never confer trust.",
     )
     memory_note_retention_days: Optional[int] = Field(
         default=90,

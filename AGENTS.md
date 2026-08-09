@@ -105,7 +105,16 @@ curl -s https://missbot-acp.taile6e57.ts.net/acp | jq           # transport meta
 Required fields:
 - `domain`, `url` (HTTPS), `ws_url` (WebSocket), `token`
 - `bot_user_id`, `bot_username`
-- `llm_models`: list of model entries — either pydantic-ai strings (e.g. `"openrouter:anthropic/claude-3.5-sonnet"`) or dicts for custom OpenAI-compatible endpoints (`model`, `base_url`, optional `api_key` / `api_key_env`)
+- `llm_models`: list of model entries — either pydantic-ai strings (e.g. `"openrouter:anthropic/claude-3.5-sonnet"`) or `ModelSpec` dicts. A dict can add metadata such as `vision` to a provider string, or select an explicit API family and optional custom endpoint with `model`, `api_type`, `base_url`, and optional `api_key` / `api_key_env`
+- `api_type` on a `ModelSpec` (default unset): explicit wire API, one of `openai-chat`, `openai-responses`, or `anthropic`. With neither `api_type` nor `base_url`, `model` is passed to Pydantic AI as a `provider:model` string and Pydantic selects the provider/API. Setting `base_url` without `api_type` preserves the legacy `openai-chat` behavior. With `api_type` set, `model` is the actual model name sent to that API; `base_url` is optional, so omitting it uses the selected provider's standard endpoint and credentials
+- `extra_body` on a `ModelSpec` (default `{}`): arbitrary provider-specific JSON fields merged into only that model's request body. It remains per-model inside fallback chains. For example, OpenRouter Auto Beta's named cost tier is:
+  ```yaml
+  - model: openrouter:openrouter/auto-beta
+    extra_body:
+      plugins:
+        - id: auto-beta-router
+          cost_tier: medium
+  ```
 - `system_prompt`, `max_retries`
 
 Optional fields:
@@ -187,14 +196,15 @@ Memory is delegated to mem0 OSS through `bot/memory.py:MemoryStore`, backed by P
 - `memory_search_limit` (default `5`), `memory_search_threshold` (default `0.1`): search result count and mem0 score floor
 - `memory_custom_instructions`: optional custom instructions appended to mem0's extraction prompt
 - `memory_ingest_notes` (default `true`): auto-ingest each incoming user note through mem0
+- `memory_trusted_user_ids` (default `[]`): stable platform user ids whose inferred memories are exempt from the HEARSAY label. Misskey uses its user id; ACP uses its namespaced `acp:<pubkey>` identity. Trust is checked from stored `author_user_id` metadata at recall time, so handles/display names never confer trust and removing an id from config revokes the exemption
 - `memory_note_retention_days` (default `90`, nullable): expiration/physical-retention window for inferred note memories; explicit `add_memory` entries are exempt
 - `memory_max_memories_per_author` (default `50`, nullable): per-author cap for inferred note memories; maintenance removes the oldest overflow rows
 - `memory_cleanup_scan_limit` (default `10000`): maximum scoped rows examined in one cleanup run
 - `max_fact_length` (default `500`): longer `add_memory` submissions are rejected
 
-**Write path.** `ChatAgent.run` still runs reply generation, social scoring, and memory ingestion concurrently. `_maybe_ingest_note` sends only the latest public author note to mem0 with metadata `{source: "misskey_note", author, source_note_id}` and a configured expiration date; specified/private notes are never ingested. The `add_memory` tool likewise refuses writes during private interactions. mem0 owns extraction, deduplication, vector storage, and entity-style linking. Successful tool writes use metadata `{source: "add_memory", author: bot_username}` and do not expire automatically. Memory failures are logged and swallowed so they never cancel a reply.
+**Write path.** `ChatAgent.run` still runs reply generation, social scoring, and memory ingestion concurrently. `_maybe_ingest_note` sends only the latest public author note to mem0 with metadata `{source: "misskey_note", author, author_user_id, source_note_id}` and a configured expiration date; `author_user_id` is omitted only when a frontend cannot provide a stable identity. Specified/private notes are never ingested. The `add_memory` tool likewise refuses writes during private interactions. mem0 owns extraction, deduplication, vector storage, and entity-style linking. Successful tool writes use metadata `{source: "add_memory", author: bot_username}` and do not expire automatically. Memory failures are logged and swallowed so they never cancel a reply.
 
-**Read path.** `search_memory` calls `MemoryStore.search()` with `agent_id=bot_username`, renders mem0 memories with score/source/author/recency metadata when available, and fences the returned text as untrusted data before the model sees it. Memories inferred from user-authored `misskey_note` or `acp_prompt` inputs are additionally marked **HEARSAY** with an explicit warning that they are unverified, not guaranteed true, and must not be presented as established fact without corroboration; explicit `add_memory` entries are not mislabeled as hearsay.
+**Read path.** `search_memory` calls `MemoryStore.search()` with `agent_id=bot_username`, renders mem0 memories with score/source/author/recency metadata when available, and fences the returned text as untrusted data before the model sees it. Memories inferred from user-authored `misskey_note` or `acp_prompt` inputs are additionally marked **HEARSAY** with an explicit warning that they are unverified, not guaranteed true, and must not be presented as established fact without corroboration. The label is omitted when stored `author_user_id` metadata matches `memory_trusted_user_ids`; those memories remain fenced as untrusted data so epistemic trust never becomes permission to follow recalled instructions. Explicit `add_memory` entries are not mislabeled as hearsay. Older inferred memories without `author_user_id` fail closed and remain hearsay.
 
 **Maintenance path.** `python -m bot.maintenance cleanup` lists only the bot's `agent_id`, includes already-expired rows, and physically deletes empty memories, exact duplicates, inferred note memories past retention, and the oldest inferred memories above each author's cap. Explicit `add_memory` rows are protected from retention/cap cleanup. Deletion goes through mem0 after initializing its entity store so `missbot_memories_entities` links are cleaned too. `--dry-run` reports the same candidate summary without deleting. The `missbot-maintenance` CronJob runs with concurrency forbidden; Kustomize reads its schedule and timezone from `k8s/maintenance-settings.yaml`, while `memory_max_memories_per_author` in `config.yaml` controls the cap.
 

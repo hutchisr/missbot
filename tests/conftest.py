@@ -99,6 +99,7 @@ def make_turn():
         text: str = "hello",
         handle: str = "alice",
         display: str | None = None,
+        user_id: str | None = None,
         privileged: bool = False,
         location: str | None = None,
         images: list[ImageUrl] | None = None,
@@ -111,7 +112,13 @@ def make_turn():
     ) -> AgentTurn:
         return AgentTurn(
             text=text,
-            author=TurnAuthor(handle=handle, display=display, privileged=privileged, location=location),
+            author=TurnAuthor(
+                handle=handle,
+                display=display,
+                user_id=user_id,
+                privileged=privileged,
+                location=location,
+            ),
             images=images or [],
             history=history or [],
             char_budget=char_budget,

@@ -11,7 +11,7 @@ from typing import Any, Iterator, Literal, Optional, Union, cast
 
 import logfire
 
-from .models import Config, CustomOpenAIModel
+from .models import Config, ModelSpec
 
 # mem0 enables anonymous PostHog telemetry by default. Keep the bot quiet unless the
 # operator explicitly opts in before process start.
@@ -71,7 +71,7 @@ def _strip_model_provider(model: str) -> str:
     return model.split(":", 1)[1]
 
 
-def _first_model_name(specs: list[Union[str, CustomOpenAIModel]]) -> str:
+def _first_model_name(specs: list[Union[str, ModelSpec]]) -> str:
     first = specs[0]
     if isinstance(first, str):
         return _strip_model_provider(first)
@@ -100,7 +100,7 @@ _OPENROUTER_ENV_VAR = "OPENROUTER_API_KEY"
 def _default_memory_llm(config: Config) -> tuple[str, str, Optional[str]]:
     """Resolve the first reply model as one endpoint/credential tuple."""
     first = config.llm_models[0]
-    if isinstance(first, CustomOpenAIModel) and first.base_url is not None:
+    if isinstance(first, ModelSpec) and first.base_url is not None:
         return first.model, str(first.base_url), _api_key(first.api_key, first.api_key_env)
     return _first_model_name(config.llm_models), _OPENROUTER_BASE_URL, os.environ.get(_OPENROUTER_ENV_VAR)
 
@@ -231,6 +231,7 @@ class MemoryStore:
         *,
         text: str,
         author: str,
+        author_user_id: Optional[str] = None,
         note_id: Optional[str] = None,
         source: str = "misskey_note",
     ) -> dict[str, Any]:
@@ -240,6 +241,8 @@ class MemoryStore:
             "source": source,
             "author": _normalize_username(author),
         }
+        if author_user_id:
+            metadata["author_user_id"] = author_user_id
         if note_id:
             metadata["source_note_id"] = note_id
         expiration_date = None

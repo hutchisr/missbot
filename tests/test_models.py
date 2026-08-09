@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from bot.models import Config, CustomOpenAIModel, MiFile, Note, ScoreCategory, User
+from bot.models import Config, CustomOpenAIModel, MiFile, ModelSpec, Note, ScoreCategory, User
 
 
 def test_config_valid(make_config):
@@ -91,7 +91,7 @@ def test_config_llm_models_mixes_strings_and_custom_endpoints(make_config):
     )
     assert cfg.llm_models[0] == "openrouter:test/model"
     custom = cfg.llm_models[1]
-    assert isinstance(custom, CustomOpenAIModel)
+    assert isinstance(custom, ModelSpec)
     assert custom.model == "Qwen/Qwen3"
     assert str(custom.base_url) == "https://example.modal.run/v1"
     assert custom.api_key_env == "MODAL_API_KEY"
@@ -101,17 +101,64 @@ def test_config_llm_models_mixes_strings_and_custom_endpoints(make_config):
 def test_config_custom_endpoint_without_base_url_passes_through_string(make_config):
     cfg = make_config(llm_models=[{"model": "openrouter:foo/bar", "vision": False}])
     entry = cfg.llm_models[0]
-    assert isinstance(entry, CustomOpenAIModel)
+    assert isinstance(entry, ModelSpec)
     assert entry.base_url is None
     assert entry.vision is False
 
 
-def test_custom_openai_model_vision_defaults_true():
-    spec = CustomOpenAIModel(
+def test_model_spec_vision_defaults_true():
+    spec = ModelSpec(
         model="Qwen/Qwen3",
         base_url="https://example.modal.run/v1",  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
     )
     assert spec.vision is True
+
+
+def test_model_spec_accepts_explicit_api_type(make_config):
+    cfg = make_config(
+        llm_models=[
+            {
+                "model": "claude-compatible-model",
+                "api_type": "anthropic",
+                "base_url": "https://anthropic.example/v1",
+            }
+        ]
+    )
+    entry = cfg.llm_models[0]
+    assert isinstance(entry, ModelSpec)
+    assert entry.api_type == "anthropic"
+
+
+def test_model_spec_accepts_provider_specific_extra_body(make_config):
+    cfg = make_config(
+        llm_models=[
+            {
+                "model": "openrouter:openrouter/auto-beta",
+                "extra_body": {
+                    "plugins": [
+                        {
+                            "id": "auto-beta-router",
+                            "cost_tier": "medium",
+                        }
+                    ]
+                },
+            }
+        ]
+    )
+    entry = cfg.llm_models[0]
+    assert isinstance(entry, ModelSpec)
+    assert entry.extra_body == {
+        "plugins": [
+            {
+                "id": "auto-beta-router",
+                "cost_tier": "medium",
+            }
+        ]
+    }
+
+
+def test_custom_openai_model_remains_compatibility_alias():
+    assert CustomOpenAIModel is ModelSpec
 
 
 def test_memory_disabled_by_default(make_config):
@@ -125,6 +172,7 @@ def test_memory_disabled_by_default(make_config):
     assert cfg.memory_search_threshold == 0.1
     assert cfg.memory_note_retention_days == 90
     assert cfg.memory_max_memories_per_author == 50
+    assert cfg.memory_trusted_user_ids == []
     assert cfg.memory_cleanup_scan_limit == 10_000
 
 

@@ -116,6 +116,7 @@ async def test_prompt_runs_turn_and_pushes_session_update(agent):
     # The full harness block reaches the model, metadata included.
     assert "Content: hello" in turn.text
     assert turn.author.handle == f"acp:{_HEX}"
+    assert turn.author.user_id == f"acp:{_HEX}"
     # No platform length cap on this frontend — that budget is Misskey's.
     assert turn.char_budget is None
     assert turn.source_id == f"acp:{session_id}"
@@ -133,7 +134,9 @@ async def test_prompt_falls_back_to_configured_identity(make_config):
     with patch.object(agent._agent, "run", AsyncMock(return_value="ok")) as run_mock:
         await agent.prompt(session_id=session_id, prompt=[_text("bare text, no header")])
 
-    assert _last_turn(run_mock).author.handle == "acp:buzz"
+    turn = _last_turn(run_mock)
+    assert turn.author.handle == "acp:buzz"
+    assert turn.author.user_id == "acp:buzz"
 
 
 @pytest.mark.anyio

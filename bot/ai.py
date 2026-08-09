@@ -3,11 +3,12 @@ import os
 import re
 import tomllib
 from collections import deque
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from collections.abc import AsyncGenerator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, cast
 
 import httpx
 
@@ -20,12 +21,17 @@ from pydantic_ai.messages import (
     TextPart,
     UserPromptPart,
 )
+from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models import Model
+from pydantic_ai.models import ModelRequestContext, ModelRequestParameters, StreamedResponse
 from pydantic_ai.models.fallback import FallbackModel
-from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
 from pydantic_ai.models.openrouter import OpenRouterModelSettings
+from pydantic_ai.models.wrapper import WrapperModel
+from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.openai import OpenAIProvider
-from pydantic_ai.settings import ModelSettings
+from pydantic_ai.settings import ModelSettings, merge_model_settings
+from pydantic_ai.usage import RequestUsage
 import logfire
 from redis.asyncio import Redis
 
@@ -33,7 +39,7 @@ from .core import AgentTurn, AutoPost, HistoryTurn, TurnImage
 from .imagegen import GeneratedImage, ImageGenerator
 from .mcp import build_mcp_toolsets, gate_names
 from .memory import MemoryStore
-from .models import Config, CustomOpenAIModel
+from .models import Config, ModelSpec
 from .scoring import ScoringSpec, build_scoring_prompt, build_scoring_spec
 from .tools import apply_social_credit, build_tools, normalize_username
 
@@ -80,27 +86,130 @@ if _original_cost is not None:
     setattr(ModelResponse, "cost", _cost_prefer_provider)
 
 
-def _resolve_model_spec(spec: Union[str, CustomOpenAIModel]) -> Union[str, Model]:
+@dataclass(init=False)
+class _ModelSettingsWrapper(WrapperModel):
+    """Attach per-model defaults to a Pydantic-inferred provider model.
+
+    Pydantic accepts settings when a concrete model is constructed, but its
+    `infer_model()` path accepts only a `provider:model` string. This wrapper
+    keeps provider inference while merging this spec's defaults before every
+    request. Runtime settings win, matching Pydantic's normal merge order.
+    """
+
+    _default_settings: ModelSettings
+
+    def __init__(self, model: str, settings: ModelSettings):
+        # Runtime provider strings are intentionally broader than Pydantic's
+        # generated KnownModelName Literal, which cannot enumerate custom IDs.
+        super().__init__(cast(Any, model))
+        self._default_settings = settings
+
+    def _merge_settings(self, overrides: ModelSettings | None) -> ModelSettings | None:
+        return merge_model_settings(self._default_settings, overrides)
+
+    @property
+    def settings(self) -> ModelSettings:
+        return self._default_settings
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        return await self.wrapped.request(
+            messages,
+            self._merge_settings(model_settings),
+            model_request_parameters,
+        )
+
+    @asynccontextmanager
+    async def request_stream(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+        run_context: RunContext[Any] | None = None,
+    ) -> AsyncGenerator[StreamedResponse]:
+        async with self.wrapped.request_stream(
+            messages,
+            self._merge_settings(model_settings),
+            model_request_parameters,
+            run_context,
+        ) as response_stream:
+            yield response_stream
+
+    async def count_tokens(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> RequestUsage:
+        return await self.wrapped.count_tokens(
+            messages,
+            self._merge_settings(model_settings),
+            model_request_parameters,
+        )
+
+    async def compact_messages(
+        self,
+        request_context: ModelRequestContext,
+        *,
+        instructions: str | None = None,
+    ) -> ModelResponse:
+        wrapped_context = replace(
+            request_context,
+            model=self.wrapped,
+            model_settings=self._merge_settings(request_context.model_settings),
+        )
+        wrapped_context.model_id = request_context.model_id
+        wrapped_context.streaming = request_context.streaming
+        return await self.wrapped.compact_messages(wrapped_context, instructions=instructions)
+
+    def prepare_request(
+        self,
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> tuple[ModelSettings | None, ModelRequestParameters]:
+        return self.wrapped.prepare_request(
+            self._merge_settings(model_settings),
+            model_request_parameters,
+        )
+
+
+def _resolve_model_spec(spec: Union[str, ModelSpec]) -> Union[str, Model]:
     """Convert a config llm_models entry into something Pydantic AI accepts.
 
-    Strings pass through (Pydantic AI parses them as 'provider:model'). Dict
-    entries with `base_url` build an OpenAIChatModel; without `base_url` the
-    `model` field is treated as a pydantic-ai provider string.
+    Strings and ModelSpec entries without an explicit endpoint or API type pass
+    through for Pydantic AI to parse as `provider:model`. A base URL alone keeps
+    the historical OpenAI Chat Completions behavior; `api_type` can explicitly
+    select Chat Completions, Responses, or Anthropic Messages instead.
     """
     if isinstance(spec, str):
         return spec
-    if spec.base_url is None:
+    if spec.base_url is None and spec.api_type is None:
+        if spec.extra_body:
+            return _ModelSettingsWrapper(spec.model, ModelSettings(extra_body=spec.extra_body))
         return spec.model
     api_key = spec.api_key
     if api_key is None and spec.api_key_env:
         api_key = os.environ.get(spec.api_key_env)
-    return OpenAIChatModel(
-        spec.model,
-        provider=OpenAIProvider(base_url=str(spec.base_url), api_key=api_key),
-    )
+    base_url = str(spec.base_url) if spec.base_url is not None else None
+    api_type = spec.api_type or "openai-chat"
+    model_settings = ModelSettings(extra_body=spec.extra_body) if spec.extra_body else None
+    if api_type == "anthropic":
+        return AnthropicModel(
+            spec.model,
+            provider=AnthropicProvider(base_url=base_url, api_key=api_key),
+            settings=model_settings,
+        )
+    provider = OpenAIProvider(base_url=base_url, api_key=api_key)
+    if api_type == "openai-responses":
+        return OpenAIResponsesModel(spec.model, provider=provider, settings=model_settings)
+    return OpenAIChatModel(spec.model, provider=provider, settings=model_settings)
 
 
-def _spec_supports_vision(spec: Union[str, CustomOpenAIModel]) -> bool:
+def _spec_supports_vision(spec: Union[str, ModelSpec]) -> bool:
     """Whether a model entry should receive image input. Strings default True."""
     if isinstance(spec, str):
         return True
@@ -367,7 +476,7 @@ _CLASSIFIER_MODEL_SETTINGS: ModelSettings = OpenRouterModelSettings(
 )
 
 
-def _model_chain(specs: list[Union[str, CustomOpenAIModel]]) -> Optional[Union[str, Model]]:
+def _model_chain(specs: list[Union[str, ModelSpec]]) -> Optional[Union[str, Model]]:
     """Resolve a list of model specs into a single model or a FallbackModel chain (or None)."""
     resolved = [_resolve_model_spec(s) for s in specs]
     if not resolved:
@@ -848,7 +957,13 @@ class ChatAgent:
             return
         author = normalize_username(turn.author.handle)
         try:
-            await self._memory.add_note(text=text, author=author, note_id=turn.source_id, source=turn.source)
+            await self._memory.add_note(
+                text=text,
+                author=author,
+                author_user_id=turn.author.user_id,
+                note_id=turn.source_id,
+                source=turn.source,
+            )
         except Exception:
             logfire.exception("Note memory ingestion failed (reply unaffected)", author=author)
 

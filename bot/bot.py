@@ -212,6 +212,7 @@ class Bot:
         """
         author = TurnAuthor(
             handle=_user_handle(note.user),
+            user_id=note.user.id,
             # Lift the author-only restriction when the note's author is a designated
             # privileged user (e.g. the operator), configured by user id.
             privileged=note.user.id in self._config.social_credit_unrestricted_user_ids,

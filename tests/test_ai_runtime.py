@@ -366,7 +366,11 @@ async def test_run_ingests_turn_with_mem0(make_config, make_turn):
 
     assert out == "reply"
     mem.add_note.assert_awaited_once_with(
-        text="Python's latest version is 3.13", author="alice", note_id="note-1", source="unknown"
+        text="Python's latest version is 3.13",
+        author="alice",
+        author_user_id=None,
+        note_id="note-1",
+        source="unknown",
     )
 
 
@@ -429,7 +433,11 @@ async def test_run_ingestion_normalizes_author_handle(make_config, make_turn):
         await agent.run(make_turn(text="I use Arch btw", handle="Alice@Remote.Example"))
 
     mem.add_note.assert_awaited_once_with(
-        text="I use Arch btw", author="alice@remote.example", note_id="note-1", source="unknown"
+        text="I use Arch btw",
+        author="alice@remote.example",
+        author_user_id=None,
+        note_id="note-1",
+        source="unknown",
     )
 
 
@@ -445,6 +453,19 @@ async def test_run_ingestion_passes_the_turn_source_label(make_config, make_turn
 
     assert mem.add_note.await_args is not None
     assert mem.add_note.await_args.kwargs["source"] == "acp_prompt"
+
+
+@pytest.mark.anyio
+async def test_run_ingestion_passes_stable_author_user_id(make_config, make_turn):
+    mem = AsyncMock()
+    agent = ChatAgent(_memory_cfg(make_config), memory=mem)
+    turn = make_turn(text="the operator prefers concise replies", user_id="trusted-user-id")
+
+    with patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))):
+        await agent.run(turn)
+
+    assert mem.add_note.await_args is not None
+    assert mem.add_note.await_args.kwargs["author_user_id"] == "trusted-user-id"
 
 
 _GENERATED = GeneratedImage(data=b"\x89PNG\r\n\x1a\nbytes", media_type="image/png", prompt="p", alt_text="a")

@@ -6,21 +6,27 @@ from types import SimpleNamespace
 
 import pytest
 from pydantic_ai import ImageUrl, ModelRetry
-from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.models import ModelRequestParameters
+from pydantic_ai.models.anthropic import AnthropicModel
+from pydantic_ai.models.fallback import FallbackModel
+from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
+from pydantic_ai.settings import ModelSettings
 
 from bot.ai import (
     AgentDeps,
     ChatAgent,
     _CLASSIFIER_MODEL_SETTINGS,
+    _ModelSettingsWrapper,
     _enforce_length,
     _history_content,
+    _model_chain,
     _normalize_for_repeat,
     _resolve_model_spec,
     _spec_supports_vision,
     _strip_leading_mentions,
 )
 from bot.core import HistoryTurn
-from bot.models import CustomOpenAIModel
+from bot.models import ModelSpec
 
 
 def test_history_content_text_only():
@@ -67,7 +73,7 @@ def test_resolve_model_spec_passes_through_strings():
 
 
 def test_resolve_model_spec_builds_openai_chat_model():
-    spec = CustomOpenAIModel(
+    spec = ModelSpec(
         model="Qwen/Qwen3",
         base_url="https://example.modal.run/v1",  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
         api_key="literal-key",
@@ -82,7 +88,7 @@ def test_resolve_model_spec_builds_openai_chat_model():
 
 def test_resolve_model_spec_reads_api_key_from_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("MODAL_API_KEY", "env-key")
-    spec = CustomOpenAIModel(
+    spec = ModelSpec(
         model="Qwen/Qwen3",
         base_url="https://example.modal.run/v1",  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
         api_key_env="MODAL_API_KEY",
@@ -92,9 +98,84 @@ def test_resolve_model_spec_reads_api_key_from_env(monkeypatch: pytest.MonkeyPat
     assert model.client.api_key == "env-key"
 
 
+def test_resolve_model_spec_builds_openai_responses_model():
+    spec = ModelSpec(
+        model="gpt-compatible-model",
+        api_type="openai-responses",
+        base_url="https://responses.example/v1",  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
+        api_key="responses-key",
+    )
+    model = _resolve_model_spec(spec)
+    assert isinstance(model, OpenAIResponsesModel)
+    assert model.model_name == "gpt-compatible-model"
+    assert str(model.client.base_url).startswith("https://responses.example/v1")
+    assert model.client.api_key == "responses-key"
+
+
+def test_resolve_model_spec_builds_anthropic_model():
+    spec = ModelSpec(
+        model="claude-compatible-model",
+        api_type="anthropic",
+        base_url="https://anthropic.example/v1",  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
+        api_key="anthropic-key",
+    )
+    model = _resolve_model_spec(spec)
+    assert isinstance(model, AnthropicModel)
+    assert model.model_name == "claude-compatible-model"
+    assert str(model.client.base_url).startswith("https://anthropic.example/v1")
+
+
+def test_resolve_model_spec_explicit_api_type_without_base_url(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+    spec = ModelSpec(model="gpt-5", api_type="openai-responses")
+    model = _resolve_model_spec(spec)
+    assert isinstance(model, OpenAIResponsesModel)
+    assert str(model.client.base_url).startswith("https://api.openai.com/v1")
+
+
 def test_resolve_model_spec_dict_without_base_url_returns_string():
-    spec = CustomOpenAIModel(model="openrouter:foo/bar", vision=False)
+    spec = ModelSpec(model="openrouter:foo/bar", vision=False)
     assert _resolve_model_spec(spec) == "openrouter:foo/bar"
+
+
+def test_resolve_model_spec_forwards_extra_body_to_inferred_provider(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key")
+    plugins = [{"id": "auto-beta-router", "cost_tier": "xhigh"}]
+    spec = ModelSpec(
+        model="openrouter:openrouter/auto-beta",
+        extra_body={"plugins": plugins},
+    )
+
+    model = _resolve_model_spec(spec)
+
+    assert isinstance(model, _ModelSettingsWrapper)
+    settings, _ = model.prepare_request(
+        ModelSettings(timeout=123),
+        ModelRequestParameters(),
+    )
+    assert settings is not None
+    assert settings.get("timeout") == 123
+    assert settings.get("extra_body") == {"plugins": plugins}
+
+
+def test_model_extra_body_stays_scoped_to_its_fallback(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key")
+    chain = _model_chain(
+        [
+            ModelSpec(
+                model="openrouter:openrouter/auto-beta",
+                extra_body={"plugins": [{"id": "auto-beta-router", "cost_tier": "medium"}]},
+            ),
+            "test",
+        ]
+    )
+
+    assert isinstance(chain, FallbackModel)
+    assert isinstance(chain.models[0], _ModelSettingsWrapper)
+    assert chain.models[0].settings.get("extra_body") == {
+        "plugins": [{"id": "auto-beta-router", "cost_tier": "medium"}]
+    }
+    assert chain.models[1].settings is None
 
 
 def test_spec_supports_vision_string_defaults_true():
@@ -102,9 +183,9 @@ def test_spec_supports_vision_string_defaults_true():
 
 
 def test_spec_supports_vision_respects_dict_flag():
-    spec = CustomOpenAIModel(model="openrouter:foo/bar", vision=False)
+    spec = ModelSpec(model="openrouter:foo/bar", vision=False)
     assert _spec_supports_vision(spec) is False
-    spec_default = CustomOpenAIModel(
+    spec_default = ModelSpec(
         model="Qwen/Qwen3",
         base_url="https://example.modal.run/v1",  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
     )
