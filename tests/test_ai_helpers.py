@@ -198,7 +198,7 @@ def test_model_settings_identify_missbot(config):
         project_version = tomllib.load(project_file)["project"]["version"]
     expected_headers = {
         "User-Agent": f"Missbot/{project_version}",
-        "HTTP-Referer": "rad://zLseUdKik1qrsiTonrjSoPGYbC6g",
+        "HTTP-Referer": "https://radicle.network/nodes/index.radicle.garden/rad%3AzLseUdKik1qrsiTonrjSoPGYbC6g",
         "X-OpenRouter-Title": f"missbot-{project_version}",
     }
 

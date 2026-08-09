@@ -221,7 +221,9 @@ async def test_create_identifies_mem0_extraction_and_embedding_requests(make_con
     assert len(captured) == 2
     for request in captured:
         assert request.headers["user-agent"] == f"Missbot/{PROJECT_VERSION}"
-        assert request.headers["http-referer"] == "rad://zLseUdKik1qrsiTonrjSoPGYbC6g"
+        assert request.headers["http-referer"] == (
+            "https://radicle.network/nodes/index.radicle.garden/rad%3AzLseUdKik1qrsiTonrjSoPGYbC6g"
+        )
         assert request.headers["x-openrouter-title"] == f"missbot-{PROJECT_VERSION}"
 
 

@@ -15,7 +15,9 @@ def _load_project_version() -> str:
 
 
 PROJECT_VERSION = _load_project_version()
-APP_URL = "rad://zLseUdKik1qrsiTonrjSoPGYbC6g"
+# OpenRouter requires an HTTP(S) app URL for attribution. This is the web form of
+# Missbot's canonical Radicle RID, not a GitHub mirror or a node-specific push URL.
+APP_URL = "https://radicle.network/nodes/index.radicle.garden/rad%3AzLseUdKik1qrsiTonrjSoPGYbC6g"
 
 
 def provider_request_headers() -> dict[str, str]:
