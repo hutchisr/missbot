@@ -478,7 +478,7 @@ class Bot:
 
     @logfire.instrument(extract_args=False)
     async def post_autonomous(self):
-        """Generate and post an autonomous text, image, or combined note."""
+        """Generate and post an autonomous text, image, poll, or combined note."""
         post = await self._agent.run_auto()
         limit = self._config.max_note_length
         if len(post.text) > limit:
@@ -487,12 +487,22 @@ class Bot:
                 "(model ignored its length budget); refusing to send."
             )
         has_text = bool(post.text.strip())
+        if post.poll is not None and not has_text:
+            raise ValueError("Autonomous poll has no question text; refusing to send")
         if not has_text and post.image is None:
             raise ValueError("Autonomous post has neither text nor an image; refusing to send")
 
         payload: dict[str, object] = {"visibility": "public"}
         if has_text:
             payload["text"] = post.text
+        if post.poll is not None:
+            poll: dict[str, object] = {
+                "choices": list(post.poll.choices),
+                "multiple": post.poll.multiple,
+            }
+            if post.poll.duration_minutes is not None:
+                poll["expiredAfter"] = post.poll.duration_minutes * 60_000
+            payload["poll"] = poll
         if post.image is not None:
             file_id = await self._upload_image(post.image)
             if file_id:

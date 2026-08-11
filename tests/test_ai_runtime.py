@@ -11,8 +11,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from pydantic_ai import ImageUrl, ModelRetry
 
-from bot.ai import AutoDeps, ChatAgent, _IMAGE_ONLY_OUTPUT, _make_generate_image_tool
-from bot.core import HistoryTurn
+from bot.ai import AutoDeps, ChatAgent, _IMAGE_ONLY_OUTPUT, _make_create_poll_tool, _make_generate_image_tool
+from bot.core import Poll, HistoryTurn
 from bot.imagegen import GeneratedImage
 
 
@@ -493,6 +493,59 @@ def _auto_config(make_config, **overrides):
 
 
 @pytest.mark.anyio
+async def test_create_poll_tool_stashes_normalized_poll_on_deps():
+    tool = _make_create_poll_tool()
+    deps = AutoDeps()
+
+    result = await tool(  # type: ignore[arg-type]
+        SimpleNamespace(deps=deps),
+        ["  Tea ", "Coffee"],
+        multiple=True,
+        duration_minutes=90,
+    )
+
+    assert deps.poll == Poll(choices=("Tea", "Coffee"), multiple=True, duration_minutes=90)
+    assert "attached" in result.lower()
+    assert "90 minutes" in result.lower()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("choices", "duration_minutes"),
+    [
+        (["only one"], None),
+        (["same", " same "], None),
+        (["x" * 51, "fine"], None),
+        (["yes", "no"], 0),
+    ],
+)
+async def test_create_poll_tool_refuses_invalid_poll(choices, duration_minutes):
+    tool = _make_create_poll_tool()
+    deps = AutoDeps()
+
+    result = await tool(  # type: ignore[arg-type]
+        SimpleNamespace(deps=deps),
+        choices,
+        duration_minutes=duration_minutes,
+    )
+
+    assert deps.poll is None
+    assert "refused" in result.lower()
+
+
+@pytest.mark.anyio
+async def test_create_poll_tool_refuses_second_poll():
+    tool = _make_create_poll_tool()
+    original = Poll(choices=("cats", "dogs"))
+    deps = AutoDeps(poll=original)
+
+    result = await tool(SimpleNamespace(deps=deps), ["tea", "coffee"])  # type: ignore[arg-type]
+
+    assert deps.poll is original
+    assert "already" in result.lower()
+
+
+@pytest.mark.anyio
 async def test_generate_image_tool_stashes_image_on_deps():
     generator = _StubGenerator(_GENERATED)
     tool = _make_generate_image_tool(generator)  # type: ignore[arg-type]
@@ -644,6 +697,19 @@ def test_reply_agent_never_gets_image_tool(make_config):
     assert "generate_image" not in agent._agent._function_toolset.tools
 
 
+def test_auto_agent_gets_poll_tool(make_config):
+    agent = ChatAgent(make_config(system_prompt_auto="Post something."))
+
+    assert agent._auto_agent is not None
+    assert "create_poll" in agent._auto_agent._function_toolset.tools
+
+
+def test_reply_agent_never_gets_poll_tool(make_config):
+    agent = ChatAgent(make_config(system_prompt_auto="Post something."))
+
+    assert "create_poll" not in agent._agent._function_toolset.tools
+
+
 @pytest.mark.anyio
 async def test_run_auto_returns_text_only_when_no_image(make_config):
     agent = ChatAgent(_auto_config(make_config))
@@ -671,6 +737,24 @@ async def test_run_auto_carries_image_generated_during_the_run(make_config):
 
     assert post.text == "post text"
     assert post.image is _GENERATED
+
+
+@pytest.mark.anyio
+async def test_run_auto_carries_poll_created_during_the_run(make_config):
+    agent = ChatAgent(make_config(system_prompt_auto="Post something."))
+    assert agent._auto_agent is not None
+    poll = Poll(choices=("Tea", "Coffee"), duration_minutes=30)
+
+    async def fake_run(prompt, **kwargs):
+        kwargs["deps"].poll = poll
+        return SimpleNamespace(output="What should I drink?")
+
+    with patch.object(agent._auto_agent, "run", AsyncMock(side_effect=fake_run)):
+        post = await agent.run_auto()
+
+    assert post.text == "What should I drink?"
+    assert post.poll is poll
+    assert list(agent._auto_history) == ["What should I drink?\n[poll choices: Tea | Coffee]"]
 
 
 @pytest.mark.anyio
@@ -834,6 +918,14 @@ def test_auto_output_validator_allows_image_without_caption():
     assert ChatAgent._validate_auto_output(ctx, _IMAGE_ONLY_OUTPUT) == ""  # type: ignore[arg-type]
 
 
+def test_auto_output_validator_retries_image_only_marker_with_poll():
+    poll = Poll(choices=("Tea", "Coffee"))
+    ctx = SimpleNamespace(deps=AutoDeps(image=_GENERATED, poll=poll))
+
+    with pytest.raises(ModelRetry, match="poll needs question text"):
+        ChatAgent._validate_auto_output(ctx, _IMAGE_ONLY_OUTPUT)  # type: ignore[arg-type]
+
+
 def test_auto_output_validator_retries_image_only_marker_without_image():
     ctx = SimpleNamespace(deps=AutoDeps())
 
@@ -853,4 +945,20 @@ async def test_run_auto_rejects_image_only_marker_without_image(make_config):
         AsyncMock(return_value=SimpleNamespace(output=_IMAGE_ONLY_OUTPUT)),
     ):
         with pytest.raises(ValueError, match="without generating an image"):
+            await agent.run_auto()
+
+
+@pytest.mark.anyio
+async def test_run_auto_rejects_poll_without_question_when_agent_skips_validators(make_config):
+    agent = ChatAgent(_auto_config(make_config))
+    assert agent._auto_agent is not None
+    poll = Poll(choices=("Tea", "Coffee"))
+
+    async def fake_run(prompt, **kwargs):
+        kwargs["deps"].image = _GENERATED
+        kwargs["deps"].poll = poll
+        return SimpleNamespace(output=_IMAGE_ONLY_OUTPUT)
+
+    with patch.object(agent._auto_agent, "run", AsyncMock(side_effect=fake_run)):
+        with pytest.raises(ValueError, match="poll has no question text"):
             await agent.run_auto()

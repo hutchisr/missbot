@@ -27,6 +27,8 @@ backends is the same bot, not a copy of it.
   automatic reconnection.
 - Optional automatic replies to timeline notes and autonomous timeline posts,
   each with configurable intervals and jitter.
+- Autonomous posts may attach a model-composed Misskey poll with optional
+  multi-select and expiration.
 - Multi-provider Pydantic AI model chains with automatic fallback on provider
   errors and timeouts.
 - Custom OpenAI-compatible endpoints alongside Pydantic AI provider strings.

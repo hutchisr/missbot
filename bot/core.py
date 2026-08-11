@@ -88,13 +88,23 @@ class AgentTurn:
 
 
 @dataclass(frozen=True)
+class Poll:
+    """Transport-neutral poll attached to an autonomous post."""
+
+    choices: tuple[str, ...]
+    multiple: bool = False
+    duration_minutes: Optional[int] = None
+    """Minutes until the poll closes, or ``None`` to leave it open indefinitely."""
+
+
+@dataclass(frozen=True)
 class AutoPost:
     """Result of one autonomous-post run; ``text`` may be empty when ``image`` is set.
 
-    Neutral like the turn types above: an image is bytes plus a media type, nothing
-    platform-specific. The adapter decides how to attach it (Misskey uploads to drive and
-    passes `fileIds`).
+    Neutral like the turn types above: attachments carry no Misskey wire fields. The
+    adapter uploads an image and translates a poll duration into the platform payload.
     """
 
     text: str
     image: Optional[GeneratedImage] = None
+    poll: Optional[Poll] = None

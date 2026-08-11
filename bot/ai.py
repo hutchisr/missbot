@@ -33,7 +33,7 @@ from pydantic_ai.usage import RequestUsage
 import logfire
 from redis.asyncio import Redis
 
-from .core import AgentTurn, AutoPost, HistoryTurn, TurnImage
+from .core import AgentTurn, AutoPost, HistoryTurn, Poll, TurnImage
 from .imagegen import GeneratedImage, ImageGenerator
 from .mcp import build_mcp_toolsets, gate_names
 from .memory import MemoryStore
@@ -273,19 +273,20 @@ class AgentDeps:
 class AutoDeps:
     """Runtime dependencies for the autonomous-post agent.
 
-    Exists so `generate_image` has somewhere to put its result: a tool returns a *string* to
-    the model, so the bytes have to travel out-of-band. Typing the tool `RunContext[AutoDeps]`
-    does NOT by itself confine it to auto posts — pyright accepts handing it to the reply agent
-    too, since `build_tools()` returns `list[Callable[..., object]]` (erasing the deps type at
-    the append site) and pydantic-ai's `tools=` parameter is a ParamSpec-gradual signature that
-    never compares `RunContext[AutoDeps]` against `RunContext[AgentDeps]`. What actually confines
-    it: `generate_image` is appended only to `auto_tools`, a list built and passed only to
-    `self._auto_agent` in `ChatAgent.__init__`; the reply agent is built from a separate `tools`
-    list that never receives it. `test_reply_agent_never_gets_image_tool` pins the separation.
+    Image and poll tools store their results here because a tool returns a *string* to
+    the model, so attachments have to travel out-of-band. Typing a tool as
+    `RunContext[AutoDeps]` does NOT by itself confine it to auto posts — pyright accepts
+    handing it to the reply agent too, since `build_tools()` returns
+    `list[Callable[..., object]]` (erasing the deps type at the append site) and
+    pydantic-ai's `tools=` parameter is a ParamSpec-gradual signature that never compares
+    `RunContext[AutoDeps]` against `RunContext[AgentDeps]`. The tools are confined by being
+    appended only to `auto_tools`, which is passed only to `self._auto_agent`.
     """
 
     image: Optional[GeneratedImage] = None
     """Set by `generate_image`; read back by `ChatAgent.run_auto`. One image per run."""
+    poll: Optional[Poll] = None
+    """Set by `create_poll`; read back by `ChatAgent.run_auto`. One poll per run."""
     image_attempted: bool = False
     """Whether this run has already called the image provider.
 
@@ -294,14 +295,13 @@ class AutoDeps:
     tool and that request failed.
     """
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
-    """Serializes `generate_image` calls against this run's deps.
+    """Serializes attachment-tool calls against this run's dependencies.
 
-    pydantic-ai may run tool calls emitted in the same model turn concurrently
-    (`asyncio.create_task` per call), so the tool's own "already generated" check and the
-    write that follows it are a check-then-set race without this: two concurrent calls could
-    both observe `image is None` before either sets it, paying for two generations instead of
-    the intended one-per-post cap. The lock is per-run (fresh `AutoDeps` per `run_auto` call),
-    not process-wide, so it never serializes across unrelated runs."""
+    Pydantic AI may schedule tool calls from one model turn concurrently. The lock makes
+    each tool's check-and-set atomic, so two concurrent calls cannot both attach a poll or
+    pay for two image generations. It is per-run, so unrelated autonomous posts remain
+    concurrent.
+    """
 
 
 def _make_enable_gate_tool(gate: str, servers: list[str]):
@@ -323,6 +323,9 @@ def _make_enable_gate_tool(gate: str, servers: list[str]):
 
 _MAX_IMAGE_PROMPT_CHARS = 1000
 _MAX_IMAGE_ALT_CHARS = 512  # Misskey's drive `comment` limit
+_MIN_POLL_CHOICES = 2
+_MAX_POLL_CHOICES = 10
+_MAX_POLL_CHOICE_CHARS = 50
 _IMAGE_ONLY_OUTPUT = "[[IMAGE_ONLY]]"
 _AUTO_IMAGE_DESCRIPTION_RE = re.compile(
     r"^\s*(?:\*\[(?P<emphasized>[^\]\r\n]+)\]\*|\[(?P<plain>[^\]\r\n]+)\])(?P<caption>[\s\S]*)$"
@@ -345,6 +348,15 @@ _AUTO_IMAGE_INSTRUCTION = f"""Image-post workflow:
   normal text-only post without an image description.
 - If you do not generate an image, output a normal text post. Never use the image-only
   marker unless generate_image succeeded.
+"""
+_AUTO_POLL_INSTRUCTION = """Poll workflow:
+- When a question would be more engaging as a poll, call create_poll before writing the
+  final post.
+- Supply 2-10 distinct choices of at most 50 characters each. Choose whether voters may
+  select multiple answers and optionally set how many minutes the poll stays open.
+- After the tool succeeds, write the final post text as a clear question or prompt for the
+  attached choices. Do not repeat the choices as a prose list.
+- Use at most one poll per post. Ordinary posts do not need to call create_poll.
 """
 
 
@@ -374,6 +386,53 @@ def _image_description_alt_text(description: str) -> str:
     if len(description) <= _MAX_IMAGE_ALT_CHARS:
         return description
     return f"{description[: _MAX_IMAGE_ALT_CHARS - 1].rstrip()}…"
+
+
+def _make_create_poll_tool():
+    """Build the auto-post-only `create_poll` tool."""
+
+    async def create_poll(
+        ctx: RunContext[AutoDeps],
+        choices: list[str],
+        multiple: bool = False,
+        duration_minutes: Optional[int] = None,
+    ) -> str:
+        """Attach a poll to this autonomous post before writing its question.
+
+        Args:
+            choices: Between 2 and 10 distinct answer choices, each at most 50 characters.
+            multiple: Whether a voter may select more than one choice.
+            duration_minutes: Minutes until voting closes, or omit for no expiration.
+        """
+        assert isinstance(ctx.deps, AutoDeps)
+        normalized = tuple(choice.strip() for choice in choices)
+        if not _MIN_POLL_CHOICES <= len(normalized) <= _MAX_POLL_CHOICES:
+            return f"Refused: a poll needs {_MIN_POLL_CHOICES}-{_MAX_POLL_CHOICES} choices; received {len(normalized)}."
+        if any(not choice for choice in normalized):
+            return "Refused: poll choices cannot be empty."
+        if any(len(choice) > _MAX_POLL_CHOICE_CHARS for choice in normalized):
+            return f"Refused: every poll choice must be at most {_MAX_POLL_CHOICE_CHARS} characters."
+        if len(set(normalized)) != len(normalized):
+            return "Refused: poll choices must be distinct."
+        if duration_minutes is not None and duration_minutes < 1:
+            return "Refused: duration_minutes must be at least 1, or omitted for no expiration."
+
+        async with ctx.deps.lock:
+            if ctx.deps.poll is not None:
+                return "A poll is already attached to this post. Do not call create_poll again."
+            ctx.deps.poll = Poll(
+                choices=normalized,
+                multiple=multiple,
+                duration_minutes=duration_minutes,
+            )
+        expiry = (
+            f" Voting will close after {duration_minutes} minutes."
+            if duration_minutes is not None
+            else " Voting will remain open indefinitely."
+        )
+        return "Poll attached. Now write the final post text as its question or prompt." + expiry
+
+    return create_poll
 
 
 def _make_generate_image_tool(generator: ImageGenerator):
@@ -540,6 +599,7 @@ class ChatAgent:
         # Auto agent runs without AgentDeps, so skip tools that touch ctx.deps
         # (social-credit tools and enable_<gate> meta-tools).
         auto_tools = build_tools(config, redis_client=None)
+        auto_tools.append(_make_create_poll_tool())
 
         async def _inject_social_credit(ctx: RunContext[AgentDeps]) -> str:
             parts: list[str] = []
@@ -592,7 +652,11 @@ class ChatAgent:
         self._auto_agent: Optional[Agent[AutoDeps, str]] = None
         self._auto_history: deque[str] = deque(maxlen=10)
         if config.system_prompt_auto:
-            auto_instructions = [config.system_prompt_auto, _length_instruction(config.max_note_length)]
+            auto_instructions = [
+                config.system_prompt_auto,
+                _length_instruction(config.max_note_length),
+                _AUTO_POLL_INSTRUCTION,
+            ]
             if config.image_gen_enabled:
                 auto_instructions.append(_AUTO_IMAGE_INSTRUCTION)
             self._auto_agent = Agent(
@@ -845,7 +909,7 @@ class ChatAgent:
 
     @logfire.instrument(extract_args=False)
     async def run_auto(self) -> AutoPost:
-        """Generate an autonomous text, image, or combined post."""
+        """Generate an autonomous text, image, poll, or combined post."""
         if not self._auto_agent:
             raise ValueError("No system_prompt_auto configured")
 
@@ -904,27 +968,41 @@ class ChatAgent:
             if deps.image is None:
                 raise ValueError("Autonomous post requested image-only output without generating an image")
             text = ""
-        if not text.strip() and deps.image is None:
-            raise ValueError("Autonomous post has neither text nor an image")
+        if not text.strip():
+            if deps.poll is not None:
+                raise ValueError("Autonomous poll has no question text")
+            if deps.image is None:
+                raise ValueError("Autonomous post has neither text nor an image")
 
         history_text = text
-        if not history_text.strip() and deps.image is not None:
+        if deps.poll is not None:
+            history_text = f"{history_text}\n[poll choices: {' | '.join(deps.poll.choices)}]"
+        elif not history_text.strip() and deps.image is not None:
             history_text = f"[image-only post: {deps.image.alt_text}]"
         self._auto_history.append(history_text)
-        # `record_return` is deliberately off: the return now carries raw image bytes, which
-        # would be base64'd into a span attribute. Log the text and a flag instead.
-        logfire.info("Generated autonomous post", text=text, has_image=deps.image is not None)
-        return AutoPost(text=text, image=deps.image)
+        # `record_return` is deliberately off: the return may carry raw image bytes, which
+        # would be base64'd into a span attribute. Log attachment flags instead.
+        logfire.info(
+            "Generated autonomous post",
+            text=text,
+            has_image=deps.image is not None,
+            has_poll=deps.poll is not None,
+        )
+        return AutoPost(text=text, image=deps.image, poll=deps.poll)
 
     @staticmethod
     def _validate_auto_output(ctx: RunContext[AutoDeps], output: str) -> str:
         """Normalize the internal image-only marker and reject contentless posts."""
         if output.strip() == _IMAGE_ONLY_OUTPUT:
+            if ctx.deps.poll is not None:
+                raise ModelRetry("A poll needs question text; do not use the image-only marker with a poll.")
             if ctx.deps.image is None:
                 raise ModelRetry(
                     f"{_IMAGE_ONLY_OUTPUT} is valid only after generate_image succeeds. Write a text post instead."
                 )
             return ""
+        if not output.strip() and ctx.deps.poll is not None:
+            raise ModelRetry("The poll has no question. Write a clear question or prompt for its choices.")
         if not output.strip() and ctx.deps.image is None:
             raise ModelRetry("The post has neither text nor an image. Write a text post or generate an image.")
         return output

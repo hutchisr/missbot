@@ -9,7 +9,7 @@ from pydantic import ValidationError
 from pydantic_ai import BinaryContent, ImageUrl
 
 from bot.bot import Bot, _image_urls_for, _user_handle
-from bot.core import AgentTurn, AutoPost
+from bot.core import AgentTurn, AutoPost, Poll
 from bot.imagegen import GeneratedImage
 from bot.models import MiFile
 
@@ -605,6 +605,58 @@ async def test_post_autonomous_posts_public_note(bot):
         "https://example.test/api/notes/create",
         json={"text": "hello timeline", "visibility": "public"},
     )
+
+
+@pytest.mark.anyio
+async def test_post_autonomous_publishes_poll(bot):
+    response = MagicMock()
+    response.json.return_value = {"createdNote": {"id": "poll-1"}}
+    poll = Poll(
+        choices=("Tea", "Coffee"),
+        multiple=True,
+        duration_minutes=30,
+    )
+
+    with (
+        patch.object(
+            bot._agent,
+            "run_auto",
+            AsyncMock(return_value=AutoPost(text="What should I drink?", poll=poll)),
+        ),
+        patch("bot.bot.api_client.post", AsyncMock(return_value=response)) as post_mock,
+    ):
+        await bot.post_autonomous()
+
+    post_mock.assert_awaited_once_with(
+        "https://example.test/api/notes/create",
+        json={
+            "text": "What should I drink?",
+            "visibility": "public",
+            "poll": {
+                "choices": ["Tea", "Coffee"],
+                "multiple": True,
+                "expiredAfter": 1_800_000,
+            },
+        },
+    )
+
+
+@pytest.mark.anyio
+async def test_post_autonomous_rejects_poll_without_question(bot):
+    poll = Poll(choices=("Tea", "Coffee"))
+
+    with (
+        patch.object(
+            bot._agent,
+            "run_auto",
+            AsyncMock(return_value=AutoPost(text="", image=_GENERATED_IMAGE, poll=poll)),
+        ),
+        patch("bot.bot.api_client.post", AsyncMock()) as post_mock,
+    ):
+        with pytest.raises(ValueError, match="poll has no question text"):
+            await bot.post_autonomous()
+
+    post_mock.assert_not_awaited()
 
 
 @pytest.mark.anyio
