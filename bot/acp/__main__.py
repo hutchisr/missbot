@@ -37,6 +37,7 @@ from ..api import api_client
 from ..memory import MemoryStore
 from ..models import Config
 from .agent import MissbotAgent
+from .session import SessionRegistry
 from .ws import DEFAULT_MOUNT_PATH, serve_acp_websocket
 
 _CONFIG_OPTION = click.option("--config", "-c", default="config.local.yaml", help="Path to the config file.")
@@ -156,29 +157,48 @@ def serve(config, host, port, mount_path, token_env):
     asyncio.run(_serve_async(config, host, port, mount_path, token_env))
 
 
+def _bearer_token_from_env(token_env: Optional[str]) -> Optional[str]:
+    """Resolve and normalize the configured bearer token without failing open."""
+    if token_env is None:
+        return None
+    bearer_token = os.environ.get(token_env)
+    if bearer_token is None or not bearer_token.strip():
+        raise click.ClickException(f"--token-env {token_env} is set but that variable is empty or missing")
+    return bearer_token.strip()
+
+
 async def _serve_async(config_path, host, port, mount_path, token_env):
     config = _load_config(config_path)
     _configure_logging(bool(config.debug))
 
-    bearer_token = os.environ.get(token_env) if token_env else None
-    if token_env and not bearer_token:
-        raise click.ClickException(f"--token-env {token_env} is set but that variable is empty or missing")
+    bearer_token = _bearer_token_from_env(token_env)
 
     async with _runtime(config) as (redis_client, memory):
         # One ChatAgent backs every connection — it owns the model chain, MCP sessions,
         # Redis, and memory. Each connection gets its own thin protocol adapter, because
         # MissbotAgent holds the client handle it pushes session updates through.
         chat_agent = ChatAgent(config, redis_client=redis_client, memory=memory)
+        sessions = SessionRegistry(
+            max_sessions=config.acp_max_sessions,
+            max_history_turns=config.acp_max_history_turns,
+        )
+        prompt_slots = asyncio.Semaphore(config.acp_max_sessions)
         stop = asyncio.Event()
         _install_shutdown(stop)
         async with chat_agent:
             serve_task = asyncio.create_task(
                 serve_acp_websocket(
-                    lambda: MissbotAgent(config=config, chat_agent=chat_agent),
+                    lambda: MissbotAgent(
+                        config=config,
+                        chat_agent=chat_agent,
+                        session_registry=sessions,
+                        prompt_semaphore=prompt_slots,
+                    ),
                     host=host,
                     port=port,
                     mount_path=mount_path,
                     bearer_token=bearer_token,
+                    max_connections=config.acp_max_sessions,
                 )
             )
             shutdown = asyncio.create_task(stop.wait())

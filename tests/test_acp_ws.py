@@ -6,12 +6,17 @@ the stream, so the round-trip is pinned here.
 """
 
 import asyncio
+import click
 
 import pytest
 
+from bot.acp.__main__ import _bearer_token_from_env
 from bot.acp.ws import (
     DEFAULT_HEALTH_PATH,
+    DEFAULT_OUTPUT_MAX_QUEUE,
+    DEFAULT_OUTPUT_MAX_SIZE,
     ServerPaths,
+    _ConnectionLimiter,
     build_metadata,
     is_authorized,
     open_stream_bridge,
@@ -23,12 +28,16 @@ class FakeWebSocket:
 
     def __init__(self, incoming=None):
         self.sent: list[str] = []
+        self.close_calls: list[tuple[int, str]] = []
         self._incoming = asyncio.Queue()
         for message in incoming or []:
             self._incoming.put_nowait(message)
 
     async def send(self, message: str) -> None:
         self.sent.append(message)
+
+    async def close(self, *, code: int, reason: str) -> None:
+        self.close_calls.append((code, reason))
 
     async def recv(self):
         return await self._incoming.get()
@@ -117,9 +126,9 @@ def test_metadata_has_every_field_the_client_reads():
 # --- auth -------------------------------------------------------------------
 
 
-def test_authorized_when_no_token_configured():
+def test_authorized_only_when_auth_is_explicitly_unconfigured():
     assert is_authorized({}, None) is True
-    assert is_authorized({}, "   ") is True
+    assert is_authorized({}, "   ") is False
 
 
 def test_authorized_with_matching_bearer():
@@ -134,6 +143,26 @@ def test_rejects_wrong_or_missing_bearer():
 
 def test_configured_token_is_stripped_before_comparison():
     assert is_authorized({"Authorization": "Bearer s3cret"}, "  s3cret  ") is True
+
+
+def test_token_env_rejects_whitespace_only_value(monkeypatch):
+    monkeypatch.setenv("ACP_TOKEN", " \n\t")
+    with pytest.raises(click.ClickException):
+        _bearer_token_from_env("ACP_TOKEN")
+
+
+def test_token_env_normalizes_valid_value(monkeypatch):
+    monkeypatch.setenv("ACP_TOKEN", "  s3cret\n")
+    assert _bearer_token_from_env("ACP_TOKEN") == "s3cret"
+
+
+def test_connection_limiter_bounds_and_releases_capacity():
+    limiter = _ConnectionLimiter(1)
+    assert limiter.try_acquire() is True
+    assert limiter.try_acquire() is False
+    limiter.release()
+    assert limiter.try_acquire() is True
+    limiter.release()
 
 
 # --- framing ----------------------------------------------------------------
@@ -219,3 +248,65 @@ async def test_round_trip_preserves_message_boundaries():
     finally:
         pump1.cancel()
         await transport1.aclose()
+
+
+@pytest.mark.anyio
+async def test_writer_rejects_output_backlog_beyond_bound():
+    ws = FakeWebSocket()
+    _reader, writer, pump, transport = open_stream_bridge(ws)
+    try:
+        payload = b"x\n" * (DEFAULT_OUTPUT_MAX_QUEUE + 1)
+        with pytest.raises(ConnectionResetError, match="backlog"):
+            writer.write(payload)
+        await asyncio.sleep(0)
+        assert ws.close_calls == [(1013, "ACP output backlog exceeded")]
+    finally:
+        pump.cancel()
+        await transport.aclose()
+
+
+@pytest.mark.anyio
+async def test_writer_rejects_oversized_partial_frame():
+    ws = FakeWebSocket()
+    _reader, writer, pump, transport = open_stream_bridge(ws)
+    try:
+        with pytest.raises(ConnectionResetError, match="size limit"):
+            writer.write(b"x" * (DEFAULT_OUTPUT_MAX_SIZE + 1))
+        await asyncio.sleep(0)
+        assert ws.close_calls == [(1013, "ACP output frame exceeds the size limit")]
+    finally:
+        pump.cancel()
+        await transport.aclose()
+
+
+@pytest.mark.anyio
+async def test_writer_drain_waits_for_backlog_capacity():
+    class BlockingWebSocket(FakeWebSocket):
+        def __init__(self):
+            super().__init__()
+            self.send_started = asyncio.Event()
+            self.release_send = asyncio.Event()
+
+        async def send(self, message: str) -> None:
+            self.send_started.set()
+            await self.release_send.wait()
+            await super().send(message)
+
+        async def close(self, *, code: int, reason: str) -> None:
+            self.release_send.set()
+            await super().close(code=code, reason=reason)
+
+    ws = BlockingWebSocket()
+    _reader, writer, pump, transport = open_stream_bridge(ws)
+    try:
+        writer.write(b"blocked\n")
+        await ws.send_started.wait()
+        writer.write(b"queued\n" * DEFAULT_OUTPUT_MAX_QUEUE)
+        drain = asyncio.create_task(writer.drain())
+        await asyncio.sleep(0)
+        assert not drain.done()
+        ws.release_send.set()
+        await drain
+    finally:
+        pump.cancel()
+        await transport.aclose()

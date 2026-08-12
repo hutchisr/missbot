@@ -436,8 +436,14 @@ class Config(BaseModel):
     acp_max_sessions: int = Field(
         default=8,
         gt=0,
-        description="Maximum concurrent ACP sessions. Bounds provider, Redis, and memory load "
-        "the same way max_concurrent_handlers does for Misskey.",
+        description="Shared cap for ACP WebSocket connections, sessions, and concurrent prompts. "
+        "Bounds provider, Redis, and memory load across all clients.",
+    )
+    acp_max_prompt_chars: int = Field(
+        default=65536,
+        gt=0,
+        description="Maximum aggregate text characters accepted in one ACP prompt before "
+        "provider, scoring, or memory work begins.",
     )
     memory_enabled: bool = Field(
         default=False,

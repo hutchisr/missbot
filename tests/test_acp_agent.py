@@ -94,6 +94,17 @@ async def test_close_session_frees_capacity(make_config):
 
 
 @pytest.mark.anyio
+async def test_session_limit_is_shared_across_websocket_adapters(config):
+    registry = SessionRegistry(max_sessions=1, max_history_turns=config.acp_max_history_turns)
+    first = MissbotAgent(config=config, session_registry=registry)
+    second = MissbotAgent(config=config, chat_agent=first._agent, session_registry=registry)
+
+    await _new_session(first)
+    with pytest.raises(acp.RequestError):
+        await _new_session(second)
+
+
+@pytest.mark.anyio
 async def test_prompt_on_unknown_session_is_invalid_params(agent):
     with pytest.raises(acp.RequestError):
         await agent.prompt(session_id="nope", prompt=[_text("hi")])
@@ -194,6 +205,72 @@ async def test_prompt_with_no_text_blocks_ends_turn(agent):
 
     assert resp.stop_reason == "end_turn"
     run_mock.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_prompt_rejects_oversized_aggregate_text(make_config):
+    agent = MissbotAgent(config=make_config(acp_max_prompt_chars=5))
+    session_id = await _new_session(agent)
+
+    with patch.object(agent._agent, "run", AsyncMock()) as run_mock:
+        with pytest.raises(acp.RequestError):
+            await agent.prompt(session_id=session_id, prompt=[_text("abc"), _text("de")])
+
+    run_mock.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_prompt_rejects_overlapping_turn_on_same_session(agent):
+    session_id = await _new_session(agent)
+    started = asyncio.Event()
+
+    async def slow_run(_turn):
+        started.set()
+        await asyncio.sleep(30)
+
+    with patch.object(agent._agent, "run", AsyncMock(side_effect=slow_run)):
+        first = asyncio.create_task(agent.prompt(session_id=session_id, prompt=[_text("first")]))
+        await started.wait()
+        with pytest.raises(acp.RequestError):
+            await agent.prompt(session_id=session_id, prompt=[_text("second")])
+        await agent.cancel(session_id)
+        assert (await first).stop_reason == "cancelled"
+
+
+@pytest.mark.anyio
+async def test_prompt_semaphore_is_shared_across_adapters(config):
+    registry = SessionRegistry(max_sessions=2, max_history_turns=config.acp_max_history_turns)
+    prompt_slots = asyncio.Semaphore(1)
+    first = MissbotAgent(config=config, session_registry=registry, prompt_semaphore=prompt_slots)
+    second = MissbotAgent(
+        config=config,
+        chat_agent=first._agent,
+        session_registry=registry,
+        prompt_semaphore=prompt_slots,
+    )
+    first_session = await _new_session(first)
+    second_session = await _new_session(second)
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def controlled_run(turn):
+        if turn.source_id == f"acp:{first_session}":
+            first_started.set()
+            await release_first.wait()
+        else:
+            second_started.set()
+        return "ok"
+
+    with patch.object(first._agent, "run", AsyncMock(side_effect=controlled_run)):
+        first_prompt = asyncio.create_task(first.prompt(session_id=first_session, prompt=[_text("first")]))
+        await first_started.wait()
+        second_prompt = asyncio.create_task(second.prompt(session_id=second_session, prompt=[_text("second")]))
+        await asyncio.sleep(0)
+        assert not second_started.is_set()
+        release_first.set()
+        await first_prompt
+        await second_prompt
 
 
 # --- social credit floor ----------------------------------------------------
@@ -308,6 +385,22 @@ async def test_cancel_stops_in_flight_turn(agent):
 
     # ACP requires the pending prompt to answer, not raise.
     assert resp.stop_reason == "cancelled"
+
+
+@pytest.mark.anyio
+async def test_close_session_awaits_in_flight_turn_cancellation(agent):
+    session_id = await _new_session(agent)
+    started = asyncio.Event()
+
+    async def slow_run(_turn):
+        started.set()
+        await asyncio.sleep(30)
+
+    with patch.object(agent._agent, "run", AsyncMock(side_effect=slow_run)):
+        prompt_task = asyncio.create_task(agent.prompt(session_id=session_id, prompt=[_text("wait")]))
+        await started.wait()
+        await agent.close_session(session_id)
+        assert (await prompt_task).stop_reason == "cancelled"
 
 
 @pytest.mark.anyio

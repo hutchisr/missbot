@@ -27,8 +27,9 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
+from contextlib import suppress
 from http import HTTPStatus
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, NoReturn, Optional
 
 import logfire
 from websockets.asyncio.server import ServerConnection, serve
@@ -43,6 +44,9 @@ DEFAULT_HEALTH_PATH = "/healthz"
 # acpremote's DEFAULT_MAX_MESSAGE_SIZE / DEFAULT_MAX_QUEUE.
 DEFAULT_MAX_SIZE = 16 * 1024 * 1024
 DEFAULT_MAX_QUEUE = 32
+DEFAULT_OUTPUT_MAX_SIZE = 1024 * 1024
+DEFAULT_OUTPUT_MAX_QUEUE = 8
+DEFAULT_MAX_CONNECTIONS = 8
 
 # Transport contract version we implement (acpremote's TransportMetadata).
 _TRANSPORT_KIND = "websocket"
@@ -95,36 +99,61 @@ def build_metadata(*, paths: ServerPaths, auth_required: bool) -> dict[str, Any]
 
 
 def is_authorized(headers: Any, token: Optional[str]) -> bool:
-    """Constant-shape bearer check matching acpremote's `is_bearer_authorized`."""
-    if token is None or not token.strip():
+    """Check bearer authorization, failing closed for invalid configured tokens."""
+    if token is None:
         return True
-    return headers.get("Authorization") == f"Bearer {token.strip()}"
+    normalized = token.strip()
+    if not normalized:
+        return False
+    return headers.get("Authorization") == f"Bearer {normalized}"
 
 
 class _FrameWriterTransport(asyncio.Transport):
-    """Turns the SDK's newline-delimited writes into one text frame per message."""
+    """Turns newline-delimited SDK writes into bounded WebSocket frames."""
 
     def __init__(self, websocket: Any, loop: asyncio.AbstractEventLoop):
         super().__init__()
         self._websocket = websocket
         self._loop = loop
         self._buffer = bytearray()
-        self._pending: asyncio.Queue[Optional[str]] = asyncio.Queue()
+        # One reserved slot ensures close() can always enqueue its sentinel.
+        self._pending: asyncio.Queue[Optional[str]] = asyncio.Queue(maxsize=DEFAULT_OUTPUT_MAX_QUEUE + 1)
+        self._writable = asyncio.Event()
+        self._writable.set()
         self._closed = False
+        self._error: Optional[ConnectionResetError] = None
+        self._protocol: Optional[asyncio.BaseProtocol] = None
+        self._websocket_close: Optional[asyncio.Task[Any]] = None
         self._sender = loop.create_task(self._sender_loop())
+
+    def set_protocol(self, protocol: asyncio.BaseProtocol) -> None:
+        self._protocol = protocol
+
+    def get_protocol(self) -> asyncio.BaseProtocol:
+        if self._protocol is None:
+            raise RuntimeError("writer protocol has not been set")
+        return self._protocol
 
     def write(self, data: Any) -> None:
         if self._closed:
-            raise ConnectionResetError("transport is closing")
+            raise self._error or ConnectionResetError("transport is closing")
         self._buffer.extend(bytes(data))
         while True:
             newline = self._buffer.find(b"\n")
             if newline < 0:
+                if len(self._buffer) > DEFAULT_OUTPUT_MAX_SIZE:
+                    self._fail("ACP output frame exceeds the size limit")
                 return
+            if newline > DEFAULT_OUTPUT_MAX_SIZE:
+                self._fail("ACP output frame exceeds the size limit")
             line = bytes(self._buffer[:newline])
             del self._buffer[: newline + 1]
+            if self._pending.qsize() >= DEFAULT_OUTPUT_MAX_QUEUE:
+                self._fail("ACP output backlog exceeded")
             # Strip the framing newline: the frame boundary *is* the message boundary.
             self._pending.put_nowait(line.decode("utf-8"))
+            if self._pending.qsize() >= DEFAULT_OUTPUT_MAX_QUEUE:
+                self._writable.clear()
 
     def writelines(self, list_of_data: Iterable[Any]) -> None:
         for line in list_of_data:
@@ -143,14 +172,38 @@ class _FrameWriterTransport(asyncio.Transport):
         if self._closed:
             return
         self._closed = True
+        self._writable.set()
         self._pending.put_nowait(None)
+        if self._protocol is not None:
+            self._protocol.connection_lost(self._error)
+
+    def abort(self) -> None:
+        with suppress(ConnectionResetError):
+            self._fail("ACP output transport aborted")
 
     def get_extra_info(self, name: str, default: Any = None) -> Any:
         return default
 
+    async def wait_writable(self) -> None:
+        await self._writable.wait()
+        if self._error is not None:
+            raise self._error
+        if self._closed:
+            raise ConnectionResetError("transport is closing")
+
+    def _fail(self, reason: str) -> NoReturn:
+        self._error = ConnectionResetError(reason)
+        self._buffer.clear()
+        self.close()
+        if self._websocket_close is None:
+            self._websocket_close = self._loop.create_task(self._websocket.close(code=1013, reason=reason))
+        raise self._error
+
     async def _sender_loop(self) -> None:
         while True:
             payload = await self._pending.get()
+            if self._pending.qsize() < DEFAULT_OUTPUT_MAX_QUEUE:
+                self._writable.set()
             if payload is None:
                 return
             try:
@@ -160,17 +213,26 @@ class _FrameWriterTransport(asyncio.Transport):
 
     async def aclose(self) -> None:
         self.close()
-        await self._sender
+        try:
+            await asyncio.wait_for(self._sender, timeout=5)
+        except TimeoutError:
+            self._sender.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._sender
+        if self._websocket_close is not None:
+            with suppress(ConnectionClosed, RuntimeError):
+                await self._websocket_close
 
 
 class _WriterProtocol(asyncio.Protocol):
-    """Minimal protocol so `asyncio.StreamWriter.drain()` works over the frame transport."""
+    """Minimal protocol providing real drain backpressure over the frame transport."""
 
-    def __init__(self, loop: asyncio.AbstractEventLoop):
+    def __init__(self, loop: asyncio.AbstractEventLoop, transport: _FrameWriterTransport):
         self._closed: asyncio.Future[None] = loop.create_future()
+        self._transport = transport
 
     async def _drain_helper(self) -> None:
-        return None
+        await self._transport.wait_writable()
 
     def _get_close_waiter(self, stream: Any) -> Any:
         return self._closed
@@ -205,11 +267,33 @@ def open_stream_bridge(
     """Adapt a WebSocket into the reader/writer pair the ACP SDK's `Connection` expects."""
     loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader(limit=DEFAULT_MAX_SIZE)
-    protocol = _WriterProtocol(loop)
     transport = _FrameWriterTransport(websocket, loop)
+    protocol = _WriterProtocol(loop, transport)
+    transport.set_protocol(protocol)
     writer = asyncio.StreamWriter(transport, protocol, reader, loop)
     pump = loop.create_task(_pump_frames(websocket, reader))
     return reader, writer, pump, transport
+
+
+class _ConnectionLimiter:
+    """Single-event-loop admission counter for live WebSocket connections."""
+
+    def __init__(self, limit: int):
+        if limit <= 0:
+            raise ValueError("max_connections must be positive")
+        self._limit = limit
+        self._active = 0
+
+    def try_acquire(self) -> bool:
+        if self._active >= self._limit:
+            return False
+        self._active += 1
+        return True
+
+    def release(self) -> None:
+        if self._active <= 0:
+            raise RuntimeError("ACP connection limit released without an active connection")
+        self._active -= 1
 
 
 async def serve_acp_websocket(
@@ -219,6 +303,7 @@ async def serve_acp_websocket(
     port: int,
     mount_path: str = DEFAULT_MOUNT_PATH,
     bearer_token: Optional[str] = None,
+    max_connections: int = DEFAULT_MAX_CONNECTIONS,
 ) -> None:
     """Serve ACP over WebSocket until cancelled.
 
@@ -230,8 +315,13 @@ async def serve_acp_websocket(
     from acp.agent.connection import AgentSideConnection
 
     paths = ServerPaths.from_mount(mount_path)
-    auth_required = bool(bearer_token and bearer_token.strip())
+    if bearer_token is not None:
+        bearer_token = bearer_token.strip()
+        if not bearer_token:
+            raise ValueError("bearer_token must be nonempty when configured")
+    auth_required = bearer_token is not None
     metadata_text = json.dumps(build_metadata(paths=paths, auth_required=auth_required))
+    connection_limiter = _ConnectionLimiter(max_connections)
 
     def process_request(connection: ServerConnection, request: Any):
         """Answer the HTTP routes; bearer auth gates the WebSocket upgrade only.
@@ -260,22 +350,32 @@ async def serve_acp_websocket(
 
     async def handler(websocket: ServerConnection) -> None:
         peer = websocket.remote_address
+        if not connection_limiter.try_acquire():
+            logfire.warning("ACP WebSocket connection rejected (connection limit)", peer=str(peer))
+            await websocket.close(code=1013, reason="ACP connection limit reached")
+            return
+
         logfire.info("ACP WebSocket connected", peer=str(peer))
-        reader, writer, pump, transport = open_stream_bridge(websocket)
-        agent = agent_factory()
-        # `listening=False` then `listen()` — matching acp.run_agent. Letting the
-        # constructor start its own receive loop as well would put two coroutines on
-        # the same reader ("readuntil() called while another coroutine is already
-        # waiting for incoming data") and fail every request.
-        connection = AgentSideConnection(lambda _conn: agent, writer, reader, listening=False)
         try:
-            await connection.listen()
-        except ConnectionClosed:
-            pass
+            reader, writer, pump, transport = open_stream_bridge(websocket)
+            agent = agent_factory()
+            async with agent:
+                # `listening=False` then `listen()` — matching acp.run_agent. Letting
+                # the constructor start its own receive loop as well would make two
+                # coroutines read the same stream and fail every request.
+                connection = AgentSideConnection(lambda _conn: agent, writer, reader, listening=False)
+                try:
+                    await connection.listen()
+                except ConnectionClosed:
+                    pass
+                finally:
+                    pump.cancel()
+                    try:
+                        await asyncio.shield(connection.close())
+                    finally:
+                        await transport.aclose()
         finally:
-            pump.cancel()
-            await asyncio.shield(connection.close())
-            await transport.aclose()
+            connection_limiter.release()
             logfire.info("ACP WebSocket disconnected", peer=str(peer))
 
     async with serve(
