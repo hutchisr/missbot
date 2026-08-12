@@ -3,8 +3,8 @@
 import json
 import secrets
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
-from typing import Optional, cast
+from datetime import UTC, datetime
+from typing import cast
 from urllib.parse import urlparse
 
 import httpx
@@ -14,7 +14,6 @@ from redis.asyncio import Redis
 
 from .memory import MemorySearchResult, MemoryStore
 from .models import Config
-
 
 _HEARSAY_MEMORY_SOURCES = frozenset({"misskey_note", "acp_prompt"})
 
@@ -74,7 +73,7 @@ def _render_memory_result(result: MemorySearchResult, trusted_user_ids: frozense
     return f"- {result.memory}{suffix}"
 
 
-def _domain_of(url: str) -> Optional[str]:
+def _domain_of(url: str) -> str | None:
     """Extract a normalized hostname from a URL, for use as a web source name.
 
     Returns None when there's no parseable host (so a result with no usable
@@ -84,8 +83,7 @@ def _domain_of(url: str) -> Optional[str]:
         host = (urlparse(url).hostname or "").lower()
     except ValueError:
         return None
-    if host.startswith("www."):
-        host = host[4:]
+    host = host.removeprefix("www.")
     return host or None
 
 
@@ -97,8 +95,7 @@ def current_datetime() -> str:
 def normalize_username(username: str) -> str:
     """Normalize a handle to lowercase and drop a leading '@'."""
     username = username.strip().lower()
-    if username.startswith("@"):
-        username = username[1:]
+    username = username.removeprefix("@")
     return username
 
 
@@ -114,7 +111,7 @@ async def apply_social_credit(redis: Redis, username: str, amount: int, reason: 
         {
             "amount": amount,
             "reason": reason,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
         }
     )
     history_key = f"history:{username}"
@@ -130,8 +127,8 @@ async def apply_social_credit(redis: Redis, username: str, amount: int, reason: 
 
 def build_tools(
     config: Config,
-    redis_client: Optional[Redis] = None,
-    memory: Optional[MemoryStore] = None,
+    redis_client: Redis | None = None,
+    memory: MemoryStore | None = None,
 ) -> list[Callable[..., object]]:
     """Create tool functions for the given config.
 
@@ -148,9 +145,9 @@ def build_tools(
     if config.searxng_url:
 
         @logfire.instrument()
-        async def search_web(query: str) -> Optional[str]:
+        async def search_web(query: str) -> str | None:
             """Search the web for information."""
-            auth: Optional[httpx.BasicAuth] = None
+            auth: httpx.BasicAuth | None = None
             if config.searxng_user and config.searxng_password:
                 auth = httpx.BasicAuth(config.searxng_user, config.searxng_password)
             transport = httpx.AsyncHTTPTransport(retries=config.max_retries)
@@ -180,7 +177,7 @@ def build_tools(
         tools.append(search_web)
 
     @logfire.instrument()
-    def search_users(query: str, limit: int = 10, offset: int = 0) -> Optional[str]:
+    def search_users(query: str, limit: int = 10, offset: int = 0) -> str | None:
         """Search for users on this Misskey instance by username or display name.
 
         Args:
@@ -218,7 +215,7 @@ def build_tools(
                 return None
 
     @logfire.instrument()
-    def search_notes(query: str, limit: int = 10, offset: int = 0) -> Optional[str]:
+    def search_notes(query: str, limit: int = 10, offset: int = 0) -> str | None:
         """Search for notes/posts on this Misskey instance.
 
         Args:

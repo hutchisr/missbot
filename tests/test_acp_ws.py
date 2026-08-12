@@ -6,8 +6,8 @@ the stream, so the round-trip is pinned here.
 """
 
 import asyncio
-import click
 
+import click
 import pytest
 
 from bot.acp.__main__ import _bearer_token_from_env

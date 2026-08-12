@@ -1,7 +1,7 @@
 """Tests for mem0 maintenance selection and CLI wiring."""
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -10,8 +10,7 @@ from click.testing import CliRunner
 from bot.maintenance import VectorRecord, cleanup, cli, plan_cleanup, reembed
 from bot.memory import StoredMemory
 
-
-NOW = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 17, 12, 0, tzinfo=UTC)
 
 
 def _memory(
@@ -228,10 +227,9 @@ async def test_reembed_refuses_wrong_endpoint_dimension(make_config):
 
     with (
         patch("bot.maintenance._load_vector_records", return_value=_vector_records()),
-        patch("bot.maintenance._replace_vectors") as replace_vectors,
+        patch("bot.maintenance._replace_vectors") as replace_vectors,pytest.raises(ValueError, match="dimension 768")
     ):
-        with pytest.raises(ValueError, match="dimension 768"):
-            await reembed(store, config)
+        await reembed(store, config)
 
     replace_vectors.assert_not_called()
 

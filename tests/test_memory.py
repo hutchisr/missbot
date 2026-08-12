@@ -1,7 +1,7 @@
 """Tests for the mem0 MemoryStore adapter."""
 
 import os
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -269,7 +269,7 @@ async def test_add_note_scopes_to_bot_agent_and_records_author(make_config):
         "author_user_id": "user-123",
         "source_note_id": "note-1",
     }
-    assert date.fromisoformat(kwargs["expiration_date"]) == datetime.now(timezone.utc).date() + timedelta(days=90)
+    assert date.fromisoformat(kwargs["expiration_date"]) == datetime.now(UTC).date() + timedelta(days=90)
     assert client.add.await_args.args[0][0]["content"] == "Alice@Remote.Example: I use Arch btw"
 
 

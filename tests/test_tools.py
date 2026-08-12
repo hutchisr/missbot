@@ -1,11 +1,10 @@
 """Tests for bot.tools."""
 
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from unittest.mock import patch
 
 from bot.memory import MemorySearchResult
 from bot.tools import build_tools, current_datetime

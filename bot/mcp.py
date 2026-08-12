@@ -31,35 +31,33 @@ def _make_allow_block_filter(cfg: MCPServerConfig):
     blocked = set(cfg.blocked_tools)
     prefix = cfg.tool_prefix
 
-    def _filter(ctx: RunContext["AgentDeps"], tool_def: ToolDefinition) -> bool:
+    def _filter(ctx: RunContext[AgentDeps], tool_def: ToolDefinition) -> bool:
         name = _strip_prefix(tool_def.name, prefix)
         if allowed is not None and name not in allowed:
             return False
-        if name in blocked:
-            return False
-        return True
+        return name not in blocked
 
     return _filter
 
 
 def _make_gate_filter(gate: str):
-    def _filter(ctx: RunContext["AgentDeps"], tool_def: ToolDefinition) -> bool:
+    def _filter(ctx: RunContext[AgentDeps], tool_def: ToolDefinition) -> bool:
         enabled = getattr(ctx.deps, "enabled_gates", None)
         return enabled is not None and gate in enabled
 
     return _filter
 
 
-def build_mcp_toolsets(config: Config) -> list[AbstractToolset["AgentDeps"]]:
+def build_mcp_toolsets(config: Config) -> list[AbstractToolset[AgentDeps]]:
     """Build filtered MCP toolsets for every enabled server in ``config.mcp_servers``."""
-    toolsets: list[AbstractToolset["AgentDeps"]] = []
+    toolsets: list[AbstractToolset[AgentDeps]] = []
     for cfg in config.mcp_servers:
         if not cfg.enabled:
             continue
         # MCPToolset has no tool_prefix arg; apply the prefix via .prefixed() (same
         # ``{prefix}_`` scheme the old server used and that _strip_prefix expects). The
         # prefix must wrap before the filters so they see the prefixed tool names.
-        server: AbstractToolset["AgentDeps"] = MCPToolset(
+        server: AbstractToolset[AgentDeps] = MCPToolset(
             str(cfg.url),
             headers=cfg.headers or None,
             init_timeout=cfg.timeout,

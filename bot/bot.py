@@ -1,21 +1,22 @@
+import asyncio
 import json
 import random
 import re
 import time
-
-import asyncio
 from collections import deque
 from collections.abc import Callable, Coroutine
-from typing import Any, Optional
+from typing import Any
+
+import httpx
+import logfire
 from pydantic import ValidationError
 from pydantic_ai import BinaryContent, ImageUrl
 from redis.asyncio import Redis
 from websockets import ClientConnection, ConnectionClosed
 from websockets.asyncio.client import connect
-import httpx
-import logfire
 
 from .ai import ChatAgent
+from .api import api_client
 from .core import AgentTurn, HistoryTurn, TurnAuthor, TurnImage
 from .imagegen import GeneratedImage
 from .memory import MemoryStore
@@ -29,8 +30,6 @@ from .models import (
     User,
 )
 from .net import fetch_image, is_safe_media_url
-from .api import api_client
-
 
 _REDIS_AUTO_REPLY_KEY = "global:last_auto_reply_time"
 _RECENT_NOTE_ID_LIMIT = 1024
@@ -104,15 +103,15 @@ class Bot:
     def __init__(
         self,
         config: Config,
-        redis_client: Optional[Redis] = None,
-        memory: Optional[MemoryStore] = None,
+        redis_client: Redis | None = None,
+        memory: MemoryStore | None = None,
     ):
         self.url = config.url
         self.ws_url = config.ws_url
         self.api_key = config.token
         self.username = config.bot_username
         self.user_id = config.bot_user_id
-        self.ws: Optional[ClientConnection] = None
+        self.ws: ClientConnection | None = None
 
         self._config = config
         self._redis = redis_client
@@ -257,7 +256,7 @@ class Bot:
     async def send_note(
         self,
         output: str,
-        in_reply_to: Optional[Note] = None,
+        in_reply_to: Note | None = None,
     ):
         mentions = await self._build_mentions_from_note(in_reply_to)
         text = self._strip_leading_mentions(output)
@@ -302,7 +301,7 @@ class Bot:
             return True
         return bool(_image_urls_for(note, self._config.vision))
 
-    def _reply_visibility(self, note: Optional[Note]) -> str:
+    def _reply_visibility(self, note: Note | None) -> str:
         # "followers" is relative to the author. Reusing it on a bot-authored
         # reply could expose the response to the bot's followers while hiding it
         # from the source author, so narrow followers-only replies to that author.
@@ -312,7 +311,7 @@ class Bot:
             return note.visibility
         return "public"
 
-    def _reply_visible_user_ids(self, note: Optional[Note]) -> list[str]:
+    def _reply_visible_user_ids(self, note: Note | None) -> list[str]:
         if not note or note.visibility not in {"followers", "specified"}:
             return []
 
@@ -328,7 +327,7 @@ class Bot:
         # The bot is the author of the reply, not a recipient.
         return self._unique_ordered([user_id for user_id in recipients if user_id and user_id != self.user_id])
 
-    async def _build_mentions_from_note(self, note: Optional[Note]) -> list[str]:
+    async def _build_mentions_from_note(self, note: Note | None) -> list[str]:
         if not note or not note.user:
             return []
 
@@ -356,7 +355,7 @@ class Bot:
         mentions.append(self._format_handle(note.user))
         return self._unique_ordered(mentions)
 
-    async def _normalize_note_mention(self, mention: str) -> Optional[str]:
+    async def _normalize_note_mention(self, mention: str) -> str | None:
         raw = mention.strip()
         if not raw:
             return None
@@ -374,7 +373,7 @@ class Bot:
         resolved = await self._resolve_user_handle(raw)
         return resolved or f"@{raw}"
 
-    async def _resolve_user_handle(self, user_id: str) -> Optional[str]:
+    async def _resolve_user_handle(self, user_id: str) -> str | None:
         try:
             response = await api_client.post(
                 f"{self.url}api/users/show",
@@ -440,7 +439,7 @@ class Bot:
         return True
 
     @logfire.instrument(extract_args=False)
-    async def _upload_image(self, image: GeneratedImage) -> Optional[str]:
+    async def _upload_image(self, image: GeneratedImage) -> str | None:
         """Upload a generated image to the bot's drive; return its file id, or None.
 
         Fail-soft on purpose: an upload failure costs the image, not the post. Note that
@@ -535,7 +534,7 @@ class Bot:
                     timeout=float(max(delay, 1)),
                 )
                 break  # shutdown event fired
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
             if self._shutdown_event.is_set():
                 break
@@ -557,7 +556,7 @@ class Bot:
                 await self._cancel_background_tasks()
 
     async def _run_loop(self):
-        auto_post_task: Optional[asyncio.Task] = None
+        auto_post_task: asyncio.Task | None = None
         if self._config.auto_post_interval:
             auto_post_task = asyncio.create_task(self._auto_post_loop())
 
@@ -643,7 +642,6 @@ class Bot:
                         )
             except ValidationError as e:
                 logfire.debug(f"Validation error: {e}. Message doesn't match expected format, ignoring.")
-                pass
             except asyncio.CancelledError:
                 logfire.info("Message handler cancelled")
                 raise
@@ -702,7 +700,7 @@ class Bot:
         coro_factory: Callable[[], Coroutine[Any, Any, Any]],
         *,
         note_id: str,
-    ) -> Optional[asyncio.Task[Any]]:
+    ) -> asyncio.Task[Any] | None:
         """Create a tracked handler task, dropping work above the configured bound."""
         capacity = self._config.max_concurrent_handlers
         if len(self._background_tasks) >= capacity:

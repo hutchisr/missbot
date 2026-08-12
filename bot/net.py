@@ -15,7 +15,6 @@ allowlist if your instance proxies all media.
 
 import ipaddress
 import socket
-from typing import Optional
 from urllib.parse import urlsplit
 
 import httpx
@@ -79,9 +78,7 @@ def is_safe_media_url(url: str) -> bool:
     if "." not in host:
         return False
     # Numeric-only hosts that neither parser accepted are still suspicious obfuscated IPs.
-    if all(ch in "0123456789." for ch in host):
-        return False
-    return True
+    return not all(ch in "0123456789." for ch in host)
 
 
 async def fetch_image(
@@ -89,8 +86,8 @@ async def fetch_image(
     *,
     timeout: float,
     max_bytes: int,
-    transport: Optional[httpx.AsyncBaseTransport] = None,
-) -> Optional[tuple[bytes, str]]:
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> tuple[bytes, str] | None:
     """Download an image so it can be sent inline as base64, or None if unusable.
 
     Some OpenAI-compatible providers refuse image URLs and require the bytes inline

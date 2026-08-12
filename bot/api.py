@@ -1,6 +1,6 @@
 import asyncio
 import threading
-from typing import Optional, cast, TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import httpx
 import logfire
@@ -13,7 +13,6 @@ from tenacity import (
 )
 
 from .models import Config
-
 
 _RETRY_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 _RETRY_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
@@ -93,8 +92,8 @@ class RetryTransport(httpx.AsyncBaseTransport):
 
 class ApiClient:
     def __init__(self):
-        self.__async_client: Optional[httpx.AsyncClient] = None
-        self.__config: Optional[Config] = None
+        self.__async_client: httpx.AsyncClient | None = None
+        self.__config: Config | None = None
         self.__lock = threading.Lock()
 
     @property

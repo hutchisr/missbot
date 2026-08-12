@@ -6,7 +6,6 @@ from typing import Any
 
 import pytest
 from fakeredis import FakeAsyncRedis
-
 from pydantic_ai import ImageUrl
 
 from bot.core import AgentTurn, HistoryTurn, TurnAuthor

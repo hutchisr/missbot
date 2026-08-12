@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from typing import Any, Iterator, Literal, Optional, Union, cast
+from datetime import UTC, datetime, timedelta
+from typing import Any, Literal, cast
 
 import logfire
 
@@ -18,7 +19,7 @@ from .provider import provider_request_headers
 # operator explicitly opts in before process start.
 os.environ.setdefault("MEM0_TELEMETRY", "False")
 
-from mem0 import AsyncMemory  # noqa: E402
+from mem0 import AsyncMemory
 
 
 @dataclass
@@ -26,13 +27,13 @@ class MemorySearchResult:
     """A memory returned by mem0 search."""
 
     memory: str
-    score: Optional[float] = None
-    created_at: Optional[str] = None
-    updated_at: Optional[str] = None
+    score: float | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_mem0(cls, item: dict[str, Any]) -> "MemorySearchResult":
+    def from_mem0(cls, item: dict[str, Any]) -> MemorySearchResult:
         return cls(
             memory=str(item.get("memory") or ""),
             score=item.get("score"),
@@ -48,13 +49,13 @@ class StoredMemory:
 
     id: str
     memory: str
-    created_at: Optional[str] = None
-    updated_at: Optional[str] = None
-    expiration_date: Optional[str] = None
+    created_at: str | None = None
+    updated_at: str | None = None
+    expiration_date: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_mem0(cls, item: dict[str, Any]) -> "StoredMemory":
+    def from_mem0(cls, item: dict[str, Any]) -> StoredMemory:
         return cls(
             id=str(item.get("id") or ""),
             memory=str(item.get("memory") or ""),
@@ -72,14 +73,14 @@ def _strip_model_provider(model: str) -> str:
     return model.split(":", 1)[1]
 
 
-def _first_model_name(specs: list[Union[str, ModelSpec]]) -> str:
+def _first_model_name(specs: list[str | ModelSpec]) -> str:
     first = specs[0]
     if isinstance(first, str):
         return _strip_model_provider(first)
     return _strip_model_provider(first.model)
 
 
-def _api_key(value: Optional[str], env_name: Optional[str]) -> Optional[str]:
+def _api_key(value: str | None, env_name: str | None) -> str | None:
     if value:
         return value
     if env_name:
@@ -89,8 +90,7 @@ def _api_key(value: Optional[str], env_name: Optional[str]) -> Optional[str]:
 
 def _normalize_username(username: str) -> str:
     username = username.strip().lower()
-    if username.startswith("@"):
-        username = username[1:]
+    username = username.removeprefix("@")
     return username
 
 
@@ -98,7 +98,7 @@ _OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 _OPENROUTER_ENV_VAR = "OPENROUTER_API_KEY"
 
 
-def _default_memory_llm(config: Config) -> tuple[str, str, Optional[str]]:
+def _default_memory_llm(config: Config) -> tuple[str, str, str | None]:
     """Resolve the first reply model as one endpoint/credential tuple."""
     first = config.llm_models[0]
     if isinstance(first, ModelSpec) and first.base_url is not None:
@@ -106,7 +106,7 @@ def _default_memory_llm(config: Config) -> tuple[str, str, Optional[str]]:
     return _first_model_name(config.llm_models), _OPENROUTER_BASE_URL, os.environ.get(_OPENROUTER_ENV_VAR)
 
 
-def _memory_llm_connection(config: Config) -> tuple[str, str, Optional[str]]:
+def _memory_llm_connection(config: Config) -> tuple[str, str, str | None]:
     """Apply explicit memory overrides without leaking credentials across endpoints."""
     default_model, default_base_url, default_key = _default_memory_llm(config)
     model = config.memory_llm_model or default_model
@@ -237,7 +237,7 @@ class MemoryStore:
         self._agent_id = _normalize_username(config.bot_username)
 
     @classmethod
-    async def create(cls, config: Config) -> "MemoryStore":
+    async def create(cls, config: Config) -> MemoryStore:
         mem0_config = _mem0_config(config)
         with _suppress_openrouter_autodetect():
             client = AsyncMemory.from_config(mem0_config)
@@ -259,8 +259,8 @@ class MemoryStore:
         *,
         text: str,
         author: str,
-        author_user_id: Optional[str] = None,
-        note_id: Optional[str] = None,
+        author_user_id: str | None = None,
+        note_id: str | None = None,
         source: str = "misskey_note",
     ) -> dict[str, Any]:
         metadata: dict[str, Any] = {
@@ -276,7 +276,7 @@ class MemoryStore:
         expiration_date = None
         if self._config.memory_note_retention_days is not None:
             expiration_date = (
-                datetime.now(timezone.utc).date() + timedelta(days=self._config.memory_note_retention_days)
+                datetime.now(UTC).date() + timedelta(days=self._config.memory_note_retention_days)
             ).isoformat()
         return await self._client.add(
             [{"role": "user", "content": f"{author}: {text}"}],

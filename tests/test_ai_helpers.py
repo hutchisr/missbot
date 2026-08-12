@@ -13,13 +13,13 @@ from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
 from pydantic_ai.settings import ModelSettings
 
 from bot.ai import (
+    _CLASSIFIER_MODEL_SETTINGS,
     AgentDeps,
     ChatAgent,
-    _CLASSIFIER_MODEL_SETTINGS,
-    _ModelSettingsWrapper,
     _enforce_length,
     _history_content,
     _model_chain,
+    _ModelSettingsWrapper,
     _normalize_for_repeat,
     _resolve_model_spec,
     _spec_supports_vision,

@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Optional
 from uuid import uuid4
 
 from ..core import HistoryTurn
@@ -24,7 +23,7 @@ class AcpSession:
     id: str
     max_history_turns: int
     history: deque[HistoryTurn] = field(default_factory=deque)
-    task: Optional[asyncio.Task] = None
+    task: asyncio.Task | None = None
     """The in-flight prompt task, so ``session/cancel`` can interrupt this turn."""
     cancelled: bool = False
     """Set by ``session/cancel`` so the prompt can report ``stop_reason='cancelled'``."""
@@ -33,13 +32,13 @@ class AcpSession:
         # A "turn" is a user message plus the bot's reply, so the deque holds twice as many.
         self.history = deque(self.history, maxlen=self.max_history_turns * 2)
 
-    def record(self, user_text: str, author: str, reply: Optional[str]) -> None:
+    def record(self, user_text: str, author: str, reply: str | None) -> None:
         """Append this exchange, evicting the oldest once the bound is reached."""
         self.history.append(HistoryTurn(role="user", text=user_text, author=author))
         if reply:
             self.history.append(HistoryTurn(role="assistant", text=reply))
 
-    def previous_reply(self) -> Optional[str]:
+    def previous_reply(self) -> str | None:
         """The bot's most recent reply in this session, for the repeat guard."""
         for past in reversed(self.history):
             if past.role == "assistant" and past.text.strip():
@@ -70,8 +69,8 @@ class SessionRegistry:
         self._sessions[session.id] = session
         return session
 
-    def get(self, session_id: str) -> Optional[AcpSession]:
+    def get(self, session_id: str) -> AcpSession | None:
         return self._sessions.get(session_id)
 
-    def remove(self, session_id: str) -> Optional[AcpSession]:
+    def remove(self, session_id: str) -> AcpSession | None:
         return self._sessions.pop(session_id, None)

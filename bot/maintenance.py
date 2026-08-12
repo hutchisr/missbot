@@ -21,7 +21,7 @@ import math
 from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
 
 import click
@@ -32,7 +32,6 @@ from psycopg import sql
 
 from .memory import MemoryStore, StoredMemory
 from .models import Config
-
 
 CleanupReason = Literal["empty", "expired", "duplicate", "retention", "author_limit"]
 _REEMBED_PROBE_TEXT = "Missbot re-embedding preflight"
@@ -66,12 +65,12 @@ def _parse_datetime(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value)
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _parse_date(value: str | None) -> date | None:
@@ -89,7 +88,7 @@ def _timestamp(memory: StoredMemory) -> datetime:
     return (
         _parse_datetime(memory.updated_at)
         or _parse_datetime(memory.created_at)
-        or datetime.max.replace(tzinfo=timezone.utc)
+        or datetime.max.replace(tzinfo=UTC)
     )
 
 
@@ -130,8 +129,8 @@ def plan_cleanup(
     """
     records = list(memories)
     if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
-    now = now.astimezone(timezone.utc)
+        now = now.replace(tzinfo=UTC)
+    now = now.astimezone(UTC)
     selected: dict[str, CleanupReason] = {}
 
     def select(memory: StoredMemory, reason: CleanupReason) -> None:
@@ -189,7 +188,7 @@ async def cleanup(store: MemoryStore, config: Config, *, dry_run: bool = False) 
     memories = await store.list_all(config.memory_cleanup_scan_limit)
     candidates = plan_cleanup(
         memories,
-        now=datetime.now(timezone.utc),
+        now=datetime.now(UTC),
         note_retention_days=config.memory_note_retention_days,
         max_memories_per_author=config.memory_max_memories_per_author,
     )
@@ -391,7 +390,7 @@ async def reembed(
             embedding_model=config.embedding_model,
         )
 
-    suffix = backup_suffix or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    suffix = backup_suffix or datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     backup_tables = await asyncio.to_thread(
         _replace_vectors,
         config.postgres_url,

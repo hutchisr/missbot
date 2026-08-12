@@ -23,7 +23,6 @@ import os
 import signal
 import sys
 from contextlib import asynccontextmanager
-from typing import Optional
 
 import acp
 import click
@@ -84,7 +83,7 @@ async def _runtime(config: Config):
     """Open the shared backends and tear them down on exit."""
     api_client.configure(config)
 
-    redis_client: Optional[Redis] = None
+    redis_client: Redis | None = None
     if config.redis_url:
         redis_client = Redis.from_url(
             config.redis_url,
@@ -94,7 +93,7 @@ async def _runtime(config: Config):
         )
         logfire.info("Redis client initialized")
 
-    memory: Optional[MemoryStore] = None
+    memory: MemoryStore | None = None
     if config.memory_enabled:
         memory = await MemoryStore.create(config)
 
@@ -157,7 +156,7 @@ def serve(config, host, port, mount_path, token_env):
     asyncio.run(_serve_async(config, host, port, mount_path, token_env))
 
 
-def _bearer_token_from_env(token_env: Optional[str]) -> Optional[str]:
+def _bearer_token_from_env(token_env: str | None) -> str | None:
     """Resolve and normalize the configured bearer token without failing open."""
     if token_env is None:
         return None

@@ -25,14 +25,12 @@ import binascii
 import json
 import os
 from dataclasses import dataclass
-from typing import Optional
 
 import httpx
 import logfire
 
 from .models import Config
 from .provider import provider_request_headers
-
 
 # Formats Misskey can serve safely, keyed by their magic bytes. WebP needs a split check
 # (``RIFF....WEBP``) and is handled separately in _sniff_media_type.
@@ -49,7 +47,7 @@ _EXTENSIONS = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "ima
 _ENVELOPE_ALLOWANCE = 64 * 1024
 
 
-def _sniff_media_type(data: bytes) -> Optional[str]:
+def _sniff_media_type(data: bytes) -> str | None:
     """Media type from the leading bytes, or None for anything we won't post."""
     for magic, media_type in _MAGIC_MEDIA_TYPES:
         if data.startswith(magic):
@@ -80,7 +78,7 @@ class GeneratedImage:
 class ImageGenerator:
     """Client for one OpenAI-compatible image-generation endpoint."""
 
-    def __init__(self, config: Config, *, transport: Optional[httpx.AsyncBaseTransport] = None) -> None:
+    def __init__(self, config: Config, *, transport: httpx.AsyncBaseTransport | None = None) -> None:
         assert config.image_gen_model, "image_gen_model is required to build an ImageGenerator"
         self._model = config.image_gen_model
         self._url = f"{str(config.image_gen_base_url).rstrip('/')}/images/generations"
@@ -96,7 +94,7 @@ class ImageGenerator:
                 env_var=config.image_gen_api_key_env,
             )
 
-    async def generate(self, prompt: str, alt_text: str) -> Optional[GeneratedImage]:
+    async def generate(self, prompt: str, alt_text: str) -> GeneratedImage | None:
         """Generate one image, or None if anything about it is unusable."""
         payload: dict[str, object] = {"model": self._model, "prompt": prompt, "n": 1}
         if self._size:
@@ -131,7 +129,7 @@ class ImageGenerator:
         logfire.info("Generated image", model=self._model, media_type=media_type, size=len(data))
         return GeneratedImage(data=data, media_type=media_type, prompt=prompt, alt_text=alt_text)
 
-    async def _post(self, payload: dict[str, object]) -> Optional[dict[str, object]]:
+    async def _post(self, payload: dict[str, object]) -> dict[str, object] | None:
         """POST the request and return the parsed body, capping how much is read."""
         headers = provider_request_headers()
         if self._api_key:
@@ -142,16 +140,15 @@ class ImageGenerator:
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(self._timeout),
                 transport=self._transport,
-            ) as client:
-                async with client.stream("POST", self._url, json=payload, headers=headers) as response:
-                    response.raise_for_status()
-                    total = 0
-                    async for chunk in response.aiter_bytes():
-                        total += len(chunk)
-                        if total > cap:
-                            logfire.warning("Image generation response exceeds byte cap; dropping", cap=cap)
-                            return None
-                        chunks.append(chunk)
+            ) as client, client.stream("POST", self._url, json=payload, headers=headers) as response:
+                response.raise_for_status()
+                total = 0
+                async for chunk in response.aiter_bytes():
+                    total += len(chunk)
+                    if total > cap:
+                        logfire.warning("Image generation response exceeds byte cap; dropping", cap=cap)
+                        return None
+                    chunks.append(chunk)
         except httpx.HTTPError:
             # This is the only operator signal for the entire provider leg — every downstream
             # failure is silent by design (fail-soft: the tool reports failure, the post goes
@@ -171,7 +168,7 @@ class ImageGenerator:
         return parsed
 
 
-def _extract_b64(body: dict[str, object]) -> Optional[str]:
+def _extract_b64(body: dict[str, object]) -> str | None:
     """Pull ``data[0].b64_json`` out of the response, or None if it isn't there."""
     data = body.get("data")
     if not isinstance(data, list):

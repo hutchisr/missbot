@@ -1,6 +1,6 @@
-from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, WebsocketUrl, field_validator, model_validator
-from typing import Any, List, Literal, Optional, Union
+from typing import Any, Literal, Optional
 
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, WebsocketUrl, field_validator, model_validator
 
 _ALLOW_EXTRA = ConfigDict(extra="allow")
 
@@ -9,11 +9,11 @@ class User(BaseModel):
     model_config = _ALLOW_EXTRA
 
     id: str
-    name: Optional[str] = None
+    name: str | None = None
     username: str
-    host: Optional[str] = None
-    location: Optional[str] = None
-    isBot: Optional[bool] = None
+    host: str | None = None
+    location: str | None = None
+    isBot: bool | None = None
 
 
 class MiFile(BaseModel):
@@ -21,26 +21,26 @@ class MiFile(BaseModel):
 
     id: str
     type: str
-    thumbnailUrl: Optional[str] = None
-    url: Optional[str] = None
+    thumbnailUrl: str | None = None
+    url: str | None = None
 
 
 class Note(BaseModel):
     model_config = _ALLOW_EXTRA
 
     id: str
-    text: Optional[str] = None
+    text: str | None = None
     userId: str
     user: User
-    replyId: Optional[str] = None
-    renoteId: Optional[str] = None
+    replyId: str | None = None
+    renoteId: str | None = None
     reply: Optional["Note"] = None
     renote: Optional["Note"] = None
-    visibility: Optional[Literal["public", "home", "followers", "specified"]] = None
-    visibleUserIds: Optional[List[str]] = None
-    localOnly: Optional[bool] = None
-    mentions: Optional[List[str]] = None
-    files: Optional[List[MiFile]] = None
+    visibility: Literal["public", "home", "followers", "specified"] | None = None
+    visibleUserIds: list[str] | None = None
+    localOnly: bool | None = None
+    mentions: list[str] | None = None
+    files: list[MiFile] | None = None
 
 
 class MiChannelConnectParams(BaseModel):
@@ -54,7 +54,7 @@ class MiChannelConnectBody(BaseModel):
 
     channel: str
     id: str
-    params: Optional[MiChannelConnectParams] = None
+    params: MiChannelConnectParams | None = None
 
 
 class MiChannelConnect(BaseModel):
@@ -67,17 +67,17 @@ class MiChannelConnect(BaseModel):
 class MiWebsocketMessageBody(BaseModel):
     model_config = _ALLOW_EXTRA
 
-    type: Optional[str] = None  # usually `mention` or `note`
-    body: Optional[Note] = None
-    channel: Optional[str] = None
-    id: Optional[str] = None
+    type: str | None = None  # usually `mention` or `note`
+    body: Note | None = None
+    channel: str | None = None
+    id: str | None = None
 
 
 class MiWebsocketMessage(BaseModel):
     model_config = _ALLOW_EXTRA
 
     type: str
-    body: Optional[MiWebsocketMessageBody] = None
+    body: MiWebsocketMessageBody | None = None
 
 
 ModelAPIType = Literal["openai-chat", "openai-responses", "anthropic"]
@@ -94,19 +94,19 @@ class ModelSpec(BaseModel):
     """
 
     model: str = Field(description="Model name, or a pydantic-ai 'provider:model' string when api_type is unset.")
-    api_type: Optional[ModelAPIType] = Field(
+    api_type: ModelAPIType | None = Field(
         default=None,
         description="API family to use. Omit to infer from a provider:model string, or to retain the "
         "openai-chat default when base_url is set.",
     )
-    base_url: Optional[AnyHttpUrl] = Field(
+    base_url: AnyHttpUrl | None = Field(
         default=None,
         description="Optional API base URL. Supports OpenAI Chat Completions, OpenAI Responses, and Anthropic APIs.",
     )
-    api_key: Optional[str] = Field(
+    api_key: str | None = Field(
         default=None, description="API key to send to the endpoint. Use api_key_env to load from env instead."
     )
-    api_key_env: Optional[str] = Field(
+    api_key_env: str | None = Field(
         default=None,
         description="Environment variable name to read the API key from (preferred over hard-coding api_key).",
     )
@@ -133,22 +133,22 @@ class MCPServerConfig(BaseModel):
     name: str = Field(description="Human-readable identifier (used in logs and gate descriptions)")
     url: AnyHttpUrl = Field(description="Streamable-HTTP MCP endpoint URL")
     headers: dict[str, str] = Field(default_factory=dict, description="Extra HTTP headers (e.g. auth tokens)")
-    tool_prefix: Optional[str] = Field(
+    tool_prefix: str | None = Field(
         default=None,
         description="Prefix added to every tool name from this server (avoids collisions). "
         "Becomes `<prefix>_<original_name>` in the model-visible tool name.",
     )
-    allowed_tools: Optional[List[str]] = Field(
+    allowed_tools: list[str] | None = Field(
         default=None,
         description="If set, only these tools are exposed. Match against UNPREFIXED MCP tool names.",
     )
-    blocked_tools: List[str] = Field(
+    blocked_tools: list[str] = Field(
         default_factory=list,
         description="Tools to hide. Match against UNPREFIXED MCP tool names. Applied after allowed_tools.",
     )
     timeout: float = Field(default=30.0, gt=0, description="HTTP connection timeout in seconds")
     enabled: bool = Field(default=True, description="Disable without deleting the entry")
-    gate: Optional[str] = Field(
+    gate: str | None = Field(
         default=None,
         description="If set, tools from this server are hidden until the model calls enable_<gate>(). "
         "Multiple servers can share a gate.",
@@ -181,7 +181,7 @@ class ScoreCategory(BaseModel):
 
 # Built-in default categories — match the previously hard-coded toxic/rude/neutral/
 # good/exceptional set, so deployments that don't configure categories are unchanged.
-DEFAULT_SCORE_CATEGORIES: List[ScoreCategory] = [
+DEFAULT_SCORE_CATEGORIES: list[ScoreCategory] = [
     ScoreCategory(name="toxic", delta=-10, description="harassment, slurs, threats, hateful content."),
     ScoreCategory(name="rude", delta=-5, description="dismissive, hostile, or insulting but not extreme."),
     ScoreCategory(name="neutral", delta=0, description="ordinary message, nothing notable either way."),
@@ -195,17 +195,17 @@ class Config(BaseModel):
     url: AnyHttpUrl = Field(description="url")
     ws_url: WebsocketUrl = Field(description="ws_url")
     token: str = Field(description="token")
-    channel: Optional[str] = None
-    llm_models: List[Union[str, ModelSpec]] = Field(
+    channel: str | None = None
+    llm_models: list[str | ModelSpec] = Field(
         description="LLM models. Strings use pydantic-ai 'provider:model' format "
         "(e.g. 'openrouter:anthropic/claude-3.5-sonnet'). Dicts add metadata or "
         "select an API family and optional custom endpoint (see ModelSpec)."
     )
     vision: bool = Field(default=True, description="Enable vision (pass images directly to the main LLM)")
-    vision_models: Optional[List[str]] = Field(
+    vision_models: list[str] | None = Field(
         default=None, description="Vision model strings (legacy, unused when vision=True)"
     )
-    max_tokens: Optional[int] = Field(
+    max_tokens: int | None = Field(
         default=None,
         gt=0,
         description="Hard cap on reply/auto-post length, wired into the reply/auto models' "
@@ -220,27 +220,27 @@ class Config(BaseModel):
         "they compose a complete in-bounds reply; over-cap output is truncated only as a "
         "last-resort safety net (Misskey rejects an over-cap note with HTTP 400).",
     )
-    temperature: Optional[float] = Field(
+    temperature: float | None = Field(
         default=None,
         ge=0.0,
         le=2.0,
         description="Sampling temperature for the reply/auto models. None leaves the provider default "
         "unchanged. Higher = more varied (helps avoid the bot repeating its own phrasing).",
     )
-    top_p: Optional[float] = Field(
+    top_p: float | None = Field(
         default=None,
         gt=0.0,
         le=1.0,
         description="Nucleus-sampling top_p for the reply/auto models. None leaves the provider default.",
     )
-    frequency_penalty: Optional[float] = Field(
+    frequency_penalty: float | None = Field(
         default=None,
         ge=-2.0,
         le=2.0,
         description="Frequency penalty for the reply/auto models (penalizes tokens by how often they've "
         "appeared). Positive values reduce verbatim self-repetition. None = not sent (provider default).",
     )
-    presence_penalty: Optional[float] = Field(
+    presence_penalty: float | None = Field(
         default=None,
         ge=-2.0,
         le=2.0,
@@ -250,11 +250,11 @@ class Config(BaseModel):
     bot_user_id: str = Field(description="bot_user_id")
     bot_username: str = Field(description="bot_username")
     system_prompt: str = Field(description="system_prompt")
-    system_prompt_auto: Optional[str] = Field(
+    system_prompt_auto: str | None = Field(
         default=None,
         description="System prompt for autonomous (unprompted) posts",
     )
-    auto_post_interval: Optional[int] = Field(
+    auto_post_interval: int | None = Field(
         default=None,
         gt=0,
         description="Interval in seconds between autonomous posts (None = disabled)",
@@ -284,13 +284,13 @@ class Config(BaseModel):
         gt=0,
         description="HTTP client timeout in seconds",
     )
-    searxng_url: Optional[AnyHttpUrl] = None
-    searxng_user: Optional[str] = None
-    searxng_password: Optional[str] = None
-    redis_url: Optional[str] = Field(default=None, description="Redis connection URL (redis://host:port/db)")
-    redis_password: Optional[str] = Field(default=None, description="Redis password for authentication")
-    redis_db: Optional[int] = Field(default=0, ge=0, description="Redis database number (0-15)")
-    social_credit_unrestricted_user_ids: List[str] = Field(
+    searxng_url: AnyHttpUrl | None = None
+    searxng_user: str | None = None
+    searxng_password: str | None = None
+    redis_url: str | None = Field(default=None, description="Redis connection URL (redis://host:port/db)")
+    redis_password: str | None = Field(default=None, description="Redis password for authentication")
+    redis_db: int | None = Field(default=0, ge=0, description="Redis database number (0-15)")
+    social_credit_unrestricted_user_ids: list[str] = Field(
         default_factory=list,
         description="User ids that lift the author-only restriction on social credit adjustments. "
         "When the author of the note being replied to has one of these user ids, the bot may adjust "
@@ -310,19 +310,19 @@ class Config(BaseModel):
         description="Minimum seconds between automatic social credit changes for a given user. "
         "Bounds how fast a user can farm score even if every message is rated positively.",
     )
-    social_credit_ignore_threshold: Optional[int] = Field(
+    social_credit_ignore_threshold: int | None = Field(
         default=None,
         description="When set (and Redis is configured), authors whose social credit score is below "
         "this value are ignored entirely: the note is never passed to the LLM and no reply is sent "
         "(nor are they scored or ingested). Leave unset to never ignore on score.",
     )
-    score_models: List[Union[str, ModelSpec]] = Field(
+    score_models: list[str | ModelSpec] = Field(
         default_factory=list,
         description="Models for the social-credit message classifier (same forms as llm_models). "
         "Defaults to llm_models when empty. Classification is a simple labeling task, so a smaller / "
         "cheaper model is usually fine.",
     )
-    social_credit_categories: List[ScoreCategory] = Field(
+    social_credit_categories: list[ScoreCategory] = Field(
         default_factory=lambda: [c.model_copy() for c in DEFAULT_SCORE_CATEGORIES],
         description="Sentiment categories the auto-scoring classifier may assign, each with a fixed point "
         "delta applied in code (the model only picks a category, never the number). Defaults to the built-in "
@@ -351,7 +351,7 @@ class Config(BaseModel):
         description="Maximum number of concurrent mention and auto-reply handlers. New events are "
         "dropped when this capacity is full to bound LLM, memory, Redis, and HTTP work.",
     )
-    mcp_servers: List[MCPServerConfig] = Field(
+    mcp_servers: list[MCPServerConfig] = Field(
         default_factory=list,
         description="Streamable-HTTP MCP servers to expose as tools.",
     )
@@ -376,7 +376,7 @@ class Config(BaseModel):
         "the generate_image tool. Requires image_gen_model. Auto posts only — the reply path and ACP never "
         "receive the tool.",
     )
-    image_gen_model: Optional[str] = Field(
+    image_gen_model: str | None = Field(
         default=None,
         description="Image model id sent to the images endpoint (e.g. 'google/gemini-2.5-flash-image').",
     )
@@ -384,7 +384,7 @@ class Config(BaseModel):
         default=AnyHttpUrl("https://openrouter.ai/api/v1"),
         description="OpenAI-compatible base URL for image generation (POSTed to <base_url>/images/generations).",
     )
-    image_gen_api_key: Optional[str] = Field(
+    image_gen_api_key: str | None = Field(
         default=None,
         description="API key for the image endpoint. Use image_gen_api_key_env to load from env instead.",
     )
@@ -394,7 +394,7 @@ class Config(BaseModel):
         "is unset). When neither resolves, requests are sent unauthenticated — which is valid for a keyless "
         "self-hosted endpoint, so it warns rather than failing startup.",
     )
-    image_gen_size: Optional[str] = Field(
+    image_gen_size: str | None = Field(
         default=None,
         description="Optional `size` request param (e.g. '1024x1024'). Sent only when set, so backends that "
         "reject the field are unaffected while it is omitted.",
@@ -451,7 +451,7 @@ class Config(BaseModel):
         "requires postgres_url and embedding_model. Adds the add_memory / search_memory tools and "
         "can ingest user notes through mem0's extraction/dedup pipeline.",
     )
-    postgres_url: Optional[str] = Field(
+    postgres_url: str | None = Field(
         default=None,
         description="Postgres DSN for mem0's pgvector store (e.g. postgres://user:pass@host:5432/db). "
         "The vector extension must be available on the server.",
@@ -460,11 +460,11 @@ class Config(BaseModel):
         default="missbot_memories",
         description="Postgres table/collection name mem0 uses for stored memories.",
     )
-    memory_history_db_path: Optional[str] = Field(
+    memory_history_db_path: str | None = Field(
         default=None,
         description="Optional SQLite path for mem0's local message/history database. Leave unset for mem0's default.",
     )
-    embedding_model: Optional[str] = Field(
+    embedding_model: str | None = Field(
         default=None,
         description="Embedding model id sent to the OpenAI-compatible embeddings endpoint. Required when memory_enabled.",
     )
@@ -475,7 +475,7 @@ class Config(BaseModel):
         "model returns. pplx-embed-v1-0.6b is 1024. pgvector HNSW indexes support at most 2000 dimensions "
         "on a plain `vector` column.",
     )
-    embedding_dimensions: Optional[int] = Field(
+    embedding_dimensions: int | None = Field(
         default=None,
         gt=0,
         description="When set, sent as the OpenAI `dimensions` request parameter to truncate a Matryoshka "
@@ -487,7 +487,7 @@ class Config(BaseModel):
         default=AnyHttpUrl("https://openrouter.ai/api/v1"),
         description="OpenAI-compatible base URL for the embeddings endpoint (POSTed to <base_url>/embeddings).",
     )
-    embedding_api_key: Optional[str] = Field(
+    embedding_api_key: str | None = Field(
         default=None,
         description="API key for the embeddings endpoint. Use embedding_api_key_env to load from env instead.",
     )
@@ -495,16 +495,16 @@ class Config(BaseModel):
         default="OPENROUTER_API_KEY",
         description="Environment variable holding the embeddings API key (used when embedding_api_key is unset).",
     )
-    memory_llm_model: Optional[str] = Field(
+    memory_llm_model: str | None = Field(
         default=None,
         description="Model mem0 uses for memory extraction. Defaults to the first llm_models entry with any "
         "pydantic-ai provider prefix stripped (e.g. openrouter:anthropic/... -> anthropic/...).",
     )
-    memory_llm_base_url: Optional[AnyHttpUrl] = Field(
+    memory_llm_base_url: AnyHttpUrl | None = Field(
         default=None,
         description="Optional OpenAI-compatible base URL for mem0's extraction LLM.",
     )
-    memory_llm_api_key: Optional[str] = Field(
+    memory_llm_api_key: str | None = Field(
         default=None,
         description="API key for mem0's extraction LLM. Use memory_llm_api_key_env to load from env instead.",
     )
@@ -528,7 +528,7 @@ class Config(BaseModel):
         gt=0,
         description="Maximum character length accepted by the add_memory tool.",
     )
-    memory_custom_instructions: Optional[str] = Field(
+    memory_custom_instructions: str | None = Field(
         default=None,
         description="Optional custom instructions appended to mem0's memory extraction prompt.",
     )
@@ -537,19 +537,19 @@ class Config(BaseModel):
         description="When memory is enabled, auto-ingest each incoming user note through mem0. Set false to "
         "disable note learning while keeping add_memory / search_memory available.",
     )
-    memory_trusted_user_ids: List[str] = Field(
+    memory_trusted_user_ids: list[str] = Field(
         default_factory=list,
         description="Stable platform user ids whose auto-ingested memories are not treated as hearsay. "
         "Misskey uses its user id; ACP uses the namespaced acp:<pubkey> identity. Handles and display names "
         "never confer trust.",
     )
-    memory_note_retention_days: Optional[int] = Field(
+    memory_note_retention_days: int | None = Field(
         default=90,
         gt=0,
         description="Days to retain memories inferred from Misskey notes. New note memories receive a mem0 "
         "expiration date, and maintenance physically deletes older rows. Set null to disable age-based cleanup.",
     )
-    memory_max_memories_per_author: Optional[int] = Field(
+    memory_max_memories_per_author: int | None = Field(
         default=50,
         gt=0,
         description="Maximum auto-ingested note memories retained per author. Maintenance removes the oldest "
@@ -560,7 +560,7 @@ class Config(BaseModel):
         gt=0,
         description="Maximum agent-scoped mem0 rows examined by one maintenance cleanup run.",
     )
-    debug: Optional[bool] = None
+    debug: bool | None = None
 
     @model_validator(mode="after")
     def check_auto_post_config(self) -> "Config":

@@ -11,10 +11,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from pydantic_ai import ImageUrl, ModelRetry
 
-from bot.ai import AutoDeps, ChatAgent, _IMAGE_ONLY_OUTPUT, _make_create_poll_tool, _make_generate_image_tool
-from bot.core import Poll, HistoryTurn
+from bot.ai import _IMAGE_ONLY_OUTPUT, AutoDeps, ChatAgent, _make_create_poll_tool, _make_generate_image_tool
+from bot.core import HistoryTurn, Poll
 from bot.imagegen import GeneratedImage
-
 
 _IMAGE = ImageUrl(url="https://media.example/1.png")
 
@@ -943,9 +942,8 @@ async def test_run_auto_rejects_image_only_marker_without_image(make_config):
         agent._auto_agent,
         "run",
         AsyncMock(return_value=SimpleNamespace(output=_IMAGE_ONLY_OUTPUT)),
-    ):
-        with pytest.raises(ValueError, match="without generating an image"):
-            await agent.run_auto()
+    ), pytest.raises(ValueError, match="without generating an image"):
+        await agent.run_auto()
 
 
 @pytest.mark.anyio

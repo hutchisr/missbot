@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
-from typing import Any, NoReturn, Optional
+from typing import Any, NoReturn, Self
 
 import acp
 import logfire
@@ -38,12 +38,12 @@ class MissbotAgent(acp.Agent):
     def __init__(
         self,
         config: Config,
-        redis_client: Optional[Redis] = None,
-        memory: Optional[MemoryStore] = None,
-        chat_agent: Optional[ChatAgent] = None,
+        redis_client: Redis | None = None,
+        memory: MemoryStore | None = None,
+        chat_agent: ChatAgent | None = None,
         *,
-        session_registry: Optional[SessionRegistry] = None,
-        prompt_semaphore: Optional[asyncio.Semaphore] = None,
+        session_registry: SessionRegistry | None = None,
+        prompt_semaphore: asyncio.Semaphore | None = None,
     ):
         self._config = config
         # One protocol adapter per connection, but the expensive parts (model chain,
@@ -62,9 +62,9 @@ class MissbotAgent(acp.Agent):
         )
         self._prompt_slots = prompt_semaphore or asyncio.Semaphore(config.acp_max_sessions)
         self._session_ids: set[str] = set()
-        self._conn: Optional[acp.Client] = None
+        self._conn: acp.Client | None = None
 
-    async def __aenter__(self) -> "MissbotAgent":
+    async def __aenter__(self) -> Self:
         if self._owns_chat_agent:
             await self._agent.__aenter__()
         return self
@@ -83,8 +83,8 @@ class MissbotAgent(acp.Agent):
     async def initialize(
         self,
         protocol_version: int,
-        client_capabilities: Optional[schema.ClientCapabilities] = None,
-        client_info: Optional[schema.Implementation] = None,
+        client_capabilities: schema.ClientCapabilities | None = None,
+        client_info: schema.Implementation | None = None,
         **kwargs: Any,
     ) -> acp.InitializeResponse:
         logfire.info(
@@ -107,15 +107,15 @@ class MissbotAgent(acp.Agent):
             agent_info=schema.Implementation(name=_AGENT_NAME, version=PROJECT_VERSION),
         )
 
-    async def authenticate(self, method_id: str, **kwargs: Any) -> Optional[acp.AuthenticateResponse]:
+    async def authenticate(self, method_id: str, **kwargs: Any) -> acp.AuthenticateResponse | None:
         """No-op: `initialize` advertises no auth methods (see the note there)."""
         return None
 
     async def new_session(
         self,
         cwd: str,
-        additional_directories: Optional[list[str]] = None,
-        mcp_servers: Optional[list[Any]] = None,
+        additional_directories: list[str] | None = None,
+        mcp_servers: list[Any] | None = None,
         **kwargs: Any,
     ) -> acp.NewSessionResponse:
         """Create a session, ignoring the client's `cwd` and MCP servers.
@@ -233,7 +233,7 @@ class MissbotAgent(acp.Agent):
 
     async def close_session(self, session_id: str, **kwargs: Any) -> None:
         if session_id not in self._session_ids:
-            return None
+            return
         self._session_ids.remove(session_id)
         session = self._sessions.remove(session_id)
         if session is not None and session.task is not None and not session.task.done():
@@ -242,7 +242,7 @@ class MissbotAgent(acp.Agent):
             with suppress(asyncio.CancelledError):
                 await session.task
         logfire.info("ACP session closed", session_id=session_id, live_sessions=len(self._sessions))
-        return None
+        return
 
     async def aclose(self) -> None:
         """Close every session owned by this protocol connection."""
@@ -266,8 +266,8 @@ class MissbotAgent(acp.Agent):
         self,
         cwd: str,
         session_id: str,
-        mcp_servers: Optional[list[Any]] = None,
-        additional_directories: Optional[list[str]] = None,
+        mcp_servers: list[Any] | None = None,
+        additional_directories: list[str] | None = None,
         **kwargs: Any,
     ) -> NoReturn:
         """History is in-process and does not survive a restart (`initialize` says so)."""
@@ -289,8 +289,8 @@ class MissbotAgent(acp.Agent):
         self,
         session_id: str,
         cwd: str,
-        additional_directories: Optional[list[str]] = None,
-        mcp_servers: Optional[list[Any]] = None,
+        additional_directories: list[str] | None = None,
+        mcp_servers: list[Any] | None = None,
         **kwargs: Any,
     ) -> NoReturn:
         self._unsupported(acp.AGENT_METHODS["session_fork"])
@@ -299,8 +299,8 @@ class MissbotAgent(acp.Agent):
         self,
         session_id: str,
         cwd: str,
-        additional_directories: Optional[list[str]] = None,
-        mcp_servers: Optional[list[Any]] = None,
+        additional_directories: list[str] | None = None,
+        mcp_servers: list[Any] | None = None,
         **kwargs: Any,
     ) -> NoReturn:
         self._unsupported(acp.AGENT_METHODS["session_resume"])
@@ -314,7 +314,7 @@ class MissbotAgent(acp.Agent):
         logfire.info("ACP extension notification ignored", method=method)
 
 
-def _text_from_blocks(blocks: list[Any], *, max_chars: Optional[int] = None) -> str:
+def _text_from_blocks(blocks: list[Any], *, max_chars: int | None = None) -> str:
     """Concatenate text blocks, rejecting oversized aggregate prompt text."""
     parts: list[str] = []
     total_chars = 0

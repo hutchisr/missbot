@@ -6,10 +6,10 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
-from typing import Any, Optional, Union, cast
+from typing import Any, Self, cast
 
 import httpx
-
+import logfire
 from pydantic_ai import Agent, ModelRetry, RunContext
 from pydantic_ai.exceptions import ModelAPIError
 from pydantic_ai.messages import (
@@ -19,9 +19,8 @@ from pydantic_ai.messages import (
     TextPart,
     UserPromptPart,
 )
+from pydantic_ai.models import Model, ModelRequestContext, ModelRequestParameters, StreamedResponse
 from pydantic_ai.models.anthropic import AnthropicModel
-from pydantic_ai.models import Model
-from pydantic_ai.models import ModelRequestContext, ModelRequestParameters, StreamedResponse
 from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
 from pydantic_ai.models.openrouter import OpenRouterModelSettings
@@ -30,7 +29,6 @@ from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings, merge_model_settings
 from pydantic_ai.usage import RequestUsage
-import logfire
 from redis.asyncio import Redis
 
 from .core import AgentTurn, AutoPost, HistoryTurn, Poll, TurnImage
@@ -82,7 +80,7 @@ def _cost_prefer_provider(self: ModelResponse):
 if _original_cost is not None:
     # setattr (not a direct assignment) so the type checker doesn't reject monkeypatching
     # a method slot with our differently-typed override.
-    setattr(ModelResponse, "cost", _cost_prefer_provider)
+    ModelResponse.cost = _cost_prefer_provider
 
 
 @dataclass(init=False)
@@ -176,7 +174,7 @@ class _ModelSettingsWrapper(WrapperModel):
         )
 
 
-def _resolve_model_spec(spec: Union[str, ModelSpec]) -> Union[str, Model]:
+def _resolve_model_spec(spec: str | ModelSpec) -> str | Model:
     """Convert a config llm_models entry into something Pydantic AI accepts.
 
     Strings and ModelSpec entries without an explicit endpoint or API type pass
@@ -208,7 +206,7 @@ def _resolve_model_spec(spec: Union[str, ModelSpec]) -> Union[str, Model]:
     return OpenAIChatModel(spec.model, provider=provider, settings=model_settings)
 
 
-def _spec_supports_vision(spec: Union[str, ModelSpec]) -> bool:
+def _spec_supports_vision(spec: str | ModelSpec) -> bool:
     """Whether a model entry should receive image input. Strings default True."""
     if isinstance(spec, str):
         return True
@@ -247,9 +245,9 @@ class AgentDeps:
 
     username: str
     """The handle of the user who sent the message."""
-    source_note_id: Optional[str] = None
+    source_note_id: str | None = None
     """Id of the note being replied to, recorded as provenance on memory writes."""
-    social_credit_score: Optional[int] = None
+    social_credit_score: int | None = None
     """The user's current social credit score, or None if unavailable."""
     adjusted_credit_users: set[str] = field(default_factory=set)
     """Tracks users whose social credit was already adjusted in this run."""
@@ -257,13 +255,13 @@ class AgentDeps:
     """When True, social credit may be adjusted for any user, not just `username`."""
     enabled_gates: set[str] = field(default_factory=set)
     """Gates opened during this run by `enable_<gate>` meta-tools."""
-    previous_bot_reply: Optional[str] = None
+    previous_bot_reply: str | None = None
     """The bot's most recent reply in this thread, if any. Used by the verbatim-repeat
     output validator to reject a reply that just parrots the prior turn (a failure mode of
     weaker fallback models when the new message is a thin same-topic follow-up)."""
     memory_writes_allowed: bool = True
     """False for followers-only/private notes so global memory cannot retain restricted content."""
-    char_budget: Optional[int] = None
+    char_budget: int | None = None
     """Hard reply length cap for this run, or None for no cap. Set per-frontend by the
     adapter (Misskey passes its note limit; ACP passes None), so the same agent can serve
     surfaces with different limits. Drives both the length instruction and its validator."""
@@ -283,9 +281,9 @@ class AutoDeps:
     appended only to `auto_tools`, which is passed only to `self._auto_agent`.
     """
 
-    image: Optional[GeneratedImage] = None
+    image: GeneratedImage | None = None
     """Set by `generate_image`; read back by `ChatAgent.run_auto`. One image per run."""
-    poll: Optional[Poll] = None
+    poll: Poll | None = None
     """Set by `create_poll`; read back by `ChatAgent.run_auto`. One poll per run."""
     image_attempted: bool = False
     """Whether this run has already called the image provider.
@@ -360,7 +358,7 @@ _AUTO_POLL_INSTRUCTION = """Poll workflow:
 """
 
 
-def _split_auto_image_description(output: str) -> Optional[tuple[str, str]]:
+def _split_auto_image_description(output: str) -> tuple[str, str] | None:
     """Return a leading image description and its caption, if ``output`` contains one.
 
     Smaller models sometimes write the visual direction into the post instead of calling
@@ -395,7 +393,7 @@ def _make_create_poll_tool():
         ctx: RunContext[AutoDeps],
         choices: list[str],
         multiple: bool = False,
-        duration_minutes: Optional[int] = None,
+        duration_minutes: int | None = None,
     ) -> str:
         """Attach a poll to this autonomous post before writing its question.
 
@@ -524,7 +522,7 @@ _CLASSIFIER_MODEL_SETTINGS: ModelSettings = OpenRouterModelSettings(
 )
 
 
-def _model_chain(specs: list[Union[str, ModelSpec]]) -> Optional[Union[str, Model]]:
+def _model_chain(specs: list[str | ModelSpec]) -> str | Model | None:
     """Resolve a list of model specs into a single model or a FallbackModel chain (or None)."""
     resolved = [_resolve_model_spec(s) for s in specs]
     if not resolved:
@@ -570,8 +568,8 @@ class ChatAgent:
     def __init__(
         self,
         config: Config,
-        redis_client: Optional[Redis] = None,
-        memory: Optional[MemoryStore] = None,
+        redis_client: Redis | None = None,
+        memory: MemoryStore | None = None,
     ):
         self._config = config
         self._redis = redis_client
@@ -586,7 +584,7 @@ class ChatAgent:
         # Build a separate chain only when the filter actually narrows the list.
         # If every model is vision-capable, the agent's default model is fine.
         if not vision_specs or len(vision_specs) == len(config.llm_models):
-            self._vision_model: Optional[Union[str, Model]] = None
+            self._vision_model: str | Model | None = None
         else:
             self._vision_model = _chain(vision_specs)
 
@@ -639,7 +637,7 @@ class ChatAgent:
         # Reject a reply that just parrots the bot's prior turn in the same thread.
         self._agent.output_validator(self._reject_verbatim_repeat)
 
-        self._image_generator: Optional[ImageGenerator] = None
+        self._image_generator: ImageGenerator | None = None
         if config.image_gen_enabled:
             # Auto posts only: appended to auto_tools, never to the reply agent's `tools`
             # list above. The RunContext[AutoDeps] typing does not enforce this by itself —
@@ -649,7 +647,7 @@ class ChatAgent:
             self._image_generator = ImageGenerator(config)
             auto_tools.append(_make_generate_image_tool(self._image_generator))
 
-        self._auto_agent: Optional[Agent[AutoDeps, str]] = None
+        self._auto_agent: Agent[AutoDeps, str] | None = None
         self._auto_history: deque[str] = deque(maxlen=10)
         if config.system_prompt_auto:
             auto_instructions = [
@@ -674,9 +672,9 @@ class ChatAgent:
         # Isolated, tool-less classifier for auto-scoring: treats the message as untrusted
         # data and emits only a fixed category, mapped to a bounded delta in code (bot/scoring.py).
         # Uses config.score_models when set (a cheaper model is fine), else the reply model.
-        self._score_agent: Optional[Agent[None, str]] = None
-        self._score_model: Optional[Union[str, Model]] = None
-        self._score_spec: Optional[ScoringSpec] = None
+        self._score_agent: Agent[None, str] | None = None
+        self._score_model: str | Model | None = None
+        self._score_spec: ScoringSpec | None = None
         if redis_client is not None and config.social_credit_auto_score:
             self._score_model = _chain(config.score_models) if config.score_models else model
             # Categories, deltas, and instructions are derived from config here, so the
@@ -691,7 +689,7 @@ class ChatAgent:
                 retries=2,
             )
 
-    async def __aenter__(self) -> "ChatAgent":
+    async def __aenter__(self) -> Self:
         """Open persistent connections (MCP sessions) on the main agent."""
         await self._agent.__aenter__()
         return self
@@ -757,7 +755,7 @@ class ChatAgent:
         # Pick the model chain. If the prompt has images but no model is vision-capable,
         # drop the images and run text-only — else the whole fallback fails ("no endpoints
         # support image input") and the user gets nothing.
-        run_model: Optional[Union[str, Model]] = None
+        run_model: str | Model | None = None
         if current_images:
             if not self._has_vision_model:
                 logfire.warning("No vision-capable models configured; dropping images")
@@ -1034,11 +1032,11 @@ class ChatAgent:
         except Exception:
             logfire.exception("Note memory ingestion failed (reply unaffected)", author=author)
 
-    async def get_score(self, handle: str) -> Optional[int]:
+    async def get_score(self, handle: str) -> int | None:
         """Fetch a handle's social credit score (None if unset/no Redis)."""
         return await self._get_social_credit_score(handle)
 
-    async def _get_social_credit_score(self, username: str) -> Optional[int]:
+    async def _get_social_credit_score(self, username: str) -> int | None:
         """Fetch the user's social credit score from Redis."""
         if not self._redis:
             return None

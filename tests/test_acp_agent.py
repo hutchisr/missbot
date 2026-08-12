@@ -212,9 +212,8 @@ async def test_prompt_rejects_oversized_aggregate_text(make_config):
     agent = MissbotAgent(config=make_config(acp_max_prompt_chars=5))
     session_id = await _new_session(agent)
 
-    with patch.object(agent._agent, "run", AsyncMock()) as run_mock:
-        with pytest.raises(acp.RequestError):
-            await agent.prompt(session_id=session_id, prompt=[_text("abc"), _text("de")])
+    with patch.object(agent._agent, "run", AsyncMock()) as run_mock, pytest.raises(acp.RequestError):
+        await agent.prompt(session_id=session_id, prompt=[_text("abc"), _text("de")])
 
     run_mock.assert_not_awaited()
 

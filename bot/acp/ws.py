@@ -26,10 +26,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable
 from contextlib import suppress
+from dataclasses import dataclass
 from http import HTTPStatus
-from typing import Any, Callable, Iterable, NoReturn, Optional
+from typing import Any, NoReturn
 
 import logfire
 from websockets.asyncio.server import ServerConnection, serve
@@ -62,7 +63,7 @@ class ServerPaths:
     health_path: str = DEFAULT_HEALTH_PATH
 
     @classmethod
-    def from_mount(cls, mount_path: str) -> "ServerPaths":
+    def from_mount(cls, mount_path: str) -> ServerPaths:
         normalized = mount_path.strip()
         if not normalized:
             raise ValueError("mount_path must not be empty")
@@ -98,7 +99,7 @@ def build_metadata(*, paths: ServerPaths, auth_required: bool) -> dict[str, Any]
     }
 
 
-def is_authorized(headers: Any, token: Optional[str]) -> bool:
+def is_authorized(headers: Any, token: str | None) -> bool:
     """Check bearer authorization, failing closed for invalid configured tokens."""
     if token is None:
         return True
@@ -117,13 +118,13 @@ class _FrameWriterTransport(asyncio.Transport):
         self._loop = loop
         self._buffer = bytearray()
         # One reserved slot ensures close() can always enqueue its sentinel.
-        self._pending: asyncio.Queue[Optional[str]] = asyncio.Queue(maxsize=DEFAULT_OUTPUT_MAX_QUEUE + 1)
+        self._pending: asyncio.Queue[str | None] = asyncio.Queue(maxsize=DEFAULT_OUTPUT_MAX_QUEUE + 1)
         self._writable = asyncio.Event()
         self._writable.set()
         self._closed = False
-        self._error: Optional[ConnectionResetError] = None
-        self._protocol: Optional[asyncio.BaseProtocol] = None
-        self._websocket_close: Optional[asyncio.Task[Any]] = None
+        self._error: ConnectionResetError | None = None
+        self._protocol: asyncio.BaseProtocol | None = None
+        self._websocket_close: asyncio.Task[Any] | None = None
         self._sender = loop.create_task(self._sender_loop())
 
     def set_protocol(self, protocol: asyncio.BaseProtocol) -> None:
@@ -237,7 +238,7 @@ class _WriterProtocol(asyncio.Protocol):
     def _get_close_waiter(self, stream: Any) -> Any:
         return self._closed
 
-    def connection_lost(self, exc: Optional[Exception]) -> None:
+    def connection_lost(self, exc: Exception | None) -> None:
         if not self._closed.done():
             self._closed.set_result(None)
 
@@ -302,7 +303,7 @@ async def serve_acp_websocket(
     host: str,
     port: int,
     mount_path: str = DEFAULT_MOUNT_PATH,
-    bearer_token: Optional[str] = None,
+    bearer_token: str | None = None,
     max_connections: int = DEFAULT_MAX_CONNECTIONS,
 ) -> None:
     """Serve ACP over WebSocket until cancelled.

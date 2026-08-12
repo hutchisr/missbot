@@ -15,8 +15,9 @@ name, and code still owns the number.
 """
 
 import secrets
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, Optional, Sequence
+from typing import Any, Literal
 
 from .models import ScoreCategory
 
@@ -72,7 +73,7 @@ def build_scoring_spec(categories: Sequence[ScoreCategory]) -> ScoringSpec:
     return ScoringSpec(output_type=output_type, deltas=deltas, instructions=instructions)
 
 
-def build_scoring_prompt(text: str, context: Optional[Sequence[str]] = None) -> str:
+def build_scoring_prompt(text: str, context: Sequence[str] | None = None) -> str:
     """Wrap the user's message as fenced, untrusted data for the classifier.
 
     A random per-call nonce delimits the data so embedded text cannot convincingly

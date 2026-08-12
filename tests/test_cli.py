@@ -9,7 +9,7 @@ import pytest
 import yaml
 from click.testing import CliRunner
 
-import bot.cli as cli
+from bot import cli
 
 
 def _config_yaml(config, **overrides) -> str:

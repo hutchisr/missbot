@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import signal
-from typing import Optional
 
 import click
 import logfire
@@ -9,10 +8,10 @@ import yaml
 from logfire.integrations.logging import LogfireLoggingHandler
 from redis.asyncio import Redis
 
+from .api import api_client
 from .bot import Bot
 from .memory import MemoryStore
 from .models import Config
-from .api import api_client
 
 
 @click.command()
@@ -58,7 +57,7 @@ async def main_async(config):
     api_client.configure(config)
 
     # Initialize Redis client if configured
-    redis_client: Optional[Redis] = None
+    redis_client: Redis | None = None
     if config.redis_url:
         redis_client = Redis.from_url(
             config.redis_url,
@@ -69,7 +68,7 @@ async def main_async(config):
         logfire.info("Redis client initialized")
 
     # Initialize the long-term memory store (Postgres + pgvector) if enabled
-    memory: Optional[MemoryStore] = None
+    memory: MemoryStore | None = None
     if config.memory_enabled:
         memory = await MemoryStore.create(config)
 

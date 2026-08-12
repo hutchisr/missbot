@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Optional
 
 # Start of the user-controlled payload. Everything from here on is untrusted.
 _CONTENT_BOUNDARY_RE = re.compile(r"^Content:", re.MULTILINE)
@@ -54,7 +53,7 @@ class AcpIdentity:
 
     key: str
     """Namespaced identity used for social credit and memory authorship."""
-    label: Optional[str] = None
+    label: str | None = None
     """Human-readable name for the prompt only. Never used as a key."""
     parsed: bool = False
     """True when derived from a sender header; False when it is the configured fallback."""
@@ -72,7 +71,7 @@ def _trusted_region(text: str) -> str:
     return text[: match.start()]
 
 
-def _extract_key(body: str) -> Optional[str]:
+def _extract_key(body: str) -> str | None:
     """Pull a pubkey out of a ``From:`` line body, preferring the explicit hex form."""
     hex_match = _HEX_KEY_RE.search(body)
     if hex_match:
@@ -83,7 +82,7 @@ def _extract_key(body: str) -> Optional[str]:
     return None
 
 
-def _extract_label(body: str) -> Optional[str]:
+def _extract_label(body: str) -> str | None:
     """Pull the display label preceding the parenthesised key material, if any."""
     label_match = _LABEL_RE.match(body)
     if not label_match:

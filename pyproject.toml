@@ -5,39 +5,43 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "agent-client-protocol>=0.11.0",
-    "click>=8.3.1",
-    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
-    "httpx>=0.28.0",
-    "logfire[httpx,redis]>=4.19.0",
-    "mem0ai[nlp]>=2.0.10",
-    "psycopg[binary,pool]>=3.3.4",
-    "pydantic-ai>=2.13.0",
-    "pyyaml>=6.0.3",
-    "redis[hiredis]>=5.0.0",
-    "spacy<3.8.14",
-    "tenacity>=9.1.2",
-    "websockets>=13.0.0",
+  "agent-client-protocol>=0.11.0",
+  "click>=8.3.1",
+  "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+  "httpx>=0.28.0",
+  "logfire[httpx,redis]>=4.19.0",
+  "mem0ai[nlp]>=2.0.10",
+  "psycopg[binary,pool]>=3.3.4",
+  "pydantic-ai>=2.13.0",
+  "pyyaml>=6.0.3",
+  "redis[hiredis]>=5.0.0",
+  "spacy<3.8.14",
+  "tenacity>=9.1.2",
+  "websockets>=13.0.0",
 ]
 
 [dependency-groups]
 dev = [
-    "anyio>=4.0.0",
-    "fakeredis>=2.20.0",
-    "ipykernel>=7.1.0",
-    "pyright>=1.1.411",
-    "pytest>=9.0.3",
-    "pytest-cov>=5.0.0",
-    "ruff>=0.15.6",
-    "ty>=0.0.40",
+  "anyio>=4.0.0",
+  "fakeredis>=2.20.0",
+  "ipykernel>=7.1.0",
+  "pyright>=1.1.411",
+  "pytest>=9.0.3",
+  "pytest-cov>=5.0.0",
+  "ruff>=0.15.6",
+  "ty>=0.0.40",
 ]
 
-[tool.ruff]
-line-length = 120
+[tool.coverage.run]
+source = ["bot"]
+branch = true
 
-[tool.ruff.lint]
-# Ruff 0.16 greatly expanded its defaults; keep the pre-0.16 project contract explicit.
-select = ["E4", "E7", "E9", "F"]
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+
+[tool.logfire]
+ignore_no_config = true
 
 [tool.pyright]
 include = ["bot", "tests"]
@@ -59,16 +63,12 @@ extraPaths = ["."]
 reportArgumentType = "none"
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
 addopts = ["--cov=bot", "--cov-report=term-missing"]
+testpaths = ["tests"]
 
-[tool.logfire]
-ignore_no_config = true
+[tool.ruff]
+line-length = 120
 
-[tool.coverage.run]
-source = ["bot"]
-branch = true
-
-[tool.coverage.report]
-show_missing = true
-skip_covered = false
+[tool.ruff.lint]
+# Ruff 0.16 greatly expanded its defaults; keep the pre-0.16 project contract explicit.
+# select = ["E4", "E7", "E9", "F"]

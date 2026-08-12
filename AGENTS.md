@@ -244,6 +244,7 @@ def my_tool(param: str) -> str:
     """Tool description for LLM."""
     return result
 
+
 tools.append(my_tool)
 ```
 For tools needing `RunContext`, use the signature `async def my_tool(ctx: RunContext[object], ...) -> str:`.

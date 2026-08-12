@@ -11,7 +11,6 @@ import pytest
 from bot.imagegen import GeneratedImage, ImageGenerator
 from bot.provider import PROJECT_VERSION
 
-
 _PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 64
 _JPEG = b"\xff\xd8\xff" + b"y" * 64
 _GIF = b"GIF89a" + b"z" * 64

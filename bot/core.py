@@ -9,7 +9,7 @@ belongs in the frontend adapter (`bot/bot.py` for Misskey), never here.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Optional, Union
+from typing import Literal, Union
 
 from pydantic_ai import BinaryContent, ImageUrl
 
@@ -27,9 +27,9 @@ class TurnAuthor:
     build it from something the author cannot freely assert. Namespace non-Misskey
     identities (``acp:``) so they can never collide with a fediverse handle.
     """
-    display: Optional[str] = None
+    display: str | None = None
     """Handle as rendered into the prompt. Falls back to ``handle``."""
-    user_id: Optional[str] = None
+    user_id: str | None = None
     """Stable platform identity used for provenance-based trust decisions.
 
     Misskey supplies its user id; ACP supplies its namespaced pubkey identity.
@@ -37,7 +37,7 @@ class TurnAuthor:
     """
     privileged: bool = False
     """Author may manually adjust anyone's social credit (see `AgentDeps`)."""
-    location: Optional[str] = None
+    location: str | None = None
     """Free-text location prepended to the prompt when the platform exposes one."""
 
     @property
@@ -56,7 +56,7 @@ class HistoryTurn:
 
     role: Literal["user", "assistant"]
     text: str
-    author: Optional[str] = None
+    author: str | None = None
     """Handle prefixed to user turns. ``None`` on assistant turns (the bot itself)."""
     images: list[TurnImage] = field(default_factory=list)
 
@@ -70,10 +70,10 @@ class AgentTurn:
     images: list[TurnImage] = field(default_factory=list)
     history: list[HistoryTurn] = field(default_factory=list)
     """Prior conversation, **oldest first**."""
-    char_budget: Optional[int] = None
+    char_budget: int | None = None
     """Hard character cap for the reply, or ``None`` for no cap. Misskey passes its
     note limit less the mention prefix; frontends without a cap pass ``None``."""
-    source_id: Optional[str] = None
+    source_id: str | None = None
     """Platform id of the source message, recorded as memory provenance."""
     source: str = "unknown"
     """Provenance label stored on memories inferred from this turn (``misskey_note``,
@@ -83,7 +83,7 @@ class AgentTurn:
     memory_writes_allowed: bool = True
     """False for private/restricted interactions, so their content stays out of the
     bot-global memory namespace. The adapter owns that judgement."""
-    previous_reply: Optional[str] = None
+    previous_reply: str | None = None
     """The bot's most recent reply in this conversation, for the repeat guard."""
 
 
@@ -93,7 +93,7 @@ class Poll:
 
     choices: tuple[str, ...]
     multiple: bool = False
-    duration_minutes: Optional[int] = None
+    duration_minutes: int | None = None
     """Minutes until the poll closes, or ``None`` to leave it open indefinitely."""
 
 
@@ -106,5 +106,5 @@ class AutoPost:
     """
 
     text: str
-    image: Optional[GeneratedImage] = None
-    poll: Optional[Poll] = None
+    image: GeneratedImage | None = None
+    poll: Poll | None = None
