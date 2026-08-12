@@ -195,7 +195,7 @@ def test_configure_closes_existing_client_with_running_loop(config):
     old_client.is_closed = False
     old_client.aclose = MagicMock(return_value="close-task")
     loop = MagicMock()
-    client._ApiClient__async_client = old_client
+    cast(Any, client)._ApiClient__async_client = old_client
 
     with patch("bot.api.asyncio.get_running_loop", return_value=loop):
         client.configure(config)
@@ -209,7 +209,7 @@ def test_configure_closes_existing_client_without_running_loop(config):
     old_client = MagicMock(spec=httpx.AsyncClient)
     old_client.is_closed = False
     old_client.aclose = MagicMock(return_value="close-task")
-    client._ApiClient__async_client = old_client
+    cast(Any, client)._ApiClient__async_client = old_client
 
     with (
         patch("bot.api.asyncio.get_running_loop", side_effect=RuntimeError),
@@ -227,7 +227,7 @@ async def test_api_client_delegates_attrs_and_close():
     underlying.is_closed = False
     underlying.aclose = AsyncMock()
     underlying.post = MagicMock()
-    client._ApiClient__async_client = underlying
+    cast(Any, client)._ApiClient__async_client = underlying
 
     assert cast(Any, client).post is underlying.post
 
@@ -242,7 +242,7 @@ async def test_api_client_context_manager_returns_self_without_touching_underlyi
     underlying = MagicMock(spec=httpx.AsyncClient)
     underlying.__aenter__ = AsyncMock()
     underlying.__aexit__ = AsyncMock()
-    client._ApiClient__async_client = underlying
+    cast(Any, client)._ApiClient__async_client = underlying
 
     async with client as c:
         assert c is client

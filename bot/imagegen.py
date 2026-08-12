@@ -137,10 +137,13 @@ class ImageGenerator:
         cap = self._max_bytes * 2 + _ENVELOPE_ALLOWANCE
         chunks: list[bytes] = []
         try:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(self._timeout),
-                transport=self._transport,
-            ) as client, client.stream("POST", self._url, json=payload, headers=headers) as response:
+            async with (
+                httpx.AsyncClient(
+                    timeout=httpx.Timeout(self._timeout),
+                    transport=self._transport,
+                ) as client,
+                client.stream("POST", self._url, json=payload, headers=headers) as response,
+            ):
                 response.raise_for_status()
                 total = 0
                 async for chunk in response.aiter_bytes():

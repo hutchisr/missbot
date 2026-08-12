@@ -16,15 +16,14 @@ from .models import Config
 
 @click.command()
 @click.option("--config", "-c", default="config.local.yaml", help="Path to the config file.")
-def main(config):
-    asyncio.run(main_async(config))
+def main(config: str) -> None:
+    with open(config, encoding="utf-8") as f:
+        loaded_config = Config(**yaml.safe_load(f))
+    asyncio.run(main_async(loaded_config))
 
 
-async def main_async(config):
+async def main_async(config: Config) -> None:
     loop = asyncio.get_running_loop()
-
-    with open(config, "r") as f:
-        config = Config(**yaml.safe_load(f))
 
     debug_enabled = bool(config.debug)
     min_level = "debug" if debug_enabled else "info"

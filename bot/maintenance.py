@@ -85,11 +85,7 @@ def _parse_date(value: str | None) -> date | None:
 def _timestamp(memory: StoredMemory) -> datetime:
     # Missing timestamps are kept ahead of ordinary rows so malformed metadata
     # alone never makes a memory the first one removed by an author cap.
-    return (
-        _parse_datetime(memory.updated_at)
-        or _parse_datetime(memory.created_at)
-        or datetime.max.replace(tzinfo=UTC)
-    )
+    return _parse_datetime(memory.updated_at) or _parse_datetime(memory.created_at) or datetime.max.replace(tzinfo=UTC)
 
 
 def _source(memory: StoredMemory) -> str:
@@ -255,7 +251,7 @@ def _load_vector_records(postgres_url: str, tables: tuple[str, str]) -> dict[str
                 if not isinstance(text, str) or not text.strip():
                     raise ValueError(f"{table} row {memory_id} has no embeddable payload.data text")
                 if not isinstance(current_dim, int):
-                    raise ValueError(f"{table} row {memory_id} has no vector dimension")
+                    raise TypeError(f"{table} row {memory_id} has no vector dimension")
                 table_records.append(
                     VectorRecord(
                         table=table,

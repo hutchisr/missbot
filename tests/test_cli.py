@@ -18,17 +18,20 @@ def _config_yaml(config, **overrides) -> str:
     return yaml.safe_dump(data)
 
 
-def test_main_invokes_asyncio_run():
+def test_main_loads_config_and_invokes_asyncio_run(config):
     runner = CliRunner()
 
     with (
+        patch("builtins.open", mock_open(read_data=_config_yaml(config))) as open_mock,
         patch.object(cli, "main_async", new=MagicMock(return_value="main-coro")) as main_async_mock,
         patch.object(cli.asyncio, "run") as run_mock,
     ):
         result = runner.invoke(cli.main, ["-c", "config.test.yaml"])
 
     assert result.exit_code == 0
-    main_async_mock.assert_called_once_with("config.test.yaml")
+    open_mock.assert_called_once_with("config.test.yaml", encoding="utf-8")
+    loaded_config = main_async_mock.call_args.args[0]
+    assert loaded_config.token == config.token
     run_mock.assert_called_once_with("main-coro")
 
 
@@ -43,7 +46,6 @@ async def test_main_async_configures_services_and_runs_bot(config):
 
     with (
         patch.object(cli.asyncio, "get_running_loop", return_value=loop),
-        patch("builtins.open", mock_open(read_data=_config_yaml(config, debug=False))),
         patch.object(cli.logfire, "configure") as configure_mock,
         patch.object(cli.logfire, "instrument_pydantic_ai") as instrument_ai_mock,
         patch.object(cli.logfire, "instrument_httpx") as instrument_httpx_mock,
@@ -56,7 +58,7 @@ async def test_main_async_configures_services_and_runs_bot(config):
         patch.object(cli.Redis, "from_url") as redis_from_url_mock,
         patch.object(cli, "Bot", return_value=bot_instance) as bot_cls,
     ):
-        await cli.main_async("config.test.yaml")
+        await cli.main_async(config)
 
         signal_handlers[signal.SIGTERM]()
 
@@ -99,7 +101,6 @@ async def test_main_async_initializes_redis_and_shutdown_closes_it(make_config):
 
     with (
         patch.object(cli.asyncio, "get_running_loop", return_value=loop),
-        patch("builtins.open", mock_open(read_data=_config_yaml(config))),
         patch.object(cli.logfire, "configure") as configure_mock,
         patch.object(cli.logfire, "instrument_pydantic_ai"),
         patch.object(cli.logfire, "instrument_httpx"),
@@ -113,7 +114,7 @@ async def test_main_async_initializes_redis_and_shutdown_closes_it(make_config):
         patch.object(cli.logfire, "info") as logfire_info_mock,
         patch.object(cli, "Bot", return_value=bot_instance) as bot_cls,
     ):
-        await cli.main_async("config.redis.yaml")
+        await cli.main_async(config)
 
         signal_handlers[signal.SIGINT]()
 

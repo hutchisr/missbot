@@ -631,13 +631,13 @@ class Bot:
                     if msg.body.type == "mention":
                         note = msg.body.body
                         self._spawn_background_task(
-                            lambda: self._process_note_event(note, auto_reply=False),
+                            lambda note=note: self._process_note_event(note, auto_reply=False),
                             note_id=note.id,
                         )
                     elif msg.body.type == "note" and self._config.auto_reply_enabled:
                         note = msg.body.body
                         self._spawn_background_task(
-                            lambda: self._process_note_event(note, auto_reply=True),
+                            lambda note=note: self._process_note_event(note, auto_reply=True),
                             note_id=note.id,
                         )
             except ValidationError as e:

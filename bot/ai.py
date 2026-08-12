@@ -78,9 +78,9 @@ def _cost_prefer_provider(self: ModelResponse):
 
 
 if _original_cost is not None:
-    # setattr (not a direct assignment) so the type checker doesn't reject monkeypatching
-    # a method slot with our differently-typed override.
-    ModelResponse.cost = _cost_prefer_provider
+    # The runtime patch returns a provider-reported price compatible with the
+    # upstream object but intentionally bypasses its narrower static return type.
+    cast(Any, ModelResponse).cost = _cost_prefer_provider
 
 
 @dataclass(init=False)

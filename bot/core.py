@@ -9,7 +9,7 @@ belongs in the frontend adapter (`bot/bot.py` for Misskey), never here.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Union
+from typing import Literal
 
 from pydantic_ai import BinaryContent, ImageUrl
 
@@ -45,7 +45,7 @@ class TurnAuthor:
         return self.display or self.handle
 
 
-TurnImage = Union[ImageUrl, BinaryContent]
+TurnImage = ImageUrl | BinaryContent
 """An image as either a URL the provider fetches, or bytes sent inline as base64.
 Which one an adapter produces depends on `Config.vision_image_mode`."""
 

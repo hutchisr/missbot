@@ -109,26 +109,28 @@ async def fetch_image(
         return None
 
     try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout),
-            follow_redirects=False,  # a redirect could point back at an internal host
-            transport=transport,
-        ) as client:
-            async with client.stream("GET", url) as response:
-                response.raise_for_status()
-                media_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
-                if not media_type.startswith("image/"):
-                    logfire.warning("Refusing non-image media", url=url, content_type=media_type)
-                    return None
+        async with (
+            httpx.AsyncClient(
+                timeout=httpx.Timeout(timeout),
+                follow_redirects=False,  # a redirect could point back at an internal host
+                transport=transport,
+            ) as client,
+            client.stream("GET", url) as response,
+        ):
+            response.raise_for_status()
+            media_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+            if not media_type.startswith("image/"):
+                logfire.warning("Refusing non-image media", url=url, content_type=media_type)
+                return None
 
-                chunks: list[bytes] = []
-                total = 0
-                async for chunk in response.aiter_bytes():
-                    total += len(chunk)
-                    if total > max_bytes:
-                        logfire.warning("Image exceeds size cap; dropping", url=url, max_bytes=max_bytes)
-                        return None
-                    chunks.append(chunk)
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
+                if total > max_bytes:
+                    logfire.warning("Image exceeds size cap; dropping", url=url, max_bytes=max_bytes)
+                    return None
+                chunks.append(chunk)
     except httpx.HTTPError:
         logfire.warning("Image fetch failed", url=url)
         return None

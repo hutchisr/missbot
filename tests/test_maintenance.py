@@ -227,7 +227,8 @@ async def test_reembed_refuses_wrong_endpoint_dimension(make_config):
 
     with (
         patch("bot.maintenance._load_vector_records", return_value=_vector_records()),
-        patch("bot.maintenance._replace_vectors") as replace_vectors,pytest.raises(ValueError, match="dimension 768")
+        patch("bot.maintenance._replace_vectors") as replace_vectors,
+        pytest.raises(ValueError, match="dimension 768"),
     ):
         await reembed(store, config)
 

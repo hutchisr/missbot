@@ -89,7 +89,7 @@ def _domain_of(url: str) -> str | None:
 
 def current_datetime() -> str:
     """Gets current date and time."""
-    return str(datetime.now())
+    return datetime.now().astimezone().isoformat()
 
 
 def normalize_username(username: str) -> str:

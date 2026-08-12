@@ -938,11 +938,14 @@ async def test_run_auto_rejects_image_only_marker_without_image(make_config):
     agent = ChatAgent(_auto_config(make_config))
     assert agent._auto_agent is not None
 
-    with patch.object(
-        agent._auto_agent,
-        "run",
-        AsyncMock(return_value=SimpleNamespace(output=_IMAGE_ONLY_OUTPUT)),
-    ), pytest.raises(ValueError, match="without generating an image"):
+    with (
+        patch.object(
+            agent._auto_agent,
+            "run",
+            AsyncMock(return_value=SimpleNamespace(output=_IMAGE_ONLY_OUTPUT)),
+        ),
+        pytest.raises(ValueError, match="without generating an image"),
+    ):
         await agent.run_auto()
 
 
@@ -957,6 +960,8 @@ async def test_run_auto_rejects_poll_without_question_when_agent_skips_validator
         kwargs["deps"].poll = poll
         return SimpleNamespace(output=_IMAGE_ONLY_OUTPUT)
 
-    with patch.object(agent._auto_agent, "run", AsyncMock(side_effect=fake_run)):
-        with pytest.raises(ValueError, match="poll has no question text"):
-            await agent.run_auto()
+    with (
+        patch.object(agent._auto_agent, "run", AsyncMock(side_effect=fake_run)),
+        pytest.raises(ValueError, match="poll has no question text"),
+    ):
+        await agent.run_auto()

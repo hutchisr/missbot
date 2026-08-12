@@ -326,7 +326,7 @@ class MemoryStore:
         """Delete one memory through mem0, including its entity-store links."""
         # AsyncMemory initializes the entity store lazily. Its delete path only
         # cleans entity links when the store has already been initialized.
-        self._client.entity_store
+        _ = self._client.entity_store
         await self._client.delete(memory_id)
 
     async def close(self) -> None:

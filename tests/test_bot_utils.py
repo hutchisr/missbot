@@ -547,7 +547,8 @@ async def test_send_note_raises_on_oversized_output(bot, make_note):
 
     with (
         patch.object(bot, "_build_mentions_from_note", AsyncMock(return_value=[])),
-        patch("bot.bot.api_client.post", AsyncMock(return_value=MagicMock())) as post_mock,pytest.raises(ValueError)
+        patch("bot.bot.api_client.post", AsyncMock(return_value=MagicMock())) as post_mock,
+        pytest.raises(ValueError),
     ):
         await bot.send_note(long_output, in_reply_to=note)
 
@@ -565,7 +566,8 @@ async def test_send_note_raises_when_mentions_push_over_cap(bot, make_note):
 
     with (
         patch.object(bot, "_build_mentions_from_note", AsyncMock(return_value=[long_mention])),
-        patch("bot.bot.api_client.post", AsyncMock(return_value=MagicMock())) as post_mock,pytest.raises(ValueError)
+        patch("bot.bot.api_client.post", AsyncMock(return_value=MagicMock())) as post_mock,
+        pytest.raises(ValueError),
     ):
         await bot.send_note(body, in_reply_to=note)
 
@@ -579,7 +581,8 @@ async def test_post_autonomous_raises_on_oversized_output(bot):
 
     with (
         patch.object(bot._agent, "run_auto", AsyncMock(return_value=AutoPost(text=long_output))),
-        patch("bot.bot.api_client.post", AsyncMock(return_value=MagicMock())) as post_mock,pytest.raises(ValueError)
+        patch("bot.bot.api_client.post", AsyncMock(return_value=MagicMock())) as post_mock,
+        pytest.raises(ValueError),
     ):
         await bot.post_autonomous()
 
@@ -649,9 +652,9 @@ async def test_post_autonomous_rejects_poll_without_question(bot):
             AsyncMock(return_value=AutoPost(text="", image=_GENERATED_IMAGE, poll=poll)),
         ),
         patch("bot.bot.api_client.post", AsyncMock()) as post_mock,
+        pytest.raises(ValueError, match="poll has no question text"),
     ):
-        with pytest.raises(ValueError, match="poll has no question text"):
-            await bot.post_autonomous()
+        await bot.post_autonomous()
 
     post_mock.assert_not_awaited()
 
@@ -661,9 +664,9 @@ async def test_post_autonomous_rejects_contentless_note(bot):
     with (
         patch.object(bot._agent, "run_auto", AsyncMock(return_value=AutoPost(text=""))),
         patch("bot.bot.api_client.post", AsyncMock()) as post_mock,
+        pytest.raises(ValueError, match="neither text nor an image"),
     ):
-        with pytest.raises(ValueError, match="neither text nor an image"):
-            await bot.post_autonomous()
+        await bot.post_autonomous()
 
     post_mock.assert_not_awaited()
 
@@ -1114,7 +1117,8 @@ async def test_post_autonomous_skips_upload_when_text_over_cap(bot):
 
     with (
         patch.object(bot._agent, "run_auto", AsyncMock(return_value=AutoPost(text=long_text, image=_GENERATED_IMAGE))),
-        patch("bot.bot.api_client.post", post_mock),pytest.raises(ValueError)
+        patch("bot.bot.api_client.post", post_mock),
+        pytest.raises(ValueError),
     ):
         await bot.post_autonomous()
 

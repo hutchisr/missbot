@@ -1,5 +1,6 @@
 """Tests for bot.tools."""
 
+from datetime import datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,8 +15,10 @@ def _tool_names(tools: list[Any]) -> set[str]:
     return {t.__name__ for t in tools}
 
 
-def test_current_datetime_returns_string():
-    assert isinstance(current_datetime(), str)
+def test_current_datetime_returns_timezone_aware_iso_string():
+    current = datetime.fromisoformat(current_datetime())
+
+    assert current.utcoffset() is not None
 
 
 def test_build_tools_minimal(config):

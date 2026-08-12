@@ -70,5 +70,6 @@ testpaths = ["tests"]
 line-length = 120
 
 [tool.ruff.lint]
-# Ruff 0.16 greatly expanded its defaults; keep the pre-0.16 project contract explicit.
-# select = ["E4", "E7", "E9", "F"]
+# Keep Ruff 0.16's expanded defaults. Missbot deliberately catches broad exceptions
+# at logged fail-soft boundaries so optional work cannot cancel replies or kill loops.
+ignore = ["BLE001"]
