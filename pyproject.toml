@@ -25,7 +25,7 @@ dev = [
   "anyio>=4.0.0",
   "fakeredis>=2.20.0",
   "ipykernel>=7.1.0",
-  "pyright>=1.1.411",
+  "basedpyright>=1.39.10",
   "pytest>=9.0.3",
   "pytest-cov>=5.0.0",
   "ruff>=0.15.6",
@@ -43,15 +43,16 @@ skip_covered = false
 [tool.logfire]
 ignore_no_config = true
 
-[tool.pyright]
+[tool.basedpyright]
 include = ["bot", "tests"]
+typeCheckingMode = "standard"
 venvPath = "."
 venv = ".venv"
 # Check against the oldest interpreter the project claims to support, not whichever
 # one happens to be in .venv.
 pythonVersion = "3.13"
 
-[[tool.pyright.executionEnvironments]]
+[[tool.basedpyright.executionEnvironments]]
 root = "tests"
 # An execution environment resolves imports against its own root, so the project
 # root has to be added back or every `from bot... import` reads as unresolved.

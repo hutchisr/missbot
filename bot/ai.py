@@ -273,7 +273,7 @@ class AutoDeps:
 
     Image and poll tools store their results here because a tool returns a *string* to
     the model, so attachments have to travel out-of-band. Typing a tool as
-    `RunContext[AutoDeps]` does NOT by itself confine it to auto posts — pyright accepts
+    `RunContext[AutoDeps]` does NOT by itself confine it to auto posts — Basedpyright accepts
     handing it to the reply agent too, since `build_tools()` returns
     `list[Callable[..., object]]` (erasing the deps type at the append site) and
     pydantic-ai's `tools=` parameter is a ParamSpec-gradual signature that never compares
@@ -458,7 +458,7 @@ def _make_generate_image_tool(generator: ImageGenerator):
             alt_text: Short plain description of the finished picture, for people who cannot
                 see it. Not a copy of the prompt.
         """
-        # Fail fast, not billed: pyright does not stop this tool from being handed to the
+        # Fail fast, not billed: Basedpyright does not stop this tool from being handed to the
         # wrong agent (see the AutoDeps docstring), so if it ever is, this turns the misuse
         # into a free precondition failure instead of an AttributeError after paying a
         # provider for a generation nobody can use.
@@ -641,7 +641,7 @@ class ChatAgent:
         if config.image_gen_enabled:
             # Auto posts only: appended to auto_tools, never to the reply agent's `tools`
             # list above. The RunContext[AutoDeps] typing does not enforce this by itself —
-            # pyright accepts the tool on either agent (see the AutoDeps docstring) — so the
+            # Basedpyright accepts the tool on either agent (see the AutoDeps docstring) — so the
             # separation is structural (which list it's appended to), pinned by
             # test_reply_agent_never_gets_image_tool.
             self._image_generator = ImageGenerator(config)
@@ -680,8 +680,8 @@ class ChatAgent:
             # Categories, deltas, and instructions are derived from config here, so the
             # operator owns the buckets while code still owns the numbers.
             self._score_spec = build_scoring_spec(config.social_credit_categories)
-            # pydantic-ai constrains output to the Literal's values at runtime, but pyright
-            # can't match the Literal special form to the Agent() overloads (hence type: ignore).
+            # pydantic-ai constrains output to the Literal's values at runtime, but Basedpyright
+            # can't match the Literal special form to the Agent() overloads (hence pyright: ignore).
             self._score_agent = Agent(  # type: ignore[reportCallIssue, reportAttributeAccessIssue]
                 self._score_model,
                 output_type=self._score_spec.output_type,  # type: ignore[reportArgumentType]
