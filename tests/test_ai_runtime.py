@@ -67,6 +67,30 @@ async def test_run_routes_image_prompt_to_vision_model(make_config, make_turn):
 
 
 @pytest.mark.anyio
+async def test_run_routes_history_image_to_vision_model(make_config, make_turn):
+    cfg = make_config(
+        llm_models=[
+            {"model": "openrouter:vision/model"},
+            {"model": "openrouter:text/model", "vision": False},
+        ]
+    )
+    agent = ChatAgent(cfg)
+    history = [HistoryTurn(role="user", text="look", author="bob", images=[_IMAGE])]
+
+    with (
+        patch.object(agent, "_get_social_credit_score", AsyncMock(return_value=None)),
+        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="ok"))) as run_mock,
+    ):
+        await agent.run(make_turn(text="what is that?", history=history))
+
+    assert run_mock.await_args is not None
+    assert run_mock.await_args.kwargs["model"] is agent._vision_model
+    message_history = run_mock.await_args.kwargs["message_history"]
+    assert isinstance(message_history[0].parts[0].content, list)
+    assert isinstance(message_history[0].parts[0].content[1], ImageUrl)
+
+
+@pytest.mark.anyio
 async def test_run_skips_model_override_when_no_images(make_config, make_turn):
     cfg = make_config(
         llm_models=[
@@ -103,6 +127,24 @@ async def test_run_drops_images_when_no_vision_model(make_config, make_turn):
     # Image was dropped — prompt collapses to a single string, no ImageUrl.
     assert isinstance(prompt, str)
     assert "model" not in run_mock.await_args.kwargs
+
+
+@pytest.mark.anyio
+async def test_run_drops_history_images_when_no_vision_model(make_config, make_turn):
+    cfg = make_config(llm_models=[{"model": "openrouter:text/model", "vision": False}])
+    agent = ChatAgent(cfg)
+    history = [HistoryTurn(role="user", text="look", author="bob", images=[_IMAGE])]
+
+    with (
+        patch.object(agent, "_get_social_credit_score", AsyncMock(return_value=None)),
+        patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="ok"))) as run_mock,
+    ):
+        await agent.run(make_turn(text="what is that?", history=history))
+
+    assert run_mock.await_args is not None
+    assert "model" not in run_mock.await_args.kwargs
+    message_history = run_mock.await_args.kwargs["message_history"]
+    assert message_history[0].parts[0].content == "bob: look"
 
 
 @pytest.mark.anyio

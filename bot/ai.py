@@ -749,22 +749,24 @@ class ChatAgent:
     async def run(self, turn: AgentTurn) -> str:
         """Process one frontend-neutral turn and generate a reply."""
         current_images = list(turn.images)
+        history_has_images = any(past.role == "user" and bool(past.images) for past in turn.history)
+        has_image_input = bool(current_images) or history_has_images
         if not turn.text and not current_images:
             raise ValueError("Turn has no text or supported images")
 
-        # Pick the model chain. If the prompt has images but no model is vision-capable,
-        # drop the images and run text-only — else the whole fallback fails ("no endpoints
-        # support image input") and the user gets nothing.
+        # Pick the model chain. Current and historical user images are part of the
+        # same model request, so either one requires a vision-capable chain. If no
+        # such model exists, drop every image rather than failing the whole fallback.
         run_model: str | Model | None = None
-        if current_images:
+        if has_image_input:
             if not self._has_vision_model:
                 logfire.warning("No vision-capable models configured; dropping images")
                 current_images = []
             elif self._vision_model is not None:
                 run_model = self._vision_model
 
-        # Mirror the same drop on history images so the history matches.
-        effective_vision = self._has_vision_model
+        # Apply the same capability decision to historical images.
+        effective_vision = has_image_input and self._has_vision_model
         message_history: list[ModelMessage] = []
         for past in turn.history:
             if past.role == "assistant":
