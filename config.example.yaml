@@ -154,6 +154,10 @@ searxng_password: "yourpassword"
 # embedding_api_key_env: OPENROUTER_API_KEY
 # memory_llm_model: "anthropic/claude-3.5-haiku"  # optional; defaults to first llm_models entry
 # memory_llm_api_key_env: OPENROUTER_API_KEY
+# memory_reranker_model: "Qwen3-Reranker-0.6B-4bit-DWQ"  # enables Cohere/Jina-compatible reranking
+# memory_reranker_base_url: "http://localhost:8000/v1"   # defaults to embedding_base_url
+# memory_reranker_api_key_env: OMLX_API_KEY              # embedding credentials inherit only on same URL
+# memory_reranker_candidate_limit: 20
 # memory_search_limit: 5
 # memory_search_threshold: 0.1
 # memory_note_retention_days: 90       # null disables age-based note cleanup

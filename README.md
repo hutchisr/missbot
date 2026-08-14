@@ -47,7 +47,8 @@ backends is the same bot, not a copy of it.
   configurable categories, cooldowns, and an isolated classifier that maps
   constrained labels to code-owned score changes.
 - Optional mem0 long-term memory backed by Postgres/pgvector, including explicit
-  `add_memory`/`search_memory` tools and automatic ingestion of public notes.
+  `add_memory`/`search_memory` tools, remote reranking, and automatic ingestion
+  of public notes.
 - Retention, deduplication, expiration, and per-author limits through a dry-run
   capable maintenance command and Kubernetes CronJob.
 

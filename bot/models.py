@@ -512,6 +512,31 @@ class Config(BaseModel):
         default="OPENROUTER_API_KEY",
         description="Environment variable holding mem0 extraction LLM API key when memory_llm_api_key is unset.",
     )
+    memory_reranker_model: str | None = Field(
+        default=None,
+        description="Optional model for reranking vector-search candidates through a Cohere/Jina-compatible "
+        "POST <base_url>/rerank endpoint. Leave unset to return mem0's vector order directly.",
+    )
+    memory_reranker_base_url: AnyHttpUrl | None = Field(
+        default=None,
+        description="Optional base URL for the reranking endpoint. Defaults to embedding_base_url. Credentials "
+        "are inherited from the embedding endpoint only when both base URLs match.",
+    )
+    memory_reranker_api_key: str | None = Field(
+        default=None,
+        description="Optional API key for the reranking endpoint. Overrides inherited embedding credentials.",
+    )
+    memory_reranker_api_key_env: str | None = Field(
+        default=None,
+        description="Optional environment variable holding the reranking API key. Overrides inherited embedding "
+        "credentials when explicitly configured.",
+    )
+    memory_reranker_candidate_limit: int = Field(
+        default=20,
+        gt=0,
+        description="Number of vector-search candidates sent to the optional reranker. The final result count "
+        "remains bounded by memory_search_limit.",
+    )
     memory_search_limit: int = Field(
         default=5,
         gt=0,

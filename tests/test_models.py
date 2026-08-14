@@ -170,6 +170,10 @@ def test_memory_disabled_by_default(make_config):
     assert cfg.memory_collection_name == "missbot_memories"
     assert cfg.memory_search_limit == 5
     assert cfg.memory_search_threshold == 0.1
+    assert cfg.memory_reranker_model is None
+    assert cfg.memory_reranker_base_url is None
+    assert cfg.memory_reranker_api_key_env is None
+    assert cfg.memory_reranker_candidate_limit == 20
     assert cfg.memory_note_retention_days == 90
     assert cfg.memory_max_memories_per_author == 50
     assert cfg.memory_trusted_user_ids == []

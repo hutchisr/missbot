@@ -10,7 +10,9 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, cast
 
+import httpx
 import logfire
+from pydantic import BaseModel, ConfigDict, Field
 
 from .models import Config, ModelSpec
 from .provider import provider_request_headers
@@ -126,6 +128,25 @@ def _memory_llm_connection(config: Config) -> tuple[str, str, str | None]:
     return model, base_url, api_key
 
 
+def _memory_reranker_connection(config: Config) -> tuple[str, str, str | None] | None:
+    """Resolve the optional reranker without leaking credentials across endpoints."""
+    if not config.memory_reranker_model:
+        return None
+
+    embedding_base_url = str(config.embedding_base_url)
+    base_url = (
+        str(config.memory_reranker_base_url) if config.memory_reranker_base_url is not None else embedding_base_url
+    )
+    credentials_overridden = bool({"memory_reranker_api_key", "memory_reranker_api_key_env"} & config.model_fields_set)
+    if credentials_overridden:
+        api_key = _api_key(config.memory_reranker_api_key, config.memory_reranker_api_key_env)
+    elif base_url.rstrip("/") == embedding_base_url.rstrip("/"):
+        api_key = _api_key(config.embedding_api_key, config.embedding_api_key_env)
+    else:
+        api_key = None
+    return config.memory_reranker_model, base_url, api_key
+
+
 @contextlib.contextmanager
 def _suppress_openrouter_autodetect() -> Iterator[None]:
     """Hide OPENROUTER_API_KEY from mem0's "openai" LLM provider for one construction call.
@@ -228,13 +249,82 @@ _DEFAULT_MEMORY_INSTRUCTIONS = (
 )
 
 
+class _RerankResult(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    index: int = Field(ge=0)
+    relevance_score: float = Field(allow_inf_nan=False)
+
+
+class _RerankResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    results: list[_RerankResult]
+
+
+class _RemoteMemoryReranker:
+    """Cohere/Jina-compatible remote reranker owned by one MemoryStore."""
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        connection = _memory_reranker_connection(config)
+        assert connection is not None, "memory_reranker_model is required to build a reranker"
+        self._model, base_url, api_key = connection
+        headers = provider_request_headers()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        self._client = httpx.AsyncClient(
+            base_url=f"{base_url.rstrip('/')}/",
+            headers=headers,
+            timeout=httpx.Timeout(config.http_timeout_seconds),
+            transport=transport,
+        )
+
+    async def rerank(self, query: str, documents: list[str], limit: int) -> list[_RerankResult]:
+        top_n = min(limit, len(documents))
+        response = await self._client.post(
+            "rerank",
+            json={
+                "model": self._model,
+                "query": query,
+                "documents": documents,
+                "top_n": top_n,
+                "return_documents": False,
+            },
+        )
+        response.raise_for_status()
+        results = _RerankResponse.model_validate(response.json()).results
+        if len(results) != top_n:
+            raise ValueError(f"reranker returned {len(results)} results; expected {top_n}")
+        indexes = [result.index for result in results]
+        if len(set(indexes)) != len(indexes) or any(index >= len(documents) for index in indexes):
+            raise ValueError("reranker returned duplicate or out-of-range document indexes")
+        return results
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+
 class MemoryStore:
     """Small project-facing API over mem0's AsyncMemory."""
 
-    def __init__(self, client: AsyncMemory, config: Config):
+    def __init__(
+        self,
+        client: AsyncMemory,
+        config: Config,
+        *,
+        reranker_transport: httpx.AsyncBaseTransport | None = None,
+    ):
         self._client = client
         self._config = config
         self._agent_id = _normalize_username(config.bot_username)
+        self._reranker = (
+            _RemoteMemoryReranker(config, transport=reranker_transport) if config.memory_reranker_model else None
+        )
 
     @classmethod
     async def create(cls, config: Config) -> MemoryStore:
@@ -248,6 +338,7 @@ class MemoryStore:
             collection=config.memory_collection_name,
             embedding_model=config.embedding_model,
             embedding_dim=config.embedding_dim,
+            reranker_model=config.memory_reranker_model,
         )
         return store
 
@@ -295,13 +386,34 @@ class MemoryStore:
         )
 
     async def search(self, query: str, limit: int) -> list[MemorySearchResult]:
+        candidate_limit = max(limit, self._config.memory_reranker_candidate_limit) if self._reranker else limit
         result = await self._client.search(
             query,
-            top_k=limit,
+            top_k=candidate_limit,
             filters=self._filters(),
             threshold=self._config.memory_search_threshold,
         )
-        return [MemorySearchResult.from_mem0(item) for item in result.get("results", []) if item.get("memory")]
+        items = [item for item in result.get("results", []) if item.get("memory")]
+        memories = [MemorySearchResult.from_mem0(item) for item in items]
+        if self._reranker is None or not memories:
+            return memories[:limit]
+
+        try:
+            rankings = await self._reranker.rerank(query, [memory.memory for memory in memories], limit)
+        except (httpx.HTTPError, ValueError) as exc:
+            logfire.warning(
+                "Memory reranking failed; using vector search order",
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            return memories[:limit]
+
+        reranked: list[MemorySearchResult] = []
+        for ranking in rankings:
+            memory = memories[ranking.index]
+            memory.score = ranking.relevance_score
+            reranked.append(memory)
+        return reranked
 
     async def list_all(self, limit: int) -> list[StoredMemory]:
         """Return agent-scoped memories, including expired rows, for maintenance."""
@@ -330,6 +442,8 @@ class MemoryStore:
         await self._client.delete(memory_id)
 
     async def close(self) -> None:
+        if self._reranker is not None:
+            await self._reranker.close()
         self._client.close()
         for attr in ("vector_store", "_entity_store", "_telemetry_vector_store"):
             store = getattr(self._client, attr, None)

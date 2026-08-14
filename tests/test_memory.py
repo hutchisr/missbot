@@ -1,5 +1,6 @@
 """Tests for the mem0 MemoryStore adapter."""
 
+import json
 import os
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
@@ -9,7 +10,14 @@ import httpx
 import pytest
 from openai import OpenAI
 
-from bot.memory import MemorySearchResult, MemoryStore, StoredMemory, _mem0_config, _suppress_openrouter_autodetect
+from bot.memory import (
+    MemorySearchResult,
+    MemoryStore,
+    StoredMemory,
+    _mem0_config,
+    _memory_reranker_connection,
+    _suppress_openrouter_autodetect,
+)
 from bot.provider import PROJECT_VERSION
 
 
@@ -247,6 +255,27 @@ async def test_create_hides_openrouter_key_from_mem0_construction(make_config, m
     assert os.environ["OPENROUTER_API_KEY"] == "sk-outer"
 
 
+def test_reranker_credentials_inherit_only_for_matching_endpoint(make_config):
+    same_endpoint = _memory_cfg(
+        make_config,
+        embedding_base_url="https://models.example/v1",
+        embedding_api_key="embedding-secret",
+        memory_reranker_model="rerank-model",
+    )
+    assert _memory_reranker_connection(same_endpoint) == (
+        "rerank-model",
+        "https://models.example/v1",
+        "embedding-secret",
+    )
+
+    different_endpoint = same_endpoint.model_copy(update={"memory_reranker_base_url": "https://reranker.example/v1"})
+    assert _memory_reranker_connection(different_endpoint) == (
+        "rerank-model",
+        "https://reranker.example/v1",
+        None,
+    )
+
+
 @pytest.mark.anyio
 async def test_add_note_scopes_to_bot_agent_and_records_author(make_config):
     client = AsyncMock()
@@ -340,6 +369,92 @@ async def test_search_maps_mem0_results(make_config):
             metadata={"author": "alice"},
         )
     ]
+
+
+@pytest.mark.anyio
+async def test_search_reranks_overfetched_candidates(make_config):
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"index": 2, "relevance_score": 0.99},
+                    {"index": 0, "relevance_score": 0.75},
+                ]
+            },
+        )
+
+    client = MagicMock()
+    client.search = AsyncMock(
+        return_value={
+            "results": [
+                {"memory": "vector first", "score": 0.9},
+                {"memory": "vector second", "score": 0.8},
+                {"memory": "reranker first", "score": 0.7, "metadata": {"author": "alice"}},
+            ]
+        }
+    )
+    cfg = _memory_cfg(
+        make_config,
+        memory_reranker_model="rerank-model",
+        memory_reranker_base_url="https://reranker.example/v1",
+        memory_reranker_api_key="reranker-secret",
+        memory_reranker_candidate_limit=20,
+    )
+    transport = httpx.MockTransport(handler)
+    store = MemoryStore(client, cfg, reranker_transport=transport)
+
+    results = await store.search("find this", 2)
+    await store.close()
+
+    client.search.assert_awaited_once_with(
+        "find this",
+        top_k=20,
+        filters={"agent_id": "grok"},
+        threshold=0.1,
+    )
+    assert len(requests) == 1
+    request = requests[0]
+    assert str(request.url) == "https://reranker.example/v1/rerank"
+    assert request.headers["authorization"] == "Bearer reranker-secret"
+    assert request.headers["user-agent"] == f"Missbot/{PROJECT_VERSION}"
+    assert json.loads(request.content) == {
+        "model": "rerank-model",
+        "query": "find this",
+        "documents": ["vector first", "vector second", "reranker first"],
+        "top_n": 2,
+        "return_documents": False,
+    }
+    assert results == [
+        MemorySearchResult(memory="reranker first", score=0.99, metadata={"author": "alice"}),
+        MemorySearchResult(memory="vector first", score=0.75),
+    ]
+
+
+@pytest.mark.anyio
+async def test_search_falls_back_to_vector_order_when_reranker_fails(make_config):
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="unavailable")
+
+    client = MagicMock()
+    client.search = AsyncMock(
+        return_value={
+            "results": [
+                {"memory": "vector first", "score": 0.9},
+                {"memory": "vector second", "score": 0.8},
+            ]
+        }
+    )
+    cfg = _memory_cfg(make_config, memory_reranker_model="rerank-model")
+    store = MemoryStore(client, cfg, reranker_transport=httpx.MockTransport(handler))
+
+    results = await store.search("find this", 1)
+    await store.close()
+
+    assert results == [MemorySearchResult(memory="vector first", score=0.9)]
 
 
 @pytest.mark.anyio
