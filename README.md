@@ -1,5 +1,15 @@
 # Missbot
 
+> [!IMPORTANT]
+> This GitHub repository is a mirror of the canonical
+> [Radicle repository](https://radicle.network/nodes/index.radicle.garden/rad:zLseUdKik1qrsiTonrjSoPGYbC6g).
+> Radicle is the source of truth for branches, issues, and patches. To work from
+> the canonical repository, run:
+>
+> ```bash
+> rad clone rad:zLseUdKik1qrsiTonrjSoPGYbC6g
+> ```
+
 Missbot is a chatbot built with Python and Pydantic AI. It listens to Misskey's
 streaming API, builds conversation context, runs a configurable LLM tool loop,
 and publishes the reply back into the thread — and it serves that same agent
