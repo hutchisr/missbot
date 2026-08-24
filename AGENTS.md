@@ -77,6 +77,30 @@ curl -s https://missbot-acp.taile6e57.ts.net/acp | jq           # transport meta
 
 **Important:** Always use `uv run` or `.venv/bin/python` — never bare `python`.
 
+## GitHub Mirror
+
+Radicle `master` is canonical. `.github/workflows/mirror-radicle-master.yml`
+polls it every 15 minutes (and supports manual dispatch), then fast-forwards
+GitHub `master`. It refuses divergence and never force-pushes.
+
+The workflow uses an ephemeral GitHub-hosted Ubuntu runner. It downloads the
+pinned Radicle release, verifies its SHA-256 checksum, starts a temporary node,
+and clones the public repository from the Radicle network. By default it creates
+a disposable non-delegate identity. For a stable node identity, set the optional
+repository secret `RADICLE_IDENTITY_KEY_B64` to the single-line base64 encoding
+of a dedicated mirror identity's OpenSSH private key; if that key is encrypted,
+also set `RADICLE_IDENTITY_PASSPHRASE`. The workflow derives the public key.
+Never use a maintainer/delegate identity: this read-only fetch needs no Radicle
+authority. The automatic `GITHUB_TOKEN` is used only to push the fast-forward
+to GitHub.
+
+GitHub must allow Actions to request read/write repository permissions; the
+workflow narrows its token to `contents: write`. If `master` has a branch
+protection rule, it must permit this workflow's push. The workflow must exist
+on GitHub's default branch before schedules or manual dispatch work, so
+bootstrap it once by pushing the merged `master` to `origin`.
+
+
 ## Architecture
 
 | File | Purpose |
