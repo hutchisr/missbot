@@ -59,8 +59,13 @@ jobs:
             chmod 600 "${RAD_HOME}/keys/radicle"
             ssh-keygen -y -P "${RAD_PASSPHRASE}" -f "${RAD_HOME}/keys/radicle" > "${RAD_HOME}/keys/radicle.pub"
           fi
+          echo "Using Radicle identity $(rad self --did)"
           rad node start
-          rad clone "${RADICLE_REPOSITORY_ID}" "${RUNNER_TEMP}/radicle-source" --timeout 120s
+          rad clone "${RADICLE_REPOSITORY_ID}" "${RUNNER_TEMP}/radicle-source" \
+            --seed "z6MkuyPDChcwCruKGd2tw54FZo2HemY135JvTLzbVTvoWKJR@index.radicle.garden:8776" \
+            --seed "z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7@iris.radicle.network:8776" \
+            --seed "z6Mkmqogy2qEM2ummccUthFEaaHvyYmYBYh3dbe9W4ebScxo@rosa.radicle.network:8776" \
+            --timeout 120s
 
           git fetch "${RUNNER_TEMP}/radicle-source" master:refs/remotes/rad/master
           git fetch --prune origin master
