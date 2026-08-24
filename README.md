@@ -50,6 +50,9 @@ backends is the same bot, not a copy of it.
 ### Tools, integrations, and state
 
 - Built-in current-time, Misskey user search, and Misskey note search tools.
+- Sandboxed `run_python` calculations and data transformations through
+  pydantic-monty, with no host filesystem, network, environment, or subprocess
+  access and strict execution-time, memory, recursion, code, and output limits.
 - Optional web search through an authenticated SearXNG instance.
 - Streamable-HTTP MCP servers with tool prefixes, allow/block lists, and
   progressive `enable_<gate>` disclosure.

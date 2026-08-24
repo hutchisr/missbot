@@ -13,6 +13,7 @@ dependencies = [
   "mem0ai[nlp]>=2.0.10",
   "psycopg[binary,pool]>=3.3.4",
   "pydantic-ai>=2.13.0",
+  "pydantic-monty>=0.0.21",
   "pyyaml>=6.0.3",
   "redis[hiredis]>=5.0.0",
   "spacy<3.8.14",

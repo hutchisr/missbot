@@ -738,6 +738,12 @@ def test_reply_agent_never_gets_image_tool(make_config):
     assert "generate_image" not in agent._agent._function_toolset.tools
 
 
+def test_reply_agent_gets_python_tool(make_config):
+    agent = ChatAgent(make_config())
+
+    assert "run_python" in agent._agent._function_toolset.tools
+
+
 def test_auto_agent_gets_poll_tool(make_config):
     agent = ChatAgent(make_config(system_prompt_auto="Post something."))
 

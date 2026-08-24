@@ -10,12 +10,29 @@ from urllib.parse import urlparse
 import httpx
 import logfire
 from pydantic_ai import RunContext
+from pydantic_monty import AsyncMonty, CollectString, MontyError, MontyRuntimeError, MontySyntaxError, ResourceLimits
 from redis.asyncio import Redis
 
 from .memory import MemorySearchResult, MemoryStore
 from .models import Config
 
 _HEARSAY_MEMORY_SOURCES = frozenset({"misskey_note", "acp_prompt"})
+_PYTHON_CODE_CHAR_LIMIT = 12_000
+_PYTHON_OUTPUT_BYTE_LIMIT = 32 * 1024
+_PYTHON_RESPONSE_CHAR_LIMIT = 32_000
+_PYTHON_LIMITS: ResourceLimits = {
+    "max_duration_secs": 0.5,
+    "max_memory": 16 * 1024 * 1024,
+    "gc_interval": 1_000,
+    "max_recursion_depth": 100,
+}
+
+
+def _clip_python_response(response: str) -> str:
+    if len(response) <= _PYTHON_RESPONSE_CHAR_LIMIT:
+        return response
+    omitted = len(response) - _PYTHON_RESPONSE_CHAR_LIMIT
+    return f"{response[:_PYTHON_RESPONSE_CHAR_LIMIT]}\n... ({omitted} characters omitted)"
 
 
 def _fence_untrusted(label: str, body: str) -> str:
@@ -129,6 +146,7 @@ def build_tools(
     config: Config,
     redis_client: Redis | None = None,
     memory: MemoryStore | None = None,
+    python_pool: AsyncMonty | None = None,
 ) -> list[Callable[..., object]]:
     """Create tool functions for the given config.
 
@@ -141,6 +159,52 @@ def build_tools(
         return current_datetime()
 
     tools.append(current_datetime_tool)
+    if python_pool is not None:
+        _python_pool = python_pool
+
+        async def run_python(code: str) -> str:
+            """Run Python for a small, deterministic calculation or data transformation.
+
+            The code runs in a pydantic-monty sandbox with strict execution-time,
+            memory, recursion, and output limits. It has no host filesystem, network,
+            environment, subprocess, package-install, or application access. Use
+            printed output or a trailing expression to return the answer.
+
+            Args:
+                code: Python source code. Keep it small and self-contained.
+            """
+            code = (code or "").strip()
+            if not code:
+                return "Python error: empty code."
+            if len(code) > _PYTHON_CODE_CHAR_LIMIT:
+                return f"Python error: code is too long ({len(code)} characters); limit is {_PYTHON_CODE_CHAR_LIMIT}."
+
+            printed = CollectString(max_bytes=_PYTHON_OUTPUT_BYTE_LIMIT)
+            try:
+                async with _python_pool.checkout(script_name="agent_tool.py", limits=_PYTHON_LIMITS) as session:
+                    result = await session.feed_run(code, print_callback=printed)
+            except (MontySyntaxError, MontyRuntimeError) as exc:
+                return f"Python error: {exc.display(format='type-msg')}"
+            except MemoryError:
+                return f"Python error: printed output exceeded {_PYTHON_OUTPUT_BYTE_LIMIT} bytes."
+            except TimeoutError:
+                return "Python error: sandbox capacity was unavailable; try again."
+            except MontyError as exc:
+                return f"Python sandbox error: {type(exc).__name__}: {exc}"
+            except Exception:
+                logfire.exception("Unexpected error running sandboxed Python")
+                return "Python sandbox unavailable."
+
+            sections: list[str] = []
+            if output := printed.output.rstrip():
+                sections.append(f"Output:\n{output}")
+            if result is not None:
+                sections.append(f"Result:\n{result!r}")
+            if not sections:
+                return "Code completed with no output."
+            return _clip_python_response("\n\n".join(sections))
+
+        tools.append(run_python)
 
     if config.searxng_url:
 

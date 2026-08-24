@@ -29,6 +29,7 @@ from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings, merge_model_settings
 from pydantic_ai.usage import RequestUsage
+from pydantic_monty import AsyncMonty
 from redis.asyncio import Redis
 
 from .core import AgentTurn, AutoPost, HistoryTurn, Poll, TurnImage
@@ -588,7 +589,18 @@ class ChatAgent:
         else:
             self._vision_model = _chain(vision_specs)
 
-        tools = build_tools(config, redis_client=redis_client, memory=memory)
+        self._python_pool = AsyncMonty(
+            min_processes=1,
+            max_processes=4,
+            checkout_timeout=1,
+            request_timeout=2,
+        )
+        tools = build_tools(
+            config,
+            redis_client=redis_client,
+            memory=memory,
+            python_pool=self._python_pool,
+        )
         gates = gate_names(config)
         for gate, servers in sorted(gates.items()):
             tools.append(_make_enable_gate_tool(gate, servers))
@@ -596,7 +608,7 @@ class ChatAgent:
 
         # Auto agent runs without AgentDeps, so skip tools that touch ctx.deps
         # (social-credit tools and enable_<gate> meta-tools).
-        auto_tools = build_tools(config, redis_client=None)
+        auto_tools = build_tools(config, redis_client=None, python_pool=self._python_pool)
         auto_tools.append(_make_create_poll_tool())
 
         async def _inject_social_credit(ctx: RunContext[AgentDeps]) -> str:
@@ -690,12 +702,20 @@ class ChatAgent:
             )
 
     async def __aenter__(self) -> Self:
-        """Open persistent connections (MCP sessions) on the main agent."""
-        await self._agent.__aenter__()
+        """Open the Python worker pool and persistent MCP sessions."""
+        await self._python_pool.__aenter__()
+        try:
+            await self._agent.__aenter__()
+        except BaseException as exc:
+            await self._python_pool.__aexit__(type(exc), exc, exc.__traceback__)
+            raise
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        await self._agent.__aexit__(exc_type, exc, tb)
+        try:
+            await self._agent.__aexit__(exc_type, exc, tb)
+        finally:
+            await self._python_pool.__aexit__(exc_type, exc, tb)
 
     def _enforce_budget(self, ctx: RunContext[AgentDeps], output: str) -> str:
         """Output validator hard-gating the reply to the turn's ``char_budget``.

@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from pydantic_monty import AsyncMonty
 
 from bot.memory import MemorySearchResult
 from bot.tools import build_tools, current_datetime
@@ -31,6 +32,27 @@ def test_build_tools_minimal(config):
     # No searxng, no redis → these absent
     assert "search_web" not in names
     assert "get_social_credit" not in names
+
+
+@pytest.mark.anyio
+async def test_run_python_is_bounded_and_has_no_host_filesystem(config):
+    async with AsyncMonty(min_processes=1, max_processes=1, request_timeout=2) as pool:
+        run_python = _find(build_tools(config, python_pool=pool), "run_python")
+
+        result = await run_python("print('squares')\nsum(i * i for i in range(6))")
+        filesystem_result = await run_python("open('/etc/passwd').read()")
+        environment_result = await run_python("import os\nos.getenv('HOME')")
+        network_result = await run_python("import socket")
+        subprocess_result = await run_python("import subprocess")
+        timeout_result = await run_python("while True:\n    pass")
+
+    assert result == "Output:\nsquares\n\nResult:\n55"
+    assert filesystem_result.startswith("Python error:")
+    assert "PermissionError" in filesystem_result
+    assert environment_result.startswith("Python error: RuntimeError:")
+    assert network_result.startswith("Python error: ModuleNotFoundError:")
+    assert subprocess_result.startswith("Python error: ModuleNotFoundError:")
+    assert timeout_result.startswith("Python error: TimeoutError:")
 
 
 def test_build_tools_with_searxng(make_config):

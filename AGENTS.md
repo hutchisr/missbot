@@ -90,7 +90,7 @@ curl -s https://missbot-acp.taile6e57.ts.net/acp | jq           # transport meta
 | `bot/acp/__main__.py` | `python -m bot.acp {stdio,serve}` entry points. Routes **all** logging to stderr — stdout is the JSON-RPC channel |
 | `bot/ai.py` | `ChatAgent` class — Pydantic AI agent with `FallbackModel`, vision support. Consumes `AgentTurn`; the reply length cap is per-run (`AgentDeps.char_budget`), not baked into the agent |
 | `bot/models.py` | Pydantic models: `Config`, `Note`, `User`, `MiFile`, WS message types |
-| `bot/tools.py` | `build_tools()` factory — datetime, web search, search_users/notes, social credit tools; `apply_social_credit()` helper |
+| `bot/tools.py` | `build_tools()` factory — datetime, sandboxed pydantic-monty Python, web search, search_users/notes, social credit tools; `apply_social_credit()` helper |
 | `bot/scoring.py` | Injection-resistant message classifier: `build_scoring_spec()` turns `Config.social_credit_categories` into the constrained output type + delta map + hardened instructions; `build_scoring_prompt()` fences untrusted input |
 | `bot/memory.py` | Thin async adapter around mem0's `AsyncMemory`; builds the mem0 config, scopes memories to the bot `agent_id`, and exposes the runtime plus maintenance read/delete paths |
 | `bot/maintenance.py` | Out-of-process mem0 cleanup CLI; selects expired, duplicate, stale, empty, and per-author overflow note memories, then deletes them through mem0 so entity links stay consistent. Driven by `k8s/maintenance.yaml` |
@@ -235,6 +235,7 @@ Gating is progressive disclosure driven by the model itself: each unique `gate` 
 - Every author's score moves via `ChatAgent._maybe_score_message` (privileged users included): a separate tool-less classifier (`bot/scoring.py`, model from `score_models` or the reply model) runs concurrently with the reply, returns one of the configured `social_credit_categories` (default toxic/rude/neutral/good/exceptional) that's mapped to its fixed delta in code, applied through `apply_social_credit` and rate-limited by a Redis `score_cooldown:<user>` key. `ChatAgent.__init__` builds a `ScoringSpec` (constrained output type + delta map + instructions) from the configured categories via `build_scoring_spec`. This is the prompt-injection mitigation — the model only picks a category name, never the number
 - Agent uses `output_type=str` (plain string output, not structured)
 - Tools are built via `build_tools()` in `bot/tools.py` and passed to `Agent(..., tools=tools)`
+- `ChatAgent` owns one async pydantic-monty worker pool (1 warm worker, 4 maximum) shared by the reply and auto agents. Its context manager opens the pool before the Pydantic AI/MCP context and closes it afterward; `build_tools(..., python_pool=...)` only registers `run_python` when passed that live pool
 - When `memory_enabled`, the bot receives a `MemoryStore` adapter around mem0 `AsyncMemory`; the adapter is passed to `build_tools()` so `add_memory` and `search_memory` are exposed
 - `ChatAgent.run` runs three coroutines concurrently via `asyncio.gather`: the reply, `_maybe_score_message`, and `_maybe_ingest_note` (mem0 ingestion when `memory_ingest_notes`). Like scoring, note ingestion swallows its own errors, so it never affects the reply
 - `FallbackModel` wraps multiple `llm_models` for automatic failover
@@ -264,6 +265,7 @@ When `system_prompt_auto` and `auto_post_interval` are configured, `ChatAgent.ru
 
 ## Available Tools (runtime)
 - `current_datetime_tool` — always available
+- `run_python` — always available to reply and auto agents for small deterministic calculations/data transformations. Code runs in a pydantic-monty worker with a 0.5-second execution-time limit, 16 MiB heap, recursion/code/output caps, and no host filesystem, network, environment, subprocess, package-install, or application access. Printed output and the trailing expression are returned
 - `search_web` (async) — when `searxng_url` configured. Returns domain-prefixed snippets
 - `search_users`, `search_notes` — Misskey search APIs
 - Social credit tools (when Redis configured): `get_social_credit`, `adjust_social_credit` (privileged authors only), `get_social_credit_history`, `get_social_credit_leaderboard`. All users (privileged included) are also scored automatically by the `bot/scoring.py` classifier, separate from any tool call
