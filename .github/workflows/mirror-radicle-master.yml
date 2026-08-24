@@ -65,8 +65,14 @@ jobs:
           rad node start
           rad node connect \
             "z6MkuyPDChcwCruKGd2tw54FZo2HemY135JvTLzbVTvoWKJR@index.radicle.garden:8776"
+          rad node connect \
+            "z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7@iris.radicle.network:8776"
+          rad node connect \
+            "z6Mkmqogy2qEM2ummccUthFEaaHvyYmYBYh3dbe9W4ebScxo@rosa.radicle.network:8776"
           rad clone "${RADICLE_REPOSITORY_ID}" "${RUNNER_TEMP}/radicle-source" \
             --seed "z6MkuyPDChcwCruKGd2tw54FZo2HemY135JvTLzbVTvoWKJR" \
+            --seed "z6MkrLMMsiPWUcNPHcRajuMi9mDfYckSoJyPwwnknocNYPm7" \
+            --seed "z6Mkmqogy2qEM2ummccUthFEaaHvyYmYBYh3dbe9W4ebScxo" \
             --timeout 120s
 
           git fetch "${RUNNER_TEMP}/radicle-source" master:refs/remotes/rad/master
