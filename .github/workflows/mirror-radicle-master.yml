@@ -53,11 +53,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          printf '\n' | RAD_PASSPHRASE='' rad auth --alias github-mirror --stdin
           if test -n "${RADICLE_IDENTITY_KEY_B64}"; then
+            rad config init --alias github-mirror
             printf '%s' "${RADICLE_IDENTITY_KEY_B64}" | base64 --decode > "${RAD_HOME}/keys/radicle"
             chmod 600 "${RAD_HOME}/keys/radicle"
             ssh-keygen -y -P "${RAD_PASSPHRASE}" -f "${RAD_HOME}/keys/radicle" > "${RAD_HOME}/keys/radicle.pub"
+          else
+            printf '\n' | RAD_PASSPHRASE='' rad auth --alias github-mirror --stdin
           fi
           echo "Using Radicle identity $(rad self --did)"
           rad node start
