@@ -206,6 +206,16 @@ def test_model_settings_identify_missbot(config):
     assert _CLASSIFIER_MODEL_SETTINGS.get("extra_headers") == expected_headers
 
 
+def test_auto_temperature_overrides_only_autonomous_posts(make_config):
+    agent = ChatAgent(make_config(temperature=0.4, auto_temperature=1.2))
+
+    assert agent._generation_settings(30.0).get("temperature") == 0.4
+    assert agent._generation_settings(30.0, auto_post=True).get("temperature") == 1.2
+
+    inherited = ChatAgent(make_config(temperature=0.7))
+    assert inherited._generation_settings(30.0, auto_post=True).get("temperature") == 0.7
+
+
 def test_enforce_length_passes_through_within_budget():
     validate = _enforce_length(10)
     assert validate("") == ""

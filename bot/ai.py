@@ -741,13 +741,13 @@ class ChatAgent:
             )
         return output
 
-    def _generation_settings(self, timeout: float) -> ModelSettings:
-        """Model settings for the reply/auto agents: the configured token cap
-        (``max_tokens`` — otherwise unused), any configured sampling/anti-repetition
-        knobs, versioned Missbot identification headers, and a per-call timeout.
+    def _generation_settings(self, timeout: float, *, auto_post: bool = False) -> ModelSettings:
+        """Model settings for reply and autonomous-post generation.
 
         ``max_tokens`` and the sampling params are only included when set in config, so
         unset ones keep the provider default (and aren't sent to models that reject them).
+        Autonomous posts use ``auto_temperature`` when configured, otherwise they inherit
+        the shared ``temperature`` setting.
         """
         settings: ModelSettings = {
             "timeout": timeout,
@@ -755,8 +755,13 @@ class ChatAgent:
         }
         if self._config.max_tokens is not None:
             settings["max_tokens"] = self._config.max_tokens
-        if self._config.temperature is not None:
-            settings["temperature"] = self._config.temperature
+        temperature = (
+            self._config.auto_temperature
+            if auto_post and self._config.auto_temperature is not None
+            else self._config.temperature
+        )
+        if temperature is not None:
+            settings["temperature"] = temperature
         if self._config.top_p is not None:
             settings["top_p"] = self._config.top_p
         if self._config.frequency_penalty is not None:
@@ -942,7 +947,7 @@ class ChatAgent:
         result = await self._auto_agent.run(
             "Generate a post for the timeline.",
             message_history=message_history,
-            model_settings=self._generation_settings(300.0),
+            model_settings=self._generation_settings(300.0, auto_post=True),
             deps=deps,
         )
         text = result.output

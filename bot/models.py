@@ -227,6 +227,13 @@ class Config(BaseModel):
         description="Sampling temperature for the reply/auto models. None leaves the provider default "
         "unchanged. Higher = more varied (helps avoid the bot repeating its own phrasing).",
     )
+    auto_temperature: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=2.0,
+        description="Sampling temperature override for autonomous posts. None reuses temperature, "
+        "including its provider-default behavior.",
+    )
     top_p: float | None = Field(
         default=None,
         gt=0.0,

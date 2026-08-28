@@ -29,6 +29,15 @@ def test_config_max_tokens_optional(make_config):
     assert make_config(max_tokens=None).max_tokens is None
 
 
+def test_config_auto_temperature_is_optional_and_bounded(make_config):
+    assert make_config().auto_temperature is None
+    assert make_config(auto_temperature=1.2).auto_temperature == 1.2
+    with pytest.raises(ValidationError):
+        make_config(auto_temperature=-0.1)
+    with pytest.raises(ValidationError):
+        make_config(auto_temperature=2.1)
+
+
 def test_config_auto_post_requires_auto_prompt(make_config):
     with pytest.raises(ValidationError) as exc:
         make_config(auto_post_interval=60)

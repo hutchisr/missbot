@@ -770,6 +770,22 @@ async def test_run_auto_returns_text_only_when_no_image(make_config):
 
 
 @pytest.mark.anyio
+async def test_run_auto_uses_autonomous_temperature(make_config):
+    agent = ChatAgent(
+        make_config(system_prompt_auto="Post something.", temperature=0.4, auto_temperature=1.2)
+    )
+    assert agent._auto_agent is not None
+    run_mock = AsyncMock(return_value=SimpleNamespace(output="post text"))
+
+    with patch.object(agent._auto_agent, "run", run_mock):
+        await agent.run_auto()
+
+    await_args = run_mock.await_args
+    assert await_args is not None
+    assert await_args.kwargs["model_settings"]["temperature"] == 1.2
+
+
+@pytest.mark.anyio
 async def test_run_auto_carries_image_generated_during_the_run(make_config):
     agent = ChatAgent(_auto_config(make_config))
     assert agent._auto_agent is not None
