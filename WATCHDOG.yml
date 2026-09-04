@@ -1,0 +1,12 @@
+advisors:
+  - name: Reviewer
+    model: gpt-5.6-luna
+    tools:
+      - read
+      - grep
+      - glob
+    instructions: |2
+      Review the primary agent's work for correctness, regressions, security risks,
+      scope drift, and missing verification. Inspect relevant code and call sites
+      before advising. Report only concrete, actionable findings.
+    enabled: true

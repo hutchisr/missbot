@@ -59,11 +59,9 @@ backends is the same bot, not a copy of it.
 - Optional Redis-backed social credit with history and leaderboard tools,
   configurable categories, cooldowns, and an isolated classifier that maps
   constrained labels to code-owned score changes.
-- Optional mem0 long-term memory backed by Postgres/pgvector, including explicit
-  `add_memory`/`search_memory` tools, remote reranking, and automatic ingestion
-  of public notes.
-- Retention, deduplication, expiration, and per-author limits through a dry-run
-  capable maintenance command and Kubernetes CronJob.
+- Optional Hindsight long-term memory, including explicit
+  `add_memory`/`search_memory` tools, provenance-aware recall, and automatic
+  ingestion of public messages through one shared bank.
 
 ### Safeguards and operations
 
@@ -145,24 +143,6 @@ The endpoint serves `/acp/ws` for the socket, `/acp` for transport metadata, and
 `/healthz` as a probe. Because stdout carries the protocol, both modes send all
 logging to stderr.
 
-## Memory Maintenance
-
-When long-term memory is enabled, inspect a cleanup pass before deleting
-anything:
-
-```bash
-uv run python -m bot.maintenance cleanup --dry-run -c config.local.yaml
-```
-
-Run the same cleanup for real after reviewing the summary:
-
-```bash
-uv run python -m bot.maintenance cleanup -c config.local.yaml
-```
-
-Explicit `add_memory` entries are protected from retention and per-author cap
-cleanup. The Kubernetes deployment runs the destructive form on a schedule.
-
 ## Development
 
 ```bash
@@ -189,9 +169,8 @@ mise run deploy
 ```
 
 `mise run build` builds and pushes the image. `mise run deploy` applies the
-Kustomize manifests and restarts the deployment. Edit
-[k8s/maintenance-settings.yaml](k8s/maintenance-settings.yaml) to change the
-memory-cleanup schedule or timezone.
+Kustomize manifests and restarts the deployment. The runtime configuration in
+`k8s/config.yaml` points Missbot at the in-cluster Hindsight API service.
 
 ## Project Layout
 
@@ -202,8 +181,7 @@ memory-cleanup schedule or timezone.
 - [bot/models.py](bot/models.py) — Runtime and configuration models
 - [bot/tools.py](bot/tools.py) — Built-in, social-credit, and memory tools
 - [bot/scoring.py](bot/scoring.py) — Constrained automatic score classification
-- [bot/memory.py](bot/memory.py) — mem0 adapter for runtime and maintenance access
-- [bot/maintenance.py](bot/maintenance.py) — Long-term-memory cleanup CLI
+- [bot/memory.py](bot/memory.py) — Official Hindsight client adapter and provenance mapping
 - [bot/mcp.py](bot/mcp.py) — MCP server filtering, prefixes, and gates
 - [bot/net.py](bot/net.py) — Federated-media SSRF protection
 - [config.example.yaml](config.example.yaml) — Configuration template

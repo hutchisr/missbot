@@ -4,8 +4,6 @@ kind: Kustomization
 resources:
 - base.yaml
 - acp.yaml
-- maintenance-settings.yaml
-- maintenance.yaml
 generatorOptions:
   disableNameSuffixHash: true
 secretGenerator:
@@ -23,24 +21,3 @@ secretGenerator:
   options:
     labels:
       app.kubernetes.io/name: missbot
-replacements:
-- source:
-    kind: ConfigMap
-    name: missbot-maintenance-settings
-    fieldPath: data.schedule
-  targets:
-  - select:
-      kind: CronJob
-      name: missbot-maintenance
-    fieldPaths:
-    - spec.schedule
-- source:
-    kind: ConfigMap
-    name: missbot-maintenance-settings
-    fieldPath: data.timeZone
-  targets:
-  - select:
-      kind: CronJob
-      name: missbot-maintenance
-    fieldPaths:
-    - spec.timeZone

@@ -66,7 +66,7 @@ async def main_async(config: Config) -> None:
         )
         logfire.info("Redis client initialized")
 
-    # Initialize the long-term memory store (Postgres + pgvector) if enabled
+    # Initialize the shared Hindsight memory client if enabled
     memory: MemoryStore | None = None
     if config.memory_enabled:
         memory = await MemoryStore.create(config)

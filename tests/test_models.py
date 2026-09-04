@@ -206,60 +206,45 @@ def test_custom_openai_model_remains_compatibility_alias():
 def test_memory_disabled_by_default(make_config):
     cfg = make_config()
     assert cfg.memory_enabled is False
-    assert cfg.embedding_dim == 1024
-    assert cfg.embedding_api_key_env == "OPENROUTER_API_KEY"
-    assert "openrouter.ai" in str(cfg.embedding_base_url)
-    assert cfg.memory_collection_name == "missbot_memories"
+    assert str(cfg.hindsight_base_url) == "http://localhost:8888/"
+    assert cfg.hindsight_api_key is None
+    assert cfg.hindsight_api_key_env == "HINDSIGHT_API_KEY"
+    assert cfg.hindsight_bank_id is None
+    assert cfg.hindsight_retain_mission is None
+    assert cfg.hindsight_recall_budget == "mid"
+    assert cfg.hindsight_recall_max_tokens == 4096
     assert cfg.memory_search_limit == 5
-    assert cfg.memory_search_threshold == 0.1
-    assert cfg.memory_reranker_model is None
-    assert cfg.memory_reranker_base_url is None
-    assert cfg.memory_reranker_api_key_env is None
-    assert cfg.memory_reranker_candidate_limit == 20
-    assert cfg.memory_note_retention_days == 90
-    assert cfg.memory_max_memories_per_author == 50
+    assert cfg.memory_ingest_notes is True
     assert cfg.memory_trusted_user_ids == []
-    assert cfg.memory_cleanup_scan_limit == 10_000
 
 
-def test_memory_enabled_requires_postgres_url(make_config):
-    with pytest.raises(ValidationError) as exc:
-        make_config(memory_enabled=True, embedding_model="perplexity/pplx-embed-v1-0.6b")
-    assert "postgres_url" in str(exc.value)
+def test_memory_enabled_uses_default_hindsight_connection(make_config):
+    cfg = make_config(memory_enabled=True)
 
-
-def test_memory_enabled_requires_embedding_model(make_config):
-    with pytest.raises(ValidationError) as exc:
-        make_config(memory_enabled=True, postgres_url="postgres://u:p@db/x")
-    assert "embedding_model" in str(exc.value)
-
-
-def test_memory_enabled_with_required_fields_ok(make_config):
-    cfg = make_config(
-        memory_enabled=True,
-        postgres_url="postgres://u:p@db/x",
-        embedding_model="perplexity/pplx-embed-v1-0.6b",
-    )
     assert cfg.memory_enabled is True
-    assert cfg.embedding_model == "perplexity/pplx-embed-v1-0.6b"
-    assert cfg.memory_llm_api_key_env == "OPENROUTER_API_KEY"
+    assert str(cfg.hindsight_base_url) == "http://localhost:8888/"
 
 
-def test_embedding_dimensions_must_equal_embedding_dim(make_config):
+def test_hindsight_bank_id_must_not_be_blank(make_config):
     with pytest.raises(ValidationError) as exc:
-        make_config(embedding_dim=1024, embedding_dimensions=2560)
-    assert "embedding_dimensions" in str(exc.value)
+        make_config(memory_enabled=True, hindsight_bank_id="   ")
+
+    assert "hindsight_bank_id" in str(exc.value)
 
 
-def test_embedding_dimensions_equal_is_ok(make_config):
+def test_hindsight_recall_settings_are_configurable(make_config):
     cfg = make_config(
         memory_enabled=True,
-        postgres_url="postgres://u:p@db/x",
-        embedding_model="perplexity/pplx-embed-v1-4b",
-        embedding_dim=1024,
-        embedding_dimensions=1024,
+        hindsight_base_url="https://memory.example.test",
+        hindsight_bank_id="shared-bank",
+        hindsight_recall_budget="high",
+        hindsight_recall_max_tokens=2048,
     )
-    assert cfg.embedding_dimensions == 1024
+
+    assert str(cfg.hindsight_base_url) == "https://memory.example.test/"
+    assert cfg.hindsight_bank_id == "shared-bank"
+    assert cfg.hindsight_recall_budget == "high"
+    assert cfg.hindsight_recall_max_tokens == 2048
 
 
 def test_score_categories_default(make_config):

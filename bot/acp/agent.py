@@ -2,8 +2,8 @@
 
 `ChatAgent` is transport-neutral (see `bot/core.py`), so this module is an adapter in
 the same sense `bot/bot.py` is — it translates ACP prompts into `AgentTurn`s and pushes
-replies back as session updates. State lives in Postgres (mem0) and Redis, so an ACP
-process pointed at the same backends is genuinely the same bot, not a copy of it.
+replies back as session updates. State lives in Hindsight and Redis, so an ACP process
+pointed at the same backends is genuinely the same bot, not a copy of it.
 
 Deliberately not implemented: `session/load` (no persistence across process restarts),
 and the client's file-system/terminal capabilities. Missbot is a conversational agent,

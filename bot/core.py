@@ -76,10 +76,9 @@ class AgentTurn:
     source_id: str | None = None
     """Platform id of the source message, recorded as memory provenance."""
     source: str = "unknown"
-    """Provenance label stored on memories inferred from this turn (``misskey_note``,
-    ``acp_prompt``, ...). Every adapter sets its own; maintenance treats anything that
-    is not an explicit ``add_memory`` write as inferred, so a new frontend's label is
-    covered by retention and per-author caps without further changes."""
+    """Provenance label retained with inferred memories (``misskey_note``,
+    ``acp_prompt``, ...). Every adapter supplies its own label so recalled facts can
+    be attributed and fenced correctly."""
     memory_writes_allowed: bool = True
     """False for private/restricted interactions, so their content stays out of the
     bot-global memory namespace. The adapter owns that judgement."""

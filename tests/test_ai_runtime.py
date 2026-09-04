@@ -425,20 +425,15 @@ async def test_run_scoring_failure_does_not_break_reply(make_config, make_turn, 
     assert not await fake_redis.exists("score_cooldown:alice")
 
 
-# --- turn -> mem0 ingestion ---
+# --- turn -> Hindsight ingestion ---
 
 
 def _memory_cfg(make_config, **extra):
-    return make_config(
-        memory_enabled=True,
-        postgres_url="postgres://u:p@db/x",
-        embedding_model="perplexity/pplx-embed-v1-0.6b",
-        **extra,
-    )
+    return make_config(memory_enabled=True, **extra)
 
 
 @pytest.mark.anyio
-async def test_run_ingests_turn_with_mem0(make_config, make_turn):
+async def test_run_ingests_turn_with_hindsight(make_config, make_turn):
     mem = AsyncMock()
     agent = ChatAgent(_memory_cfg(make_config), memory=mem)
 
@@ -493,9 +488,9 @@ async def test_run_ingestion_skips_empty_text(make_config, make_turn):
 
 
 @pytest.mark.anyio
-async def test_run_ingestion_swallows_mem0_errors(make_config, make_turn):
+async def test_run_ingestion_swallows_hindsight_errors(make_config, make_turn):
     mem = AsyncMock()
-    mem.add_note.side_effect = RuntimeError("mem0 down")
+    mem.add_note.side_effect = RuntimeError("Hindsight down")
     agent = ChatAgent(_memory_cfg(make_config), memory=mem)
 
     with patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))):

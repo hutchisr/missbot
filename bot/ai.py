@@ -1072,10 +1072,10 @@ class ChatAgent:
         return output
 
     async def _maybe_ingest_note(self, turn: AgentTurn) -> None:
-        """Let mem0 learn durable memories from the author's message.
+        """Let Hindsight learn durable facts from the author's public message.
 
-        mem0 owns extraction, deduplication, and storage. This side task is guarded by
-        ``_guarded`` in ``run`` and also catches its own errors so memory never breaks replies.
+        Hindsight owns extraction, deduplication, storage, and retrieval. This side
+        task catches its own errors so memory can never break a reply.
         """
         if self._memory is None or not self._config.memory_enabled or not self._config.memory_ingest_notes:
             return

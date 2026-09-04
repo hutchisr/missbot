@@ -2,12 +2,12 @@
 
 <!-- This file is the project doc; CLAUDE.md is just `@AGENTS.md`. Edit AGENTS.md, not CLAUDE.md. -->
 
-Pydantic AI chat agent with LLM fallback, an optional Redis-backed social credit system, and optional mem0 long-term memory backed by Postgres/pgvector. It serves **two frontends over one shared brain**:
+Pydantic AI chat agent with LLM fallback, an optional Redis-backed social credit system, and optional Hindsight long-term memory. It serves **two frontends over one shared brain**:
 
 - **Misskey/Fediverse** (`bot/bot.py`) — WebSocket streaming, mentions, timeline auto-replies, autonomous posts
 - **ACP** (`bot/acp/`) — Agent Client Protocol over stdio, so ACP clients (Zed, JetBrains, [buzz-acp](https://github.com/block/buzz)) reach the same persona
 
-Both are thin adapters translating their wire format into the neutral `AgentTurn` in `bot/core.py`; `ChatAgent` never sees a platform type. Persona, memories, and scores live in Postgres and Redis, so a separate ACP process pointed at the same backends is genuinely the same bot rather than a copy of it.
+Both are thin adapters translating their wire format into the neutral `AgentTurn` in `bot/core.py`; `ChatAgent` never sees a platform type. Persona and memories live in Hindsight while scores live in Redis, so separate Misskey and ACP processes pointed at the same backends are genuinely the same bot rather than copies.
 
 ## Commands
 
@@ -26,14 +26,6 @@ uv run python -m bot.acp serve -c config.local.yaml --host 0.0.0.0 --port 8080 -
 # Consumer side (e.g. buzz-acp):
 #   BUZZ_ACP_AGENT_COMMAND="acpremote mirror ws://<host>:8080/acp/ws --bearer-token $ACP_TOKEN"
 
-# mem0 maintenance (the k8s CronJob runs the destructive form daily)
-uv run python -m bot.maintenance cleanup --dry-run -c config.local.yaml
-uv run python -m bot.maintenance cleanup -c config.local.yaml
-# Embedding-model migration (stop every memory reader/writer before the live form).
-# The live form takes full timestamped backups and atomically replaces only the
-# vector columns in both the memory and entity tables.
-uv run python -m bot.maintenance reembed --dry-run -c config.local.yaml
-uv run python -m bot.maintenance reembed -c config.local.yaml
 
 # Test
 # OPENROUTER_API_KEY must be set or test collection errors out: importing the agents
@@ -55,16 +47,11 @@ docker build -t missbot . && docker run -v /path/to/config.yaml:/config.yaml mis
 mise run build      # Build and push Docker image
 mise run deploy     # Apply K8s manifests and restart
 # k8s/config.yaml and k8s/secrets.txt are ignored local inputs; Kustomize emits
-# both as Secrets (the runtime config contains the Misskey token/DB credentials).
-# Edit k8s/maintenance-settings.yaml for the cleanup schedule/timezone; set
-# memory_max_memories_per_author in config.yaml for the per-author limit.
-
-# Production cluster (kubectl context: mercury)
-# Memory DB is CloudNativePG, NOT local. Connect via the primary pod with peer auth
-# as the postgres OS user (the `grok` app user fails peer auth; never put the password on the
-# command line — the safety classifier blocks it, and you don't need it):
-kubectl exec -n cnpg pg-cluster-1 -- psql -U postgres -d grok -tAc "SELECT count(*) FROM missbot_memories"
-# Bot pod and memory-maintenance CronJob live in the `misskey` namespace (missbot-*), not `default`.
+# both as Secrets (the runtime config contains the Misskey token and provider credentials).
+# Hindsight runs in the `hindsight` namespace. Missbot reaches it through
+# http://hindsight-api.hindsight.svc.cluster.local:8888.
+kubectl -n hindsight logs deployment/hindsight-api --tail=50
+curl -s https://hindsight-api.taile6e57.ts.net/health
 
 # ACP endpoint (k8s/acp.yaml: Deployment + Service + Tailscale Ingress)
 kubectl -n misskey logs deployment/missbot-acp --tail=50
@@ -116,8 +103,7 @@ bootstrap it once by pushing the merged `master` to `origin`.
 | `bot/models.py` | Pydantic models: `Config`, `Note`, `User`, `MiFile`, WS message types |
 | `bot/tools.py` | `build_tools()` factory — datetime, sandboxed pydantic-monty Python, web search, search_users/notes, social credit tools; `apply_social_credit()` helper |
 | `bot/scoring.py` | Injection-resistant message classifier: `build_scoring_spec()` turns `Config.social_credit_categories` into the constrained output type + delta map + hardened instructions; `build_scoring_prompt()` fences untrusted input |
-| `bot/memory.py` | Thin async adapter around mem0's `AsyncMemory`; builds the mem0 config, scopes memories to the bot `agent_id`, and exposes the runtime plus maintenance read/delete paths |
-| `bot/maintenance.py` | Out-of-process mem0 cleanup CLI; selects expired, duplicate, stale, empty, and per-author overflow note memories, then deletes them through mem0 so entity links stay consistent. Driven by `k8s/maintenance.yaml` |
+| `bot/memory.py` | Thin async adapter around the official `hindsight-client`; creates the shared bank, retains provenance-bearing public messages and explicit memories, and recalls raw world/experience facts |
 | `bot/net.py` | `is_safe_media_url()` — SSRF guard for attacker-supplied image URLs (blocks private/reserved IPs and internal hosts); `fetch_image()` — bounded, guarded download used by `vision_image_mode: fetch` |
 | `bot/imagegen.py` | `ImageGenerator` + `GeneratedImage` — OpenAI-compatible `/images/generations` client for auto-post images. Validates by magic bytes (PNG/JPEG/GIF/WebP, SVG refused), caps the response body and decoded size, and uses a dedicated client so the Misskey token never reaches the provider |
 | `bot/mcp.py` | `build_mcp_toolsets()` + `gate_names()` — streamable-HTTP MCP servers with allow/block and gate filtering |
@@ -149,7 +135,7 @@ Optional fields:
 - `auto_timeout_seconds` (default `300`): per-request timeout for autonomous model generation. This is independent of the frontend HTTP client timeout
 - `temperature`, `top_p`, `frequency_penalty`, `presence_penalty` (all default unset/`None`): sampling + anti-repetition knobs for the **reply and auto-post** models, applied via `ChatAgent._generation_settings`. Each is only sent to the model when set (so an unset one keeps the provider default and isn't sent to models that reject it). Positive `frequency_penalty`/`presence_penalty` curb the bot reusing its own phrasing turn-after-turn. Bounds: temperature 0–2, top_p 0–1, penalties −2–2. The social scoring classifier is unaffected (it keeps its own structured-output settings)
 - `auto_temperature` (default unset/`None`): autonomous-post-only sampling temperature. When set, it overrides `temperature` for `ChatAgent.run_auto()` without changing replies or ACP; when unset, autonomous posts inherit the shared `temperature` setting (including its provider-default behavior). Bounds: 0–2. A higher value can reduce repetitive phrasing at the cost of more variable output
-- Every model-provider request identifies the app with the HTTPS Radicle Explorer URL for `rad:zLseUdKik1qrsiTonrjSoPGYbC6g` as `HTTP-Referer`, plus versioned `User-Agent: Missbot/<version>` and `X-OpenRouter-Title: missbot-<version>` headers. This covers reply, ACP, autonomous-post, social-scoring, mem0 extraction and embedding, and image-generation calls
+- Every model-provider request identifies the app with the HTTPS Radicle Explorer URL for `rad:zLseUdKik1qrsiTonrjSoPGYbC6g` as `HTTP-Referer`, plus versioned `User-Agent: Missbot/<version>` and `X-OpenRouter-Title: missbot-<version>` headers. This covers reply, ACP, autonomous-post, social-scoring, and image-generation calls. Hindsight API requests use `User-Agent: Missbot/<version>`; Hindsight owns its internal model-provider requests
 - `vision`: bool (default `true`) — pass images directly to the main LLM
 - `vision_image_mode` (default `url`): `url` sends the media URL; `fetch` downloads the image and sends it inline as base64. **`fetch` is required by providers that refuse URLs** — Ollama Cloud answers `image URLs are not currently supported, please use base64 encoded data instead`. Fetching means this process retrieves attacker-supplied media, so `bot/net.py:fetch_image` re-checks the SSRF guard, requires an `image/*` content type, refuses redirects, streams with a byte cap, and uses a dedicated client (never `api_client`, which carries the Misskey token). A fetch failure drops that one image rather than the reply
 - `vision_max_image_bytes` (default `8388608`): per-image cap in `fetch` mode; the body is abandoned mid-stream once exceeded
@@ -159,12 +145,12 @@ Optional fields:
 - `image_gen_enabled` (default `false`): give the autonomous-post agent a `generate_image` tool so it can illustrate its own post. The agent chooses the image first, then may add a caption or publish the image without text. Auto posts only — the tool is appended solely to `auto_tools`, a list passed only to the auto agent (`Agent[AutoDeps, str]`); the reply and ACP agents are built from a separate `tools` list that never receives it. The `RunContext[AutoDeps]` typing does not enforce this by itself (Basedpyright accepts the tool on either agent, since `build_tools()` returns `list[Callable[..., object]]` and pydantic-ai's `tools=` parameter is gradually typed) — the confinement is structural, and `test_reply_agent_never_gets_image_tool` pins it. Requires `image_gen_model`
 - `image_gen_model`: image model id sent to the endpoint (e.g. `google/gemini-2.5-flash-image`)
 - `image_gen_base_url` (default `https://openrouter.ai/api/v1`): OpenAI-compatible base URL; the request goes to `<base_url>/images/generations`
-- `image_gen_api_key` / `image_gen_api_key_env` (default env `OPENROUTER_API_KEY`): same resolution order as `bot/memory.py`'s embedding/extraction keys — explicit key first, then the env var, and if neither resolves the request is sent unauthenticated (a warning is logged, since that's valid for a keyless self-hosted endpoint rather than a misconfiguration)
+- `image_gen_api_key` / `image_gen_api_key_env` (default env `OPENROUTER_API_KEY`): explicit key first, then the configured environment variable; if neither resolves the request is sent unauthenticated (a warning is logged, since that's valid for a keyless self-hosted endpoint rather than a misconfiguration)
 - `image_gen_size` (default unset/`None`): optional `size` request param (e.g. `1024x1024`); sent only when set, so backends that reject the field are unaffected
 - `image_gen_timeout_seconds` (default `120`): HTTP timeout for one generation call; image models are much slower than chat
 - `image_gen_max_bytes` (default `8388608`): cap on the decoded image; checked against the base64 length before decoding (so an over-cap image is dropped without ever materializing it) and again after
 - `image_gen_mark_sensitive` (default `false`): upload with `isSensitive` set so Misskey blurs the image behind a click
-- **Uploaded drive files are never cleaned up.** Every generated image (~5/day at the default interval) becomes a permanent Misskey drive file, plus one orphan per `notes/create` failure that follows a successful upload; the `missbot-maintenance` CronJob only cleans up mem0 memories, not the drive. Misskey drive has a per-user capacity, so this accumulates indefinitely — years away at this rate, but silent: once capacity is hit, `drive/files/create` starts failing and the feature quietly reverts to text-only posts forever. No cleanup is implemented; this is a known, accepted gap
+- **Uploaded drive files are never cleaned up.** Every generated image (~5/day at the default interval) becomes a permanent Misskey drive file, plus one orphan per `notes/create` failure that follows a successful upload. Misskey drive has a per-user capacity, so this accumulates indefinitely — years away at this rate, but silent: once capacity is hit, `drive/files/create` starts failing and the feature quietly reverts to text-only posts forever. No cleanup is implemented; this is a known, accepted gap
 - `searxng_url`, `searxng_user`, `searxng_password`: web search via SearXNG
 - `redis_url`, `redis_password`, `redis_db`: Redis for social credit system
 - `social_credit_auto_score` (default `true`): score every author's message via an isolated, tool-less classifier whose category is mapped to a fixed delta (−10…+10) in code — users can't dictate their own score (privileged users are scored too; the flag only gates the manual adjust tool)
@@ -180,7 +166,7 @@ Optional fields:
 - `max_concurrent_handlers` (default `20`): hard cap on in-flight mention/auto-reply handlers; excess events are dropped before a coroutine is created to bound provider and memory load
 - `http_timeout_seconds`: HTTP timeout (default 30.0)
 - `mcp_servers`: list of streamable-HTTP MCP servers (see below)
-- `memory_enabled` (default `false`): turn on mem0 long-term memory (see below). Requires `postgres_url` and `embedding_model`
+- `memory_enabled` (default `false`): turn on Hindsight long-term memory (see below)
 - `acp_*`: ACP frontend settings (see below); ignored by `python -m bot`
 - `channel`, `debug`
 
@@ -214,33 +200,23 @@ Config fields:
 **stdout is the protocol channel.** `bot/acp/__main__.py` points logfire's console exporter and `logging` at stderr. Anything printed to stdout corrupts the JSON-RPC stream and breaks the connection.
 
 ### Long-term memory
-Memory is delegated to mem0 OSS through `bot/memory.py:MemoryStore`, backed by Postgres/pgvector. The bot does not maintain its own entity graph, claim schema, agreement counts, or consolidation job. `bot.maintenance reembed` performs controlled embedding-model migrations in place: it validates the new endpoint/dimension, precomputes every memory and entity vector, creates full timestamped backup tables, then replaces both vector columns atomically. Stop all memory readers/writers before running its live form. Off unless `memory_enabled: true`. Config fields:
-- `postgres_url` (required when enabled): Postgres DSN for mem0's pgvector backend; the server must have the `vector` extension available
-- `memory_collection_name` (default `missbot_memories`): Postgres table/collection mem0 uses for memories
-- `memory_history_db_path` (default unset): optional SQLite path for mem0's local message/history database; leave unset for mem0's default
-- `embedding_model` (required when enabled): embedding model id, e.g. `perplexity/pplx-embed-v1-0.6b`
-- `embedding_dim` (default `1024`): vector dimension for the mem0 pgvector collection; must match the embedding model output
-- `embedding_dimensions` (default unset): when set, sent as the OpenAI `dimensions` request param to truncate a Matryoshka model; must equal `embedding_dim`
-- `embedding_base_url` (default `https://openrouter.ai/api/v1`) + `embedding_api_key` / `embedding_api_key_env` (default env `OPENROUTER_API_KEY`): OpenAI-compatible embeddings endpoint
-- `memory_llm_model` (default first `llm_models` entry with provider prefix stripped): model mem0 uses for memory extraction
-- `memory_llm_base_url`, `memory_llm_api_key`, `memory_llm_api_key_env` (default env `OPENROUTER_API_KEY`): optional OpenAI-compatible extraction-LLM settings
-- `memory_reranker_model` (default unset): optional model sent to a Cohere/Jina-compatible `POST <base_url>/rerank` endpoint after vector search. Setting it enables reranking; leaving it unset preserves mem0's vector order
-- `memory_reranker_base_url` (default `embedding_base_url`) + `memory_reranker_api_key` / `memory_reranker_api_key_env` (default unset): optional dedicated reranker connection. Embedding credentials are inherited only when the reranker and embedding base URLs match; a different endpoint is unauthenticated unless given its own key
-- `memory_reranker_candidate_limit` (default `20`): vector candidates sent to the reranker. The final result count remains bounded by `memory_search_limit`
-- `memory_search_limit` (default `5`), `memory_search_threshold` (default `0.1`): search result count and mem0 score floor
-- `memory_custom_instructions`: optional custom instructions appended to mem0's extraction prompt
-- `memory_ingest_notes` (default `true`): auto-ingest each incoming user note through mem0
-- `memory_trusted_user_ids` (default `[]`): stable platform user ids whose inferred memories are exempt from the HEARSAY label. Misskey uses its user id; ACP uses its namespaced `acp:<pubkey>` identity. Trust is checked from stored `author_user_id` metadata at recall time, so handles/display names never confer trust and removing an id from config revokes the exemption
-- `memory_note_retention_days` (default `90`, nullable): expiration/physical-retention window for inferred note memories; explicit `add_memory` entries are exempt
-- `memory_max_memories_per_author` (default `50`, nullable): per-author cap for inferred note memories; maintenance removes the oldest overflow rows
-- `memory_cleanup_scan_limit` (default `10000`): maximum scoped rows examined in one cleanup run
-- `max_fact_length` (default `500`): longer `add_memory` submissions are rejected
+Memory is delegated to Hindsight through the official async `hindsight-client` API. `bot/memory.py:MemoryStore` creates one shared bank and uses Hindsight for extraction, deduplication, vector/graph storage, temporal retrieval, and reranking. Missbot does not access Hindsight's Postgres store directly and has no memory maintenance job. Off unless `memory_enabled: true`.
 
-**Write path.** `ChatAgent.run` still runs reply generation, social scoring, and memory ingestion concurrently. `_maybe_ingest_note` sends only the latest public author note to mem0 with metadata `{source: "misskey_note", author, author_user_id, source_note_id}` and a configured expiration date; `author_user_id` is omitted only when a frontend cannot provide a stable identity. Specified/private notes are never ingested. The `add_memory` tool likewise refuses writes during private interactions. mem0 owns extraction, deduplication, vector storage, and entity-style linking. Successful tool writes use metadata `{source: "add_memory", author: bot_username}` and do not expire automatically. Memory failures are logged and swallowed so they never cancel a reply.
+Config fields:
+- `hindsight_base_url` (default `http://localhost:8888`): Hindsight API base URL
+- `hindsight_api_key` / `hindsight_api_key_env` (default env `HINDSIGHT_API_KEY`): optional bearer credential; explicit key wins
+- `hindsight_bank_id` (default unset): shared bank id; unset normalizes `bot_username`, ensuring Misskey and ACP use the same bank
+- `hindsight_retain_mission` (default unset): optional extraction-policy override; unset uses Missbot's durable-fact and prompt-injection-resistant mission
+- `hindsight_recall_budget` (default `mid`): Hindsight recall breadth/cost, one of `low`, `mid`, or `high`
+- `hindsight_recall_max_tokens` (default `4096`): maximum recall payload
+- `memory_search_limit` (default `5`): maximum recalled facts exposed to the model
+- `memory_ingest_notes` (default `true`): auto-retain each public incoming message
+- `memory_trusted_user_ids` (default `[]`): stable platform ids whose inferred facts are exempt from the HEARSAY label. Misskey uses its user id; ACP uses its namespaced `acp:<pubkey>` identity. Handles/display names never confer trust
+- `max_fact_length` (default `500`): maximum explicit `add_memory` submission
 
-**Read path.** `search_memory` calls `MemoryStore.search()` with `agent_id=bot_username`, renders memories with score/source/author/recency metadata when available, and fences the returned text as untrusted data before the model sees it. When `memory_reranker_model` is set, vector search overfetches up to `memory_reranker_candidate_limit`, sends the nonempty candidate texts to the Cohere/Jina-compatible reranker, and returns at most the requested count in reranker order with `relevance_score` as the displayed score. The reranker uses a dedicated HTTP client with Missbot's provider-identification headers and never the Misskey token. HTTP or response-validation failure is logged and falls back to vector order. Memories inferred from user-authored `misskey_note` or `acp_prompt` inputs are additionally marked **HEARSAY** with an explicit warning that they are unverified, not guaranteed true, and must not be presented as established fact without corroboration. The label is omitted when stored `author_user_id` metadata matches `memory_trusted_user_ids`; those memories remain fenced as untrusted data so epistemic trust never becomes permission to follow recalled instructions. Explicit `add_memory` entries are not mislabeled as hearsay. Older inferred memories without `author_user_id` fail closed and remain hearsay.
+**Write path.** `ChatAgent.run` runs reply generation, social scoring, and memory ingestion concurrently. `_maybe_ingest_note` sends only the latest public author message to Hindsight with string metadata `{source, author, author_user_id, source_note_id}` and a deterministic source-prefixed document id. Restricted/private messages are never retained. `add_memory` uses source `add_memory`, the bot username as author, and a content-derived document id. Retains are synchronous at the Hindsight operation boundary (`retain_async=false`) so tool success means extraction completed. Memory failures are logged and isolated from replies.
 
-**Maintenance path.** `python -m bot.maintenance cleanup` lists only the bot's `agent_id`, includes already-expired rows, and physically deletes empty memories, exact duplicates, inferred note memories past retention, and the oldest inferred memories above each author's cap. Explicit `add_memory` rows are protected from retention/cap cleanup. Deletion goes through mem0 after initializing its entity store so `missbot_memories_entities` links are cleaned too. `--dry-run` reports the same candidate summary without deleting. The `missbot-maintenance` CronJob runs with concurrency forbidden; Kustomize reads its schedule and timezone from `k8s/maintenance-settings.yaml`, while `memory_max_memories_per_author` in `config.yaml` controls the cap.
+**Read path.** `search_memory` recalls raw `world` and `experience` facts rather than synthesized observations so per-fact provenance remains available. Results are bounded by the configured token budget and result limit, rendered with type/score/source/author/recency when present, and fenced as untrusted data before reaching the model. Every record is HEARSAY unless it is provably an explicit `add_memory` write or its stored `author_user_id` is currently trusted; missing or legacy metadata fails closed. Trusted records remain fenced because epistemic trust is never permission to follow recalled instructions.
 
 ### MCP servers
 Each entry in `mcp_servers` takes:
@@ -264,8 +240,8 @@ Gating is progressive disclosure driven by the model itself: each unique `gate` 
 - Every author's score moves via `ChatAgent._maybe_score_message` (privileged users included): a separate tool-less classifier (`bot/scoring.py`, model from `score_models` or the reply model) runs concurrently with the reply, returns one of the configured `social_credit_categories` (default toxic/rude/neutral/good/exceptional) that's mapped to its fixed delta in code, applied through `apply_social_credit` and rate-limited by a Redis `score_cooldown:<user>` key. `ChatAgent.__init__` builds a `ScoringSpec` (constrained output type + delta map + instructions) from the configured categories via `build_scoring_spec`, then wraps its Literal output in Pydantic AI `PromptedOutput`. This retains validation/retries without forcing `tool_choice=required`, which NanoGPT's DeepSeek route rejects with HTTP 503. This is the prompt-injection mitigation — the model only picks a category name, never the number
 - Agent uses `output_type=str` (plain string output, not structured)
 - Tools are built via `build_tools()` in `bot/tools.py` and passed to `Agent(..., tools=tools)`. Reply and auto agents also receive Pydantic AI Harness `CodeMode`; every eligible regular tool is callable under its normal name only inside `run_code`. A shared instruction tells models to make the `run_code` call instead of merely narrating their intent. Framework control and other code-execution tools cannot be nested by CodeMode and remain native. The social-scoring classifier remains tool-less
-- When `memory_enabled`, the bot receives a `MemoryStore` adapter around mem0 `AsyncMemory`; the adapter is passed to `build_tools()` so `add_memory` and `search_memory` are exposed
-- `ChatAgent.run` runs three coroutines concurrently via `asyncio.gather`: the reply, `_maybe_score_message`, and `_maybe_ingest_note` (mem0 ingestion when `memory_ingest_notes`). Like scoring, note ingestion swallows its own errors, so it never affects the reply
+- When `memory_enabled`, the bot creates one shared `MemoryStore` backed by the official Hindsight client; `build_tools()` receives it to expose `add_memory` and `search_memory`
+- `ChatAgent.run` runs three coroutines concurrently via `asyncio.gather`: the reply, `_maybe_score_message`, and `_maybe_ingest_note` (Hindsight retention when `memory_ingest_notes`). Like scoring, note ingestion swallows its own errors, so it never affects the reply
 - `FallbackModel` wraps multiple `llm_models` for automatic failover. Provider HTTP/API errors, transport timeouts, malformed success payloads (`UnexpectedModelBehavior`), and complete responses containing only empty text or thinking advance immediately to the next configured model. The response-level guard runs inside `FallbackModel`, before Pydantic AI can spend the agent's output-retry budget on the same actionless model. This is required for OpenAI-compatible local servers such as OMLX that may return an error-shaped JSON body with HTTP 200 and for reasoning models that stop after describing the tool call they intended to make
 - Social credit score is injected via a dynamic system prompt function
 
@@ -301,7 +277,7 @@ Eligible regular tools are exposed only through `run_code` as sandboxed async Py
 - `search_web` (async) — when `searxng_url` configured. Returns domain-prefixed snippets
 - `search_users`, `search_notes` — Misskey search APIs
 - Social credit tools (when Redis configured): `get_social_credit`, `adjust_social_credit` (privileged authors only), `get_social_credit_history`, `get_social_credit_leaderboard`. All users (privileged included) are also scored automatically by the `bot/scoring.py` classifier, separate from any tool call
-- Long-term memory tools (when `memory_enabled`): `add_memory` (passes text to mem0 `add`, except in private interactions) and `search_memory` (mem0 `search` results, fenced as untrusted data). Public user notes are also ingested automatically when `memory_ingest_notes=true`; private/specified notes are not. Not given to the auto-agent
+- Long-term memory tools (when `memory_enabled`): `add_memory` retains explicit durable text through Hindsight, except in private interactions, and `search_memory` recalls provenance-bearing facts fenced as untrusted data. Public user messages are retained automatically when `memory_ingest_notes=true`; private/specified messages are not. Not given to the auto-agent
 - `enable_<gate>` — one per unique `gate` value in `mcp_servers`; model calls it to unlock gated MCP tools
 - MCP tools — from each configured `mcp_servers` entry, name-prefixed per `tool_prefix`
 - `generate_image` — **auto posts only** (when `image_gen_enabled`). The model writes the image prompt and its alt text; one image per post, over-length prompt/alt refused, failure degrades to a text-only post

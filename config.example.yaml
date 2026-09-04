@@ -151,27 +151,19 @@ searxng_password: "yourpassword"
 # acp_max_history_turns: 20     # per-session history bound (sessions are long-lived)
 # acp_max_sessions: 8           # concurrent session cap
 
-# Optional: persistent long-term memory via mem0 (Postgres + pgvector). Off by default.
-# Adds the add_memory / search_memory tools. Requires postgres_url + embedding_model.
+# Optional: persistent long-term memory via a Hindsight API service. Off by default.
+# Adds add_memory / search_memory and can learn from public user messages.
 # memory_enabled: false
-# postgres_url: "postgres://user:pass@localhost:5432/missbot"
-# memory_collection_name: missbot_memories
-# embedding_model: "perplexity/pplx-embed-v1-0.6b"
-# embedding_dim: 1024                # must match the embedding model output
-# embedding_base_url: "https://openrouter.ai/api/v1"
-# embedding_api_key_env: OPENROUTER_API_KEY
-# memory_llm_model: "anthropic/claude-3.5-haiku"  # optional; defaults to first llm_models entry
-# memory_llm_api_key_env: OPENROUTER_API_KEY
-# memory_reranker_model: "Qwen3-Reranker-0.6B-4bit-DWQ"  # enables Cohere/Jina-compatible reranking
-# memory_reranker_base_url: "http://localhost:8000/v1"   # defaults to embedding_base_url
-# memory_reranker_api_key_env: OMLX_API_KEY              # embedding credentials inherit only on same URL
-# memory_reranker_candidate_limit: 20
+# hindsight_base_url: "http://localhost:8888"
+# hindsight_api_key_env: HINDSIGHT_API_KEY  # optional; explicit hindsight_api_key takes precedence
+# hindsight_bank_id: missbot                # defaults to normalized bot_username
+# hindsight_retain_mission: null            # optional extraction policy override
+# hindsight_recall_budget: mid              # low, mid, or high
+# hindsight_recall_max_tokens: 4096
 # memory_search_limit: 5
-# memory_search_threshold: 0.1
-# memory_note_retention_days: 90       # null disables age-based note cleanup
-# memory_max_memories_per_author: 50  # null disables the per-author note cap
-# memory_cleanup_scan_limit: 10000
-# max_fact_length: 500               # longer facts are rejected
+# memory_ingest_notes: true
+# memory_trusted_user_ids: []                # stable Misskey ids or namespaced ACP identities
+# max_fact_length: 500                       # longer explicit memories are rejected
 
 # The bot's reply is the model's plain text output. Mentions are added
 # automatically by code, so the prompt must NOT emit @handles itself.

@@ -475,143 +475,61 @@ class Config(BaseModel):
     )
     memory_enabled: bool = Field(
         default=False,
-        description="Enable persistent long-term memory via mem0 (Postgres + pgvector). Off by default; "
-        "requires postgres_url and embedding_model. Adds the add_memory / search_memory tools and "
-        "can ingest user notes through mem0's extraction/dedup pipeline.",
+        description="Enable persistent long-term memory via Hindsight. Off by default. Adds the "
+        "add_memory / search_memory tools and can ingest public user messages.",
     )
-    postgres_url: str | None = Field(
+    hindsight_base_url: AnyHttpUrl = Field(
+        default=AnyHttpUrl("http://localhost:8888"),
+        description="Base URL of the Hindsight API service.",
+    )
+    hindsight_api_key: str | None = Field(
         default=None,
-        description="Postgres DSN for mem0's pgvector store (e.g. postgres://user:pass@host:5432/db). "
-        "The vector extension must be available on the server.",
+        description="Optional Hindsight API key. Takes precedence over hindsight_api_key_env.",
     )
-    memory_collection_name: str = Field(
-        default="missbot_memories",
-        description="Postgres table/collection name mem0 uses for stored memories.",
+    hindsight_api_key_env: str | None = Field(
+        default="HINDSIGHT_API_KEY",
+        description="Environment variable holding the Hindsight API key when hindsight_api_key is unset. "
+        "Set null to disable environment lookup.",
     )
-    memory_history_db_path: str | None = Field(
+    hindsight_bank_id: str | None = Field(
         default=None,
-        description="Optional SQLite path for mem0's local message/history database. Leave unset for mem0's default.",
+        description="Shared Hindsight bank id. Defaults to the normalized bot_username so Misskey and ACP "
+        "processes use the same memory.",
     )
-    embedding_model: str | None = Field(
+    hindsight_retain_mission: str | None = Field(
         default=None,
-        description="Embedding model id sent to the OpenAI-compatible embeddings endpoint. Required when memory_enabled.",
+        description="Optional Hindsight retain mission controlling which durable facts are extracted. "
+        "The built-in Missbot durability and prompt-injection policy is used when unset.",
     )
-    embedding_dim: int = Field(
-        default=1024,
+    hindsight_recall_budget: Literal["low", "mid", "high"] = Field(
+        default="mid",
+        description="Hindsight recall breadth/cost budget used by search_memory.",
+    )
+    hindsight_recall_max_tokens: int = Field(
+        default=4096,
         gt=0,
-        description="Embedding vector dimension for mem0's pgvector collection; must match what the embedding "
-        "model returns. pplx-embed-v1-0.6b is 1024. pgvector HNSW indexes support at most 2000 dimensions "
-        "on a plain `vector` column.",
-    )
-    embedding_dimensions: int | None = Field(
-        default=None,
-        gt=0,
-        description="When set, sent as the OpenAI `dimensions` request parameter to truncate a Matryoshka "
-        "(MRL) model's output to this size (e.g. pplx-embed-v1-4b returns its native 2560 unless you ask "
-        "for fewer). Must equal embedding_dim (the stored column size). Leave unset for models whose native "
-        "output already equals embedding_dim.",
-    )
-    embedding_base_url: AnyHttpUrl = Field(
-        default=AnyHttpUrl("https://openrouter.ai/api/v1"),
-        description="OpenAI-compatible base URL for the embeddings endpoint (POSTed to <base_url>/embeddings).",
-    )
-    embedding_api_key: str | None = Field(
-        default=None,
-        description="API key for the embeddings endpoint. Use embedding_api_key_env to load from env instead.",
-    )
-    embedding_api_key_env: str = Field(
-        default="OPENROUTER_API_KEY",
-        description="Environment variable holding the embeddings API key (used when embedding_api_key is unset).",
-    )
-    memory_llm_model: str | None = Field(
-        default=None,
-        description="Model mem0 uses for memory extraction. Defaults to the first llm_models entry with any "
-        "pydantic-ai provider prefix stripped (e.g. openrouter:anthropic/... -> anthropic/...).",
-    )
-    memory_llm_base_url: AnyHttpUrl | None = Field(
-        default=None,
-        description="Optional OpenAI-compatible base URL for mem0's extraction LLM.",
-    )
-    memory_llm_api_key: str | None = Field(
-        default=None,
-        description="API key for mem0's extraction LLM. Use memory_llm_api_key_env to load from env instead.",
-    )
-    memory_llm_api_key_env: str = Field(
-        default="OPENROUTER_API_KEY",
-        description="Environment variable holding mem0 extraction LLM API key when memory_llm_api_key is unset.",
-    )
-    memory_reranker_model: str | None = Field(
-        default=None,
-        description="Optional model for reranking vector-search candidates through a Cohere/Jina-compatible "
-        "POST <base_url>/rerank endpoint. Leave unset to return mem0's vector order directly.",
-    )
-    memory_reranker_base_url: AnyHttpUrl | None = Field(
-        default=None,
-        description="Optional base URL for the reranking endpoint. Defaults to embedding_base_url. Credentials "
-        "are inherited from the embedding endpoint only when both base URLs match.",
-    )
-    memory_reranker_api_key: str | None = Field(
-        default=None,
-        description="Optional API key for the reranking endpoint. Overrides inherited embedding credentials.",
-    )
-    memory_reranker_api_key_env: str | None = Field(
-        default=None,
-        description="Optional environment variable holding the reranking API key. Overrides inherited embedding "
-        "credentials when explicitly configured.",
-    )
-    memory_reranker_candidate_limit: int = Field(
-        default=20,
-        gt=0,
-        description="Number of vector-search candidates sent to the optional reranker. The final result count "
-        "remains bounded by memory_search_limit.",
+        description="Maximum tokens Hindsight may return to one search_memory call.",
     )
     memory_search_limit: int = Field(
         default=5,
         gt=0,
-        description="Max number of memories returned per search_memory call.",
-    )
-    memory_search_threshold: float = Field(
-        default=0.1,
-        ge=0.0,
-        le=1.0,
-        description="Minimum mem0 search score for search_memory results.",
+        description="Maximum number of Hindsight results returned per search_memory call.",
     )
     max_fact_length: int = Field(
         default=500,
         gt=0,
         description="Maximum character length accepted by the add_memory tool.",
     )
-    memory_custom_instructions: str | None = Field(
-        default=None,
-        description="Optional custom instructions appended to mem0's memory extraction prompt.",
-    )
     memory_ingest_notes: bool = Field(
         default=True,
-        description="When memory is enabled, auto-ingest each incoming user note through mem0. Set false to "
-        "disable note learning while keeping add_memory / search_memory available.",
+        description="When memory is enabled, auto-ingest each public user message through Hindsight. "
+        "Set false to keep explicit add_memory / search_memory while disabling automatic learning.",
     )
     memory_trusted_user_ids: list[str] = Field(
         default_factory=list,
         description="Stable platform user ids whose auto-ingested memories are not treated as hearsay. "
         "Misskey uses its user id; ACP uses the namespaced acp:<pubkey> identity. Handles and display names "
         "never confer trust.",
-    )
-    memory_note_retention_days: int | None = Field(
-        default=90,
-        gt=0,
-        description="Days to retain memories inferred from Misskey notes. New note memories receive a mem0 "
-        "expiration date, and maintenance physically deletes older rows. Set null to disable age-based cleanup.",
-    )
-    memory_max_memories_per_author: int | None = Field(
-        default=50,
-        gt=0,
-        description="Maximum auto-ingested note memories retained per author. Maintenance removes the oldest "
-        "overflow rows. Explicit add_memory entries are exempt. Set null to disable the per-author cap.",
-    )
-    memory_cleanup_scan_limit: int = Field(
-        default=10_000,
-        gt=0,
-        description="Maximum agent-scoped mem0 rows examined by one maintenance cleanup run.",
     )
     debug: bool | None = None
 
@@ -633,16 +551,8 @@ class Config(BaseModel):
 
     @model_validator(mode="after")
     def check_memory_config(self) -> "Config":
-        if self.memory_enabled:
-            if not self.postgres_url:
-                raise ValueError("postgres_url is required when memory_enabled is true")
-            if not self.embedding_model:
-                raise ValueError("embedding_model is required when memory_enabled is true")
-        if self.embedding_dimensions is not None and self.embedding_dimensions != self.embedding_dim:
-            raise ValueError(
-                f"embedding_dimensions ({self.embedding_dimensions}) must equal embedding_dim ({self.embedding_dim}) "
-                "— it only tells the embeddings API to truncate to the stored column size."
-            )
+        if self.hindsight_bank_id is not None and not self.hindsight_bank_id.strip():
+            raise ValueError("hindsight_bank_id must not be blank")
         return self
 
     @model_validator(mode="after")
