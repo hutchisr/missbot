@@ -5,15 +5,19 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from pydantic_ai import ImageUrl, ModelRetry
+from pydantic_ai import Agent, ImageUrl, ModelMessage, ModelResponse, ModelRetry, ThinkingPart
+from pydantic_ai.exceptions import UnexpectedModelBehavior
 from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.fallback import FallbackModel
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
+from pydantic_ai.models.test import TestModel
 from pydantic_ai.settings import ModelSettings
 
 from bot.ai import (
     _CLASSIFIER_MODEL_SETTINGS,
+    _FALLBACK_ON,
     AgentDeps,
     ChatAgent,
     _enforce_length,
@@ -178,6 +182,53 @@ def test_model_extra_body_stays_scoped_to_its_fallback(monkeypatch: pytest.Monke
     assert chain.models[1].settings is None
 
 
+@pytest.mark.anyio
+async def test_fallback_recovers_from_invalid_model_response():
+    async def fail_model(messages: list[ModelMessage], info: AgentInfo):
+        del messages, info
+        raise UnexpectedModelBehavior("provider returned malformed success payload")
+
+    model = FallbackModel(
+        FunctionModel(fail_model),
+        TestModel(custom_output_text="fallback"),
+        fallback_on=_FALLBACK_ON,
+    )
+
+    result = await Agent(model).run("hello")
+
+    assert result.output == "fallback"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "response",
+    [
+        ModelResponse(parts=[]),
+        ModelResponse(parts=[ThinkingPart("I should call a tool.")]),
+    ],
+    ids=["empty", "thinking-only"],
+)
+async def test_fallback_rejects_actionless_model_response(response: ModelResponse):
+    primary_calls = 0
+
+    async def primary(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal primary_calls
+        del messages, info
+        primary_calls += 1
+        return response
+
+    model = FallbackModel(
+        FunctionModel(primary),
+        TestModel(custom_output_text="fallback"),
+        fallback_on=_FALLBACK_ON,
+    )
+
+    result = await Agent(model).run("hello")
+
+    assert result.output == "fallback"
+    assert primary_calls == 1
+
+
 def test_spec_supports_vision_string_defaults_true():
     assert _spec_supports_vision("openrouter:foo/bar") is True
 
@@ -214,6 +265,16 @@ def test_auto_temperature_overrides_only_autonomous_posts(make_config):
 
     inherited = ChatAgent(make_config(temperature=0.7))
     assert inherited._generation_settings(30.0, auto_post=True).get("temperature") == 0.7
+
+
+def test_auto_max_tokens_overrides_only_autonomous_posts(make_config):
+    agent = ChatAgent(make_config(max_tokens=1024, auto_max_tokens=256))
+
+    assert agent._generation_settings(30.0).get("max_tokens") == 1024
+    assert agent._generation_settings(30.0, auto_post=True).get("max_tokens") == 256
+
+    inherited = ChatAgent(make_config(max_tokens=512))
+    assert inherited._generation_settings(30.0, auto_post=True).get("max_tokens") == 512
 
 
 def test_enforce_length_passes_through_within_budget():

@@ -10,18 +10,19 @@ from typing import Any, Self, cast
 
 import httpx
 import logfire
-from pydantic_ai import Agent, ModelRetry, RunContext
-from pydantic_ai.exceptions import ModelAPIError
+from pydantic_ai import Agent, ModelRetry, PromptedOutput, RunContext
+from pydantic_ai.exceptions import ModelAPIError, UnexpectedModelBehavior
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
     TextPart,
+    ThinkingPart,
     UserPromptPart,
 )
 from pydantic_ai.models import Model, ModelRequestContext, ModelRequestParameters, StreamedResponse
 from pydantic_ai.models.anthropic import AnthropicModel
-from pydantic_ai.models.fallback import FallbackModel
+from pydantic_ai.models.fallback import FallbackModel, FallbackOn
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
 from pydantic_ai.models.openrouter import OpenRouterModelSettings
 from pydantic_ai.models.wrapper import WrapperModel
@@ -29,7 +30,7 @@ from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings, merge_model_settings
 from pydantic_ai.usage import RequestUsage
-from pydantic_monty import AsyncMonty
+from pydantic_ai_harness import CodeMode
 from redis.asyncio import Redis
 
 from .core import AgentTurn, AutoPost, HistoryTurn, Poll, TurnImage
@@ -40,6 +41,13 @@ from .models import Config, ModelSpec
 from .provider import provider_request_headers
 from .scoring import ScoringSpec, build_scoring_prompt, build_scoring_spec
 from .tools import apply_social_credit, build_tools, normalize_username
+
+_CODE_MODE_INSTRUCTION = (
+    "Available async functions are callable only inside the native `run_code` tool, not as "
+    "native tools themselves. When one is needed, call `run_code` with Python that awaits it. "
+    "Never emit XML, JSON, or textual tool-call markup, and never merely describe an intended "
+    "tool call. After receiving tool results, complete the requested response."
+)
 
 
 @dataclass
@@ -334,23 +342,25 @@ _AUTO_IMAGE_LABEL_RE = re.compile(
     re.IGNORECASE,
 )
 _AUTO_LEGACY_MEME_RE = re.compile(r"^(?:boomer(?:-tier)?|cringe)\s+meme\b", re.IGNORECASE)
+_AUTO_TOOL_MARKUP_RE = re.compile(r"<\s*/?\s*(?:invoke|tool_call)\b", re.IGNORECASE)
 _AUTO_IMAGE_INSTRUCTION = f"""Image-post workflow:
 - Decide whether the post needs an image before composing any final post text.
-- If it does, your first response must be only a generate_image tool call. Do not emit a
-  draft caption alongside or before that call; text from a tool-calling turn is intermediate
-  and will not be published.
+- If it does, your first response must be only a `run_code` tool call whose Python invokes
+  `await generate_image(prompt=..., alt_text=...)`. Do not address generate_image as a native
+  tool and do not emit `<invoke>`, `<tool_call>`, JSON, or any other textual tool-call markup.
 - After the image succeeds, either output the final caption or output exactly
   {_IMAGE_ONLY_OUTPUT} to publish the image by itself. The marker is internal and is never
   posted as text.
 - Never imitate an image with bracketed prose such as *[meme: ...]*, [image: ...], or a
-  similar description. Call generate_image instead. If image generation fails, write a
-  normal text-only post without an image description.
+  similar description. Use `run_code` to call generate_image instead. If image generation
+  fails, write a normal text-only post without an image description.
 - If you do not generate an image, output a normal text post. Never use the image-only
   marker unless generate_image succeeded.
 """
 _AUTO_POLL_INSTRUCTION = """Poll workflow:
-- When a question would be more engaging as a poll, call create_poll before writing the
-  final post.
+- When a question would be more engaging as a poll, use `run_code` with Python that invokes
+  `await create_poll(...)` before writing the final post. Do not address create_poll as a
+  native tool or emit textual tool-call markup.
 - Supply 2-10 distinct choices of at most 50 characters each. Choose whether voters may
   select multiple answers and optionally set how many minutes the poll stays open.
 - After the tool succeeds, write the final post text as a clear question or prompt for the
@@ -506,14 +516,29 @@ async def _guarded(coro: Awaitable[object], label: str) -> None:
         logfire.exception(f"{label} failed (reply unaffected)")
 
 
-_FALLBACK_ON = (ModelAPIError, httpx.TimeoutException)
+def _is_actionless_model_response(response: ModelResponse) -> bool:
+    """Fallback before agent retries when a model emits only empty text or thinking."""
+    return (
+        response.state == "complete"
+        and not response.text
+        and not response.tool_calls
+        and all(isinstance(part, (TextPart, ThinkingPart)) for part in response.parts)
+    )
+
+
+_FALLBACK_ON: FallbackOn = [
+    ModelAPIError,
+    UnexpectedModelBehavior,
+    httpx.TimeoutException,
+    _is_actionless_model_response,
+]
 
 
 # Run settings for constrained-output classifier agents (currently social scoring).
-# Their output types force a tool call (`tool_choice`), which
-# thinking-mode endpoints reject ("Thinking mode does not support this tool_choice") — so
-# reasoning is disabled (it's wasted on a labeling task anyway) and OpenRouter routing is
-# restricted to providers that support every request param (`require_parameters`).
+# PromptedOutput keeps the Literal validation and retry boundary without forcing providers
+# to support tool_choice=required; NanoGPT's DeepSeek route returns 503 for that tool-output
+# request but accepts prompted JSON output. Reasoning is disabled because it is wasted on a
+# labeling task, and OpenRouter routing still requires support for every request parameter.
 # The two ``openrouter_*`` keys are ignored by non-OpenRouter models.
 _CLASSIFIER_MODEL_SETTINGS: ModelSettings = OpenRouterModelSettings(
     timeout=60.0,
@@ -589,17 +614,10 @@ class ChatAgent:
         else:
             self._vision_model = _chain(vision_specs)
 
-        self._python_pool = AsyncMonty(
-            min_processes=1,
-            max_processes=4,
-            checkout_timeout=1,
-            request_timeout=2,
-        )
         tools = build_tools(
             config,
             redis_client=redis_client,
             memory=memory,
-            python_pool=self._python_pool,
         )
         gates = gate_names(config)
         for gate, servers in sorted(gates.items()):
@@ -608,7 +626,7 @@ class ChatAgent:
 
         # Auto agent runs without AgentDeps, so skip tools that touch ctx.deps
         # (social-credit tools and enable_<gate> meta-tools).
-        auto_tools = build_tools(config, redis_client=None, python_pool=self._python_pool)
+        auto_tools = build_tools(config, redis_client=None)
         auto_tools.append(_make_create_poll_tool())
 
         async def _inject_social_credit(ctx: RunContext[AgentDeps]) -> str:
@@ -639,9 +657,15 @@ class ChatAgent:
             model,
             output_type=str,
             deps_type=AgentDeps,
-            instructions=[config.system_prompt, _inject_length_budget, _inject_social_credit],
+            instructions=[
+                config.system_prompt,
+                _CODE_MODE_INSTRUCTION,
+                _inject_length_budget,
+                _inject_social_credit,
+            ],
             tools=tools,
             toolsets=mcp_toolsets or None,
+            capabilities=[CodeMode()],
             retries=3,
         )
         # Hard-gate the reply to the budget the instruction states (see _enforce_budget).
@@ -661,24 +685,30 @@ class ChatAgent:
 
         self._auto_agent: Agent[AutoDeps, str] | None = None
         self._auto_history: deque[str] = deque(maxlen=10)
+        self._auto_char_limit = config.auto_max_chars or config.max_note_length
         if config.system_prompt_auto:
+            auto_model = model if config.auto_models is None else _chain(config.auto_models)
+            assert auto_model is not None, "auto_models must not be empty"
             auto_instructions = [
                 config.system_prompt_auto,
-                _length_instruction(config.max_note_length),
+                _CODE_MODE_INSTRUCTION,
+                _length_instruction(self._auto_char_limit),
                 _AUTO_POLL_INSTRUCTION,
             ]
             if config.image_gen_enabled:
                 auto_instructions.append(_AUTO_IMAGE_INSTRUCTION)
             self._auto_agent = Agent(
-                model,
+                auto_model,
                 output_type=str,
                 deps_type=AutoDeps,
                 instructions=auto_instructions,
                 tools=auto_tools,
+                capabilities=[CodeMode()],
                 retries=3,
             )
-            # No mention prefix on auto posts, so the budget is the full note cap.
-            self._auto_agent.output_validator(_enforce_length(config.max_note_length))
+            # Autonomous drafts have their own publication budget, which may be tighter
+            # than the Misskey instance's general note limit.
+            self._auto_agent.output_validator(_enforce_length(self._auto_char_limit))
             self._auto_agent.output_validator(self._validate_auto_output)
 
         # Isolated, tool-less classifier for auto-scoring: treats the message as untrusted
@@ -692,30 +722,22 @@ class ChatAgent:
             # Categories, deltas, and instructions are derived from config here, so the
             # operator owns the buckets while code still owns the numbers.
             self._score_spec = build_scoring_spec(config.social_credit_categories)
-            # pydantic-ai constrains output to the Literal's values at runtime, but Basedpyright
-            # can't match the Literal special form to the Agent() overloads (hence pyright: ignore).
+            # PromptedOutput preserves Pydantic validation against the Literal category names
+            # without requiring tool_choice=required, which some OpenAI-compatible routes reject.
             self._score_agent = Agent(  # type: ignore[reportCallIssue, reportAttributeAccessIssue]
                 self._score_model,
-                output_type=self._score_spec.output_type,  # type: ignore[reportArgumentType]
+                output_type=PromptedOutput(self._score_spec.output_type),  # type: ignore[reportArgumentType]
                 instructions=[self._score_spec.instructions],
                 retries=2,
             )
 
     async def __aenter__(self) -> Self:
-        """Open the Python worker pool and persistent MCP sessions."""
-        await self._python_pool.__aenter__()
-        try:
-            await self._agent.__aenter__()
-        except BaseException as exc:
-            await self._python_pool.__aexit__(type(exc), exc, exc.__traceback__)
-            raise
+        """Open persistent MCP sessions."""
+        await self._agent.__aenter__()
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        try:
-            await self._agent.__aexit__(exc_type, exc, tb)
-        finally:
-            await self._python_pool.__aexit__(exc_type, exc, tb)
+        await self._agent.__aexit__(exc_type, exc, tb)
 
     def _enforce_budget(self, ctx: RunContext[AgentDeps], output: str) -> str:
         """Output validator hard-gating the reply to the turn's ``char_budget``.
@@ -746,15 +768,20 @@ class ChatAgent:
 
         ``max_tokens`` and the sampling params are only included when set in config, so
         unset ones keep the provider default (and aren't sent to models that reject them).
-        Autonomous posts use ``auto_temperature`` when configured, otherwise they inherit
-        the shared ``temperature`` setting.
+        Autonomous posts may override the token cap and temperature without changing
+        replies or ACP.
         """
         settings: ModelSettings = {
             "timeout": timeout,
             "extra_headers": provider_request_headers(),
         }
-        if self._config.max_tokens is not None:
-            settings["max_tokens"] = self._config.max_tokens
+        max_tokens = (
+            self._config.auto_max_tokens
+            if auto_post and self._config.auto_max_tokens is not None
+            else self._config.max_tokens
+        )
+        if max_tokens is not None:
+            settings["max_tokens"] = max_tokens
         temperature = (
             self._config.auto_temperature
             if auto_post and self._config.auto_temperature is not None
@@ -947,10 +974,12 @@ class ChatAgent:
         result = await self._auto_agent.run(
             "Generate a post for the timeline.",
             message_history=message_history,
-            model_settings=self._generation_settings(300.0, auto_post=True),
+            model_settings=self._generation_settings(self._config.auto_timeout_seconds, auto_post=True),
             deps=deps,
         )
         text = result.output
+        if _AUTO_TOOL_MARKUP_RE.search(text):
+            raise ValueError("Autonomous post contains textual tool-call markup")
         image_description = _split_auto_image_description(text)
         if image_description is not None:
             description, caption = image_description
@@ -993,6 +1022,11 @@ class ChatAgent:
             if deps.image is None:
                 raise ValueError("Autonomous post requested image-only output without generating an image")
             text = ""
+        if len(text) > self._auto_char_limit:
+            raise ValueError(
+                f"Autonomous post is {len(text)} characters, over the "
+                f"{self._auto_char_limit}-character publication limit"
+            )
         if not text.strip():
             if deps.poll is not None:
                 raise ValueError("Autonomous poll has no question text")
@@ -1017,7 +1051,12 @@ class ChatAgent:
 
     @staticmethod
     def _validate_auto_output(ctx: RunContext[AutoDeps], output: str) -> str:
-        """Normalize the internal image-only marker and reject contentless posts."""
+        """Normalize the image-only marker and reject malformed or contentless posts."""
+        if _AUTO_TOOL_MARKUP_RE.search(output):
+            raise ModelRetry(
+                "Do not write textual tool-call markup. Call the native run_code tool and "
+                "invoke the needed async function from Python, then write only the final post."
+            )
         if output.strip() == _IMAGE_ONLY_OUTPUT:
             if ctx.deps.poll is not None:
                 raise ModelRetry("A poll needs question text; do not use the image-only marker with a poll.")

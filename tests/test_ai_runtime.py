@@ -9,9 +9,32 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from pydantic_ai import ImageUrl, ModelRetry
+from pydantic_ai import (
+    Agent,
+    FunctionToolset,
+    ImageUrl,
+    ModelMessage,
+    ModelResponse,
+    ModelRetry,
+    PromptedOutput,
+    TextPart,
+    Tool,
+    ToolCallPart,
+)
+from pydantic_ai.messages import ToolReturnPart
+from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.models.test import TestModel
+from pydantic_ai_harness import CodeMode
 
-from bot.ai import _IMAGE_ONLY_OUTPUT, AutoDeps, ChatAgent, _make_create_poll_tool, _make_generate_image_tool
+from bot.ai import (
+    _CODE_MODE_INSTRUCTION,
+    _IMAGE_ONLY_OUTPUT,
+    AgentDeps,
+    AutoDeps,
+    ChatAgent,
+    _make_create_poll_tool,
+    _make_generate_image_tool,
+)
 from bot.core import HistoryTurn, Poll
 from bot.imagegen import GeneratedImage
 
@@ -278,6 +301,23 @@ def test_score_model_uses_separate_chain_when_configured(make_config, fake_redis
     agent = ChatAgent(cfg, redis_client=fake_redis)
     assert agent._score_model == "openrouter:cheap/classifier"
     assert agent._score_agent is not None
+    assert isinstance(agent._score_agent.output_type, PromptedOutput)
+
+
+@pytest.mark.anyio
+async def test_score_agent_validates_prompted_literal_output(make_config, fake_redis):
+    agent = ChatAgent(make_config(), redis_client=fake_redis)
+    assert agent._score_agent is not None
+
+    async def prompted_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        del messages
+        assert info.output_tools == []
+        return ModelResponse(parts=[TextPart('{"response":"good"}')])
+
+    with agent._score_agent.override(model=FunctionModel(prompted_model)):
+        result = await agent._score_agent.run("classify this")
+
+    assert result.output == "good"
 
 
 @pytest.mark.anyio
@@ -738,10 +778,6 @@ def test_reply_agent_never_gets_image_tool(make_config):
     assert "generate_image" not in agent._agent._function_toolset.tools
 
 
-def test_reply_agent_gets_python_tool(make_config):
-    agent = ChatAgent(make_config())
-
-    assert "run_python" in agent._agent._function_toolset.tools
 
 
 def test_auto_agent_gets_poll_tool(make_config):
@@ -758,6 +794,90 @@ def test_reply_agent_never_gets_poll_tool(make_config):
 
 
 @pytest.mark.anyio
+async def test_reply_and_auto_agents_offer_code_mode_tools(make_config):
+    agent = ChatAgent(make_config(system_prompt_auto="Post something."))
+
+    reply_model = TestModel(call_tools=[], custom_output_text="reply")
+    with agent._agent.override(model=reply_model):
+        await agent._agent.run("hello", deps=AgentDeps(username="alice"))
+    reply_params = reply_model.last_model_request_parameters
+    assert reply_params is not None
+    reply_names = {tool.name for tool in reply_params.function_tools}
+    assert reply_names == {"run_code"}
+    reply_instructions = "\n".join(part.content for part in reply_params.instruction_parts or [])
+    assert _CODE_MODE_INSTRUCTION in reply_instructions
+
+    assert agent._auto_agent is not None
+    auto_model = TestModel(call_tools=[], custom_output_text="post")
+    with agent._auto_agent.override(model=auto_model):
+        await agent.run_auto()
+    auto_params = auto_model.last_model_request_parameters
+    assert auto_params is not None
+    auto_names = {tool.name for tool in auto_params.function_tools}
+    assert auto_names == {"run_code"}
+    auto_instructions = "\n".join(part.content for part in auto_params.instruction_parts or [])
+    assert _CODE_MODE_INSTRUCTION in auto_instructions
+
+
+@pytest.mark.anyio
+async def test_code_mode_executes_tool_from_code():
+    calls: list[str] = []
+
+    def echo(value: str) -> str:
+        """Echo a value."""
+        calls.append(value)
+        return value.upper()
+
+    async def use_code(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        has_tool_return = any(isinstance(part, ToolReturnPart) for message in messages for part in message.parts)
+        if not has_tool_return:
+            assert {tool.name for tool in info.function_tools} == {"run_code"}
+            run_code = next(tool for tool in info.function_tools if tool.name == "run_code")
+            assert run_code.description is not None
+            assert "async def echo(" in run_code.description
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "run_code",
+                        {"code": "await echo(value='coded')"},
+                        "code-call",
+                    )
+                ]
+            )
+        return ModelResponse(parts=[TextPart("done")])
+
+    agent = Agent(
+        TestModel(),
+        toolsets=[FunctionToolset(tools=[Tool(echo)])],
+        capabilities=[CodeMode()],
+    )
+    with agent.override(model=FunctionModel(use_code)):
+        result = await agent.run("Call echo from code.")
+    assert result.output == "done"
+    assert calls == ["coded"]
+
+
+@pytest.mark.anyio
+async def test_auto_agent_uses_dedicated_model_chain(make_config):
+    reply_model = TestModel(call_tools=[], custom_output_text="reply")
+    auto_model = TestModel(call_tools=[], custom_output_text="auto")
+
+    with patch("bot.ai._model_chain", side_effect=[reply_model, auto_model]) as model_chain:
+        agent = ChatAgent(
+            make_config(
+                llm_models=["reply-model"],
+                auto_models=["auto-model"],
+                system_prompt_auto="Post something.",
+            )
+        )
+
+    post = await agent.run_auto()
+
+    assert [call.args[0] for call in model_chain.call_args_list] == [["reply-model"], ["auto-model"]]
+    assert post.text == "auto"
+
+
+@pytest.mark.anyio
 async def test_run_auto_returns_text_only_when_no_image(make_config):
     agent = ChatAgent(_auto_config(make_config))
     assert agent._auto_agent is not None
@@ -771,9 +891,7 @@ async def test_run_auto_returns_text_only_when_no_image(make_config):
 
 @pytest.mark.anyio
 async def test_run_auto_uses_autonomous_temperature(make_config):
-    agent = ChatAgent(
-        make_config(system_prompt_auto="Post something.", temperature=0.4, auto_temperature=1.2)
-    )
+    agent = ChatAgent(make_config(system_prompt_auto="Post something.", temperature=0.4, auto_temperature=1.2))
     assert agent._auto_agent is not None
     run_mock = AsyncMock(return_value=SimpleNamespace(output="post text"))
 
@@ -783,6 +901,28 @@ async def test_run_auto_uses_autonomous_temperature(make_config):
     await_args = run_mock.await_args
     assert await_args is not None
     assert await_args.kwargs["model_settings"]["temperature"] == 1.2
+
+@pytest.mark.anyio
+async def test_run_auto_uses_autonomous_timeout_and_token_cap(make_config):
+    agent = ChatAgent(
+        make_config(
+            system_prompt_auto="Post something.",
+            max_tokens=1024,
+            auto_max_tokens=256,
+            auto_timeout_seconds=60,
+        )
+    )
+    assert agent._auto_agent is not None
+    run_mock = AsyncMock(return_value=SimpleNamespace(output="post text"))
+
+    with patch.object(agent._auto_agent, "run", run_mock):
+        await agent.run_auto()
+
+    await_args = run_mock.await_args
+    assert await_args is not None
+    assert await_args.kwargs["model_settings"]["timeout"] == 60
+    assert await_args.kwargs["model_settings"]["max_tokens"] == 256
+
 
 
 @pytest.mark.anyio
@@ -996,6 +1136,20 @@ def test_auto_output_validator_retries_image_only_marker_without_image():
         ChatAgent._validate_auto_output(ctx, _IMAGE_ONLY_OUTPUT)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize(
+    "output",
+    [
+        '<invoke name="generate_image"><parameter name="prompt">bad</parameter></invoke>',
+        "<tool_call>generate_image({})</tool_call>",
+    ],
+)
+def test_auto_output_validator_retries_textual_tool_markup(output):
+    ctx = SimpleNamespace(deps=AutoDeps())
+
+    with pytest.raises(ModelRetry, match="run_code"):
+        ChatAgent._validate_auto_output(ctx, output)  # type: ignore[arg-type]
+
+
 @pytest.mark.anyio
 async def test_run_auto_rejects_image_only_marker_without_image(make_config):
     """Keep the publication boundary safe even when a mocked/custom Agent skips validators."""
@@ -1011,6 +1165,35 @@ async def test_run_auto_rejects_image_only_marker_without_image(make_config):
         pytest.raises(ValueError, match="without generating an image"),
     ):
         await agent.run_auto()
+
+
+@pytest.mark.anyio
+async def test_run_auto_rejects_textual_tool_markup_before_history(make_config):
+    agent = ChatAgent(_auto_config(make_config))
+    assert agent._auto_agent is not None
+    output = '<invoke name="generate_image"><parameter name="prompt">bad</parameter></invoke>'
+
+    with (
+        patch.object(agent._auto_agent, "run", AsyncMock(return_value=SimpleNamespace(output=output))),
+        pytest.raises(ValueError, match="textual tool-call markup"),
+    ):
+        await agent.run_auto()
+
+    assert list(agent._auto_history) == []
+
+
+@pytest.mark.anyio
+async def test_run_auto_rejects_over_limit_text_before_history(make_config):
+    agent = ChatAgent(_auto_config(make_config, auto_max_chars=10))
+    assert agent._auto_agent is not None
+
+    with (
+        patch.object(agent._auto_agent, "run", AsyncMock(return_value=SimpleNamespace(output="eleven chars"))),
+        pytest.raises(ValueError, match="publication limit"),
+    ):
+        await agent.run_auto()
+
+    assert list(agent._auto_history) == []
 
 
 @pytest.mark.anyio

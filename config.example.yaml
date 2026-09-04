@@ -21,9 +21,13 @@ llm_models:
   #   api_key_env: MODAL_API_KEY  # optional
   # - model: "openrouter:deepseek/deepseek-chat-v3.1"
   #   vision: false  # opt this string-form model out of vision routing
+# Optional autonomous-post-only fallback chain. Omit to reuse llm_models.
+# auto_models:
+#   - "openrouter:deepseek/deepseek-chat-v3.1"
+#   - "openrouter:qwen/qwen3-235b-a22b-2507"
 # Pass images directly to the main LLM (requires a multimodal model)
 vision: true
-max_tokens: 512  # optional hard cap on reply/auto-post length, enforced via model_settings; omit to leave unbounded (truncated only at max_note_length)
+max_tokens: 512  # optional reply/default auto token cap; omit to leave generation unbounded
 max_retries: 1
 http_timeout_seconds: 30
 # Sampling / anti-repetition knobs for the reply + auto-post models. Each is only
@@ -80,6 +84,9 @@ searxng_password: "yourpassword"
 # Optional: Autonomous posting (post to the timeline without being mentioned)
 # auto_post_interval: 3600  # seconds between autonomous posts
 # auto_post_jitter: 600     # random +/- seconds added to each interval
+# auto_timeout_seconds: 60  # per autonomous model request; default 300
+# auto_max_tokens: 256      # autonomous-only token cap; defaults to max_tokens
+# auto_max_chars: 280       # autonomous-only visible post cap; defaults to max_note_length
 # system_prompt_auto: |
 #   You are Grok 4. Post something interesting, funny, or random to the timeline.
 #   No mentions needed. Keep it short and in your usual chaotic style.

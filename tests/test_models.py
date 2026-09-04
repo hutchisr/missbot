@@ -29,6 +29,39 @@ def test_config_max_tokens_optional(make_config):
     assert make_config(max_tokens=None).max_tokens is None
 
 
+def test_config_autonomous_generation_overrides(make_config):
+    defaults = make_config()
+    assert defaults.auto_models is None
+    assert defaults.auto_max_tokens is None
+    assert defaults.auto_max_chars is None
+    assert defaults.auto_timeout_seconds == 300.0
+
+    cfg = make_config(
+        auto_models=["openrouter:test/auto"],
+        auto_max_tokens=256,
+        auto_max_chars=280,
+        auto_timeout_seconds=60,
+    )
+    assert cfg.auto_models == ["openrouter:test/auto"]
+    assert cfg.auto_max_tokens == 256
+    assert cfg.auto_max_chars == 280
+    assert cfg.auto_timeout_seconds == 60
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("auto_models", []),
+        ("auto_max_tokens", 0),
+        ("auto_max_chars", 0),
+        ("auto_timeout_seconds", 0),
+    ],
+)
+def test_config_rejects_invalid_autonomous_generation_override(make_config, field, value):
+    with pytest.raises(ValidationError):
+        make_config(**{field: value})
+
+
 def test_config_auto_temperature_is_optional_and_bounded(make_config):
     assert make_config().auto_temperature is None
     assert make_config(auto_temperature=1.2).auto_temperature == 1.2

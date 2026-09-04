@@ -201,6 +201,11 @@ class Config(BaseModel):
         "(e.g. 'openrouter:anthropic/claude-3.5-sonnet'). Dicts add metadata or "
         "select an API family and optional custom endpoint (see ModelSpec)."
     )
+    auto_models: list[str | ModelSpec] | None = Field(
+        default=None,
+        min_length=1,
+        description="Optional model chain used only for autonomous posts. None reuses llm_models.",
+    )
     vision: bool = Field(default=True, description="Enable vision (pass images directly to the main LLM)")
     vision_models: list[str] | None = Field(
         default=None, description="Vision model strings (legacy, unused when vision=True)"
@@ -208,9 +213,14 @@ class Config(BaseModel):
     max_tokens: int | None = Field(
         default=None,
         gt=0,
-        description="Hard cap on reply/auto-post length, wired into the reply/auto models' "
-        "model_settings. When unset, the model generates unboundedly and over-length output "
-        "is truncated only at the Misskey note cap (max_note_length).",
+        description="Hard cap on reply generation and, when auto_max_tokens is unset, autonomous "
+        "generation. When unset, the corresponding models generate without an explicit token cap.",
+    )
+    auto_max_tokens: int | None = Field(
+        default=None,
+        gt=0,
+        description="Autonomous-post-only generation token cap. None reuses max_tokens, including "
+        "its unbounded behavior.",
     )
     max_note_length: int = Field(
         default=3000,
@@ -219,6 +229,12 @@ class Config(BaseModel):
         "maxNoteTextLength, default 3000). The reply/auto models are told this budget so "
         "they compose a complete in-bounds reply; over-cap output is truncated only as a "
         "last-resort safety net (Misskey rejects an over-cap note with HTTP 400).",
+    )
+    auto_max_chars: int | None = Field(
+        default=None,
+        gt=0,
+        description="Autonomous-post-only visible character cap. None reuses max_note_length. "
+        "Over-limit drafts are retried and never added to autonomous history or published.",
     )
     temperature: float | None = Field(
         default=None,
@@ -233,6 +249,11 @@ class Config(BaseModel):
         le=2.0,
         description="Sampling temperature override for autonomous posts. None reuses temperature, "
         "including its provider-default behavior.",
+    )
+    auto_timeout_seconds: float = Field(
+        default=300.0,
+        gt=0,
+        description="Per-request timeout in seconds for autonomous-post model generation.",
     )
     top_p: float | None = Field(
         default=None,
