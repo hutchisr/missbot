@@ -433,115 +433,166 @@ def _memory_cfg(make_config, **extra):
 
 
 @pytest.mark.anyio
-async def test_run_ingests_turn_with_hindsight(make_config, make_turn):
+async def test_run_recalls_before_model_and_retains_completed_exchange(make_config, make_turn):
+    events: list[str] = []
     mem = AsyncMock()
-    agent = ChatAgent(_memory_cfg(make_config), memory=mem)
 
-    with patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))):
-        out = await agent.run(make_turn(text="Python's latest version is 3.13"))
+    async def recall(turn):
+        events.append("recall")
+        return "guarded Hindsight context"
+
+    async def model_run(*args, **kwargs):
+        events.append("model")
+        return SimpleNamespace(output="reply")
+
+    async def retain(turn, reply):
+        events.append("retain")
+
+    mem.recall_for_turn.side_effect = recall
+    mem.retain_turn.side_effect = retain
+    agent = ChatAgent(_memory_cfg(make_config), memory=mem)
+    turn = make_turn(text="What do you remember?")
+
+    with patch.object(agent._agent, "run", AsyncMock(side_effect=model_run)) as run_mock:
+        out = await agent.run(turn)
 
     assert out == "reply"
-    mem.add_note.assert_awaited_once_with(
-        text="Python's latest version is 3.13",
-        author="alice",
-        author_user_id=None,
-        note_id="note-1",
-        source="unknown",
-    )
+    assert events == ["recall", "model", "retain"]
+    assert run_mock.await_args is not None
+    prompt = run_mock.await_args.args[0]
+    assert prompt == ["guarded Hindsight context", "alice: What do you remember?"]
+    mem.recall_for_turn.assert_awaited_once_with(turn)
+    mem.retain_turn.assert_awaited_once_with(turn, "reply")
 
 
 @pytest.mark.anyio
-async def test_run_ingestion_disabled_by_flag(make_config, make_turn):
+async def test_run_does_not_retain_when_model_fails(make_config, make_turn):
     mem = AsyncMock()
-    agent = ChatAgent(_memory_cfg(make_config, memory_ingest_notes=False), memory=mem)
+    mem.recall_for_turn.return_value = None
+    agent = ChatAgent(_memory_cfg(make_config), memory=mem)
 
-    with patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))):
-        await agent.run(make_turn(text="Python's latest version is 3.13"))
+    with (
+        patch.object(agent._agent, "run", AsyncMock(side_effect=RuntimeError("provider failed"))),
+        pytest.raises(RuntimeError, match="provider failed"),
+    ):
+        await agent.run(make_turn(text="do not retain an unanswered turn"))
 
-    mem.add_note.assert_not_awaited()
+    mem.retain_turn.assert_not_awaited()
 
 
 @pytest.mark.anyio
-async def test_run_ingestion_skips_turns_that_disallow_memory_writes(make_config, make_turn):
+async def test_run_cancellation_stops_scoring_without_retention_delay(make_config, make_turn):
+    mem = AsyncMock()
+    mem.recall_for_turn.return_value = None
+    agent = ChatAgent(_memory_cfg(make_config), memory=mem)
+    model_started = asyncio.Event()
+    score_started = asyncio.Event()
+    score_cancelled = asyncio.Event()
+    score_release = asyncio.Event()
+    score_stopped = asyncio.Event()
+    never_finishes = asyncio.Event()
+
+    async def slow_model(*args, **kwargs):
+        model_started.set()
+        await never_finishes.wait()
+
+    async def slow_score(_turn):
+        score_started.set()
+        try:
+            await never_finishes.wait()
+        except asyncio.CancelledError:
+            # Simulate a provider cleanup path which does not stop immediately.
+            score_cancelled.set()
+            await score_release.wait()
+        finally:
+            score_stopped.set()
+
+    with (
+        patch.object(agent._agent, "run", AsyncMock(side_effect=slow_model)),
+        patch.object(agent, "_maybe_score_message", AsyncMock(side_effect=slow_score)),
+    ):
+        run_task = asyncio.create_task(agent.run(make_turn(text="cancel this turn")))
+        await asyncio.gather(model_started.wait(), score_started.wait())
+        run_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(run_task, timeout=0.5)
+        score_release.set()
+        await asyncio.wait_for(score_stopped.wait(), timeout=0.5)
+
+    assert score_cancelled.is_set()
+    mem.retain_turn.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_run_skips_all_memory_access_for_restricted_turn(make_config, make_turn):
     mem = AsyncMock()
     agent = ChatAgent(_memory_cfg(make_config), memory=mem)
-    turn = make_turn(text="restricted account recovery code", memory_writes_allowed=False)
+    turn = make_turn(text="restricted account recovery code", memory_access_allowed=False)
 
     with patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="private reply"))) as run_mock:
         out = await agent.run(turn)
 
     assert out == "private reply"
     assert run_mock.await_args is not None
-    assert run_mock.await_args.kwargs["deps"].memory_writes_allowed is False
-    mem.add_note.assert_not_awaited()
+    assert run_mock.await_args.args[0] == "alice: restricted account recovery code"
+    mem.recall_for_turn.assert_not_awaited()
+    mem.retain_turn.assert_not_awaited()
 
 
 @pytest.mark.anyio
-async def test_run_ingestion_skips_empty_text(make_config, make_turn):
+async def test_run_recall_failure_does_not_cost_reply_or_retention(make_config, make_turn):
     mem = AsyncMock()
+    mem.recall_for_turn.side_effect = RuntimeError("Hindsight down")
     agent = ChatAgent(_memory_cfg(make_config), memory=mem)
+    turn = make_turn(text="some durable world fact")
 
-    with patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))):
-        await agent.run(make_turn(text="  "))
+    with patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))) as run_mock:
+        out = await agent.run(turn)
 
-    mem.add_note.assert_not_awaited()
+    assert out == "reply"
+    assert run_mock.await_args is not None
+    assert run_mock.await_args.args[0] == "alice: some durable world fact"
+    mem.retain_turn.assert_awaited_once_with(turn, "reply")
 
 
 @pytest.mark.anyio
-async def test_run_ingestion_swallows_hindsight_errors(make_config, make_turn):
+async def test_run_retention_failure_does_not_cost_reply(make_config, make_turn):
     mem = AsyncMock()
-    mem.add_note.side_effect = RuntimeError("Hindsight down")
+    mem.recall_for_turn.return_value = None
+    mem.retain_turn.side_effect = RuntimeError("Hindsight down")
     agent = ChatAgent(_memory_cfg(make_config), memory=mem)
 
     with patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))):
         out = await agent.run(make_turn(text="some durable world fact"))
 
     assert out == "reply"
-    mem.add_note.assert_awaited_once()
+    mem.retain_turn.assert_awaited_once()
 
 
 @pytest.mark.anyio
-async def test_run_ingestion_normalizes_author_handle(make_config, make_turn):
+async def test_run_retains_user_turn_without_hiding_no_reply_outcome(make_config, make_turn):
     mem = AsyncMock()
+    mem.recall_for_turn.return_value = None
     agent = ChatAgent(_memory_cfg(make_config), memory=mem)
+    turn = make_turn(text="quiet thought")
 
-    with patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))):
-        await agent.run(make_turn(text="I use Arch btw", handle="Alice@Remote.Example"))
+    with patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="NO_REPLY"))):
+        out = await agent.run(turn)
 
-    mem.add_note.assert_awaited_once_with(
-        text="I use Arch btw",
-        author="alice@remote.example",
-        author_user_id=None,
-        note_id="note-1",
-        source="unknown",
-    )
+    assert out == "NO_REPLY"
+    mem.retain_turn.assert_awaited_once_with(turn, "NO_REPLY")
 
 
 @pytest.mark.anyio
-async def test_run_ingestion_passes_the_turn_source_label(make_config, make_turn):
-    """Provenance follows the frontend, so ACP memories aren't tagged as Misskey notes."""
+async def test_run_does_not_use_store_when_memory_disabled(config, make_turn):
     mem = AsyncMock()
-    agent = ChatAgent(_memory_cfg(make_config), memory=mem)
-    turn = make_turn(text="i keep three shrimp tanks", handle="acp:abc", source="acp_prompt")
+    agent = ChatAgent(config, memory=mem)
 
     with patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))):
-        await agent.run(turn)
+        await agent.run(make_turn())
 
-    assert mem.add_note.await_args is not None
-    assert mem.add_note.await_args.kwargs["source"] == "acp_prompt"
-
-
-@pytest.mark.anyio
-async def test_run_ingestion_passes_stable_author_user_id(make_config, make_turn):
-    mem = AsyncMock()
-    agent = ChatAgent(_memory_cfg(make_config), memory=mem)
-    turn = make_turn(text="the operator prefers concise replies", user_id="trusted-user-id")
-
-    with patch.object(agent._agent, "run", AsyncMock(return_value=SimpleNamespace(output="reply"))):
-        await agent.run(turn)
-
-    assert mem.add_note.await_args is not None
-    assert mem.add_note.await_args.kwargs["author_user_id"] == "trusted-user-id"
+    mem.recall_for_turn.assert_not_awaited()
+    mem.retain_turn.assert_not_awaited()
 
 
 _GENERATED = GeneratedImage(data=b"\x89PNG\r\n\x1a\nbytes", media_type="image/png", prompt="p", alt_text="a")
@@ -773,8 +824,6 @@ def test_reply_agent_never_gets_image_tool(make_config):
     assert "generate_image" not in agent._agent._function_toolset.tools
 
 
-
-
 def test_auto_agent_gets_poll_tool(make_config):
     agent = ChatAgent(make_config(system_prompt_auto="Post something."))
 
@@ -897,6 +946,7 @@ async def test_run_auto_uses_autonomous_temperature(make_config):
     assert await_args is not None
     assert await_args.kwargs["model_settings"]["temperature"] == 1.2
 
+
 @pytest.mark.anyio
 async def test_run_auto_uses_autonomous_timeout_and_token_cap(make_config):
     agent = ChatAgent(
@@ -917,7 +967,6 @@ async def test_run_auto_uses_autonomous_timeout_and_token_cap(make_config):
     assert await_args is not None
     assert await_args.kwargs["model_settings"]["timeout"] == 60
     assert await_args.kwargs["model_settings"]["max_tokens"] == 256
-
 
 
 @pytest.mark.anyio

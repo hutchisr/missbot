@@ -59,22 +59,22 @@ backends is the same bot, not a copy of it.
 - Optional Redis-backed social credit with history and leaderboard tools,
   configurable categories, cooldowns, and an isolated classifier that maps
   constrained labels to code-owned score changes.
-- Optional Hindsight long-term memory, including explicit
-  `add_memory`/`search_memory` tools, provenance-aware recall, and automatic
-  ingestion of public messages through one shared bank.
+- Optional Hindsight long-term memory with automatic pre-turn recall,
+  post-turn structured retention, observation consolidation, provenance, and
+  one shared public-conversation bank.
 
 ### Safeguards and operations
 
 - Direct-message and bot-account filtering by default to reduce accidental
-  private ingestion and bot-to-bot loops.
+  private memory access and bot-to-bot loops.
 - SSRF checks for federated media URLs before images reach a model provider.
 - Caps for reply mentions and concurrent handlers to bound notification,
   provider, Redis, memory, and HTTP load.
-- Private interactions cannot write long-term memory; public-note memory and
-  social scoring failures are isolated from reply generation.
+- Private interactions cannot access long-term memory. Hindsight recall,
+  retention, and social-scoring failures are isolated from reply generation.
 - Logfire instrumentation for Pydantic AI, HTTPX, Redis, and application events.
-- Docker and Kustomize deployment with generated Secrets and scheduled memory
-  maintenance.
+- Docker and Kustomize deployment with generated Secrets and in-cluster
+  Hindsight connectivity.
 
 ## Requirements
 
@@ -82,7 +82,7 @@ backends is the same bot, not a copy of it.
 - `uv` package manager
 - A Misskey account and API token for the bot
 
-Redis, SearXNG, Postgres/pgvector, MCP servers, and long-term memory are optional.
+Redis, SearXNG, Hindsight, and MCP servers are optional.
 
 ## Setup
 
@@ -179,9 +179,9 @@ Kustomize manifests and restarts the deployment. The runtime configuration in
 - [bot/acp/](bot/acp/) — ACP adapter: protocol surface, sender attribution, sessions
 - [bot/ai.py](bot/ai.py) — Model fallback, prompts, vision routing, and concurrent side work
 - [bot/models.py](bot/models.py) — Runtime and configuration models
-- [bot/tools.py](bot/tools.py) — Built-in, social-credit, and memory tools
+- [bot/tools.py](bot/tools.py) — Built-in and social-credit tools
 - [bot/scoring.py](bot/scoring.py) — Constrained automatic score classification
-- [bot/memory.py](bot/memory.py) — Official Hindsight client adapter and provenance mapping
+- [bot/memory.py](bot/memory.py) — Hindsight recall/retain lifecycle and provenance fencing
 - [bot/mcp.py](bot/mcp.py) — MCP server filtering, prefixes, and gates
 - [bot/net.py](bot/net.py) — Federated-media SSRF protection
 - [config.example.yaml](config.example.yaml) — Configuration template

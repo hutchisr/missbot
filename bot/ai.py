@@ -254,8 +254,6 @@ class AgentDeps:
 
     username: str
     """The handle of the user who sent the message."""
-    source_note_id: str | None = None
-    """Id of the note being replied to, recorded as provenance on memory writes."""
     social_credit_score: int | None = None
     """The user's current social credit score, or None if unavailable."""
     adjusted_credit_users: set[str] = field(default_factory=set)
@@ -268,8 +266,6 @@ class AgentDeps:
     """The bot's most recent reply in this thread, if any. Used by the verbatim-repeat
     output validator to reject a reply that just parrots the prior turn (a failure mode of
     weaker fallback models when the new message is a thin same-topic follow-up)."""
-    memory_writes_allowed: bool = True
-    """False for followers-only/private notes so global memory cannot retain restricted content."""
     char_budget: int | None = None
     """Hard reply length cap for this run, or None for no cap. Set per-frontend by the
     adapter (Misskey passes its note limit; ACP passes None), so the same agent can serve
@@ -617,7 +613,6 @@ class ChatAgent:
         tools = build_tools(
             config,
             redis_client=redis_client,
-            memory=memory,
         )
         gates = gate_names(config)
         for gate, servers in sorted(gates.items()):
@@ -799,16 +794,15 @@ class ChatAgent:
 
     @logfire.instrument(extract_args=["turn"])
     async def run(self, turn: AgentTurn) -> str:
-        """Process one frontend-neutral turn and generate a reply."""
+        """Recall context, generate a reply, then retain the completed exchange."""
         current_images = list(turn.images)
         history_has_images = any(past.role == "user" and bool(past.images) for past in turn.history)
         has_image_input = bool(current_images) or history_has_images
         if not turn.text and not current_images:
             raise ValueError("Turn has no text or supported images")
 
-        # Pick the model chain. Current and historical user images are part of the
-        # same model request, so either one requires a vision-capable chain. If no
-        # such model exists, drop every image rather than failing the whole fallback.
+        # Current and historical images are one request, so either requires a
+        # vision-capable chain. Without one, drop every image rather than fail.
         run_model: str | Model | None = None
         if has_image_input:
             if not self._has_vision_model:
@@ -817,23 +811,27 @@ class ChatAgent:
             elif self._vision_model is not None:
                 run_model = self._vision_model
 
-        # Apply the same capability decision to historical images.
         effective_vision = has_image_input and self._has_vision_model
         message_history: list[ModelMessage] = []
         for past in turn.history:
             if past.role == "assistant":
-                # The bot's own earlier messages become assistant responses. Adapters
-                # strip any platform mention prefix before handing them over, so the
-                # history can't prime the model to copy its prior reply verbatim.
                 message_history.append(ModelResponse(parts=[TextPart(content=past.text.strip())]))
             else:
-                # Other users' messages become user prompts (with any attached images)
                 message_history.append(
                     ModelRequest(parts=[UserPromptPart(content=_history_content(past, effective_vision))])
                 )
 
-        # Build current user prompt
+        # Hindsight recall and the current score lookup are independent. Both
+        # complete before the model runs; scoring the new message starts only
+        # afterward so the dynamic prompt sees the pre-turn score.
+        score, memory_context = await asyncio.gather(
+            self._get_social_credit_score(turn.author.handle),
+            self._recall_memory_context(turn),
+        )
+
         current_parts: list[str | TurnImage] = []
+        if memory_context:
+            current_parts.append(memory_context)
         if turn.author.location:
             current_parts.append(f"User location: {turn.author.location}")
         current_parts.append(f"{turn.author.rendered}: {turn.text}")
@@ -846,21 +844,13 @@ class ChatAgent:
         else:
             prompt = current_parts
 
-        # Pre-fetch social credit score for the current user
-        score = await self._get_social_credit_score(turn.author.handle)
         deps = AgentDeps(
-            # Prompt-facing, so use the rendered handle; scoring and memory key off
-            # `turn.author.handle` instead.
             username=turn.author.rendered,
-            source_note_id=turn.source_id,
             social_credit_score=score,
-            # The adapter decides privilege — it owns the platform's notion of identity.
             social_credit_unrestricted=turn.author.privileged,
             previous_bot_reply=turn.previous_reply,
-            memory_writes_allowed=turn.memory_writes_allowed,
             char_budget=turn.char_budget,
         )
-
         run_kwargs: dict[str, Any] = {
             "deps": deps,
             "message_history": message_history,
@@ -868,14 +858,21 @@ class ChatAgent:
         }
         if run_model is not None:
             run_kwargs["model"] = run_model
-        # Score the author's message and learn any world-fact it asserts, both in parallel
-        # with the reply (no added latency). Each side task is _guarded, so its errors are
-        # swallowed and can never cancel the reply.
-        result, _, _ = await asyncio.gather(
-            self._agent.run(prompt, **run_kwargs),
-            _guarded(self._maybe_score_message(turn), "Message scoring"),
-            _guarded(self._maybe_ingest_note(turn), "Note ingestion"),
-        )
+
+        scoring_task = asyncio.create_task(_guarded(self._maybe_score_message(turn), "Message scoring"))
+        try:
+            result = await self._agent.run(prompt, **run_kwargs)
+        except BaseException:
+            # A failed or cancelled model turn is never retained. Stop its side task too:
+            # waiting for an independent classifier would delay error propagation and ACP
+            # cancellation without producing a reply that can use the score.
+            scoring_task.cancel()
+            done, _ = await asyncio.wait((scoring_task,), timeout=0.1)
+            if not done:
+                logfire.warning("Message scoring did not stop promptly after model failure")
+            raise
+        await scoring_task
+        await self._retain_memory_exchange(turn, result.output)
         return result.output
 
     def _render_context_lines(self, history: list[HistoryTurn]) -> list[str]:
@@ -883,8 +880,8 @@ class ChatAgent:
         lines.
 
         ``history`` is oldest-first. Empty messages are dropped; the bot's own messages
-        use the configured bot handle. Shared by the note-ingestion and scoring side tasks
-        so both see the same thread rendering.
+        use the configured bot handle. The scoring classifier uses these lines as
+        reference-only conversational context.
         """
         lines: list[str] = []
         for past in history:
@@ -1071,32 +1068,24 @@ class ChatAgent:
             raise ModelRetry("The post has neither text nor an image. Write a text post or generate an image.")
         return output
 
-    async def _maybe_ingest_note(self, turn: AgentTurn) -> None:
-        """Let Hindsight learn durable facts from the author's public message.
-
-        Hindsight owns extraction, deduplication, storage, and retrieval. This side
-        task catches its own errors so memory can never break a reply.
-        """
-        if self._memory is None or not self._config.memory_enabled or not self._config.memory_ingest_notes:
-            return
-        # Restricted interactions may be replyable, but their content must never enter the
-        # bot-global memory namespace. The adapter owns that judgement per platform.
-        if not turn.memory_writes_allowed:
-            return
-        text = turn.text.strip()
-        if not text:
-            return
-        author = normalize_username(turn.author.handle)
+    async def _recall_memory_context(self, turn: AgentTurn) -> str | None:
+        """Best-effort pre-turn recall; restricted interactions never touch Hindsight."""
+        if self._memory is None or not self._config.memory_enabled or not turn.memory_access_allowed:
+            return None
         try:
-            await self._memory.add_note(
-                text=text,
-                author=author,
-                author_user_id=turn.author.user_id,
-                note_id=turn.source_id,
-                source=turn.source,
-            )
+            return await self._memory.recall_for_turn(turn)
         except Exception:
-            logfire.exception("Note memory ingestion failed (reply unaffected)", author=author)
+            logfire.exception("Hindsight recall failed (reply unaffected)", source_id=turn.source_id)
+            return None
+
+    async def _retain_memory_exchange(self, turn: AgentTurn, reply: str) -> None:
+        """Best-effort post-turn retention; a memory failure never costs the reply."""
+        if self._memory is None or not self._config.memory_enabled or not turn.memory_access_allowed:
+            return
+        try:
+            await self._memory.retain_turn(turn, reply)
+        except Exception:
+            logfire.exception("Hindsight retention failed (reply unaffected)", source_id=turn.source_id)
 
     async def get_score(self, handle: str) -> int | None:
         """Fetch a handle's social credit score (None if unset/no Redis)."""

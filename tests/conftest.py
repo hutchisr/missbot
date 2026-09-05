@@ -1,7 +1,7 @@
 """Shared fixtures for the test suite."""
 
 from __future__ import annotations
-
+from datetime import datetime
 from typing import Any
 
 import pytest
@@ -71,6 +71,7 @@ def make_note(make_user):
         id: str = "note-1",
         text: str | None = "hello",
         user: User | None = None,
+        created_at: datetime | None = None,
         files: list[MiFile] | None = None,
         reply_id: str | None = None,
         mentions: list[str] | None = None,
@@ -81,6 +82,7 @@ def make_note(make_user):
             text=text,
             userId=u.id,
             user=u,
+            createdAt=created_at,
             replyId=reply_id,
             mentions=mentions,
             files=files,
@@ -104,9 +106,11 @@ def make_turn():
         images: list[ImageUrl] | None = None,
         history: list[HistoryTurn] | None = None,
         char_budget: int | None = None,
-        source_id: str | None = "note-1",
+        source_id: str = "note-1",
+        conversation_id: str = "misskey:note-1",
+        occurred_at: datetime | None = None,
         source: str = "unknown",
-        memory_writes_allowed: bool = True,
+        memory_access_allowed: bool = True,
         previous_reply: str | None = None,
     ) -> AgentTurn:
         return AgentTurn(
@@ -118,12 +122,14 @@ def make_turn():
                 privileged=privileged,
                 location=location,
             ),
+            source_id=source_id,
+            conversation_id=conversation_id,
+            occurred_at=occurred_at,
+            source=source,
             images=images or [],
             history=history or [],
             char_budget=char_budget,
-            source_id=source_id,
-            source=source,
-            memory_writes_allowed=memory_writes_allowed,
+            memory_access_allowed=memory_access_allowed,
             previous_reply=previous_reply,
         )
 

@@ -142,28 +142,28 @@ searxng_password: "yourpassword"
 # image_gen_mark_sensitive: false   # true uploads with isSensitive so Misskey blurs it
 
 # Optional: ACP frontend (`python -m bot.acp`). Ignored by the Misskey entry point.
-# ACP carries no per-sender identity field, so attribution is parsed out of the
-# harness's message header — only the region before the first "Content:" line is
-# trusted, and only the pubkey is used (never the display name). Parsing failures
-# fall back to acp_default_identity rather than writing unattributed.
-# acp_default_identity: acp     # namespaced as acp:<value>; never collides with a handle
-# acp_parse_sender_header: true # false => every ACP caller shares acp_default_identity
+# ACP carries no authenticated sender field. Header parsing is disabled by default:
+# an arbitrary ACP client can fabricate a complete pre-Content header. Enable it
+# only when the process/transport admits a trusted harness such as your own buzz-acp
+# deployment; structural parsing alone does not verify signatures or identities.
+# acp_default_identity: acp      # namespaced as acp:<value>; never collides with a handle
+# acp_parse_sender_header: false # true only for an operator-trusted ACP harness
 # acp_max_history_turns: 20     # per-session history bound (sessions are long-lived)
 # acp_max_sessions: 8           # concurrent session cap
 
-# Optional: persistent long-term memory via a Hindsight API service. Off by default.
-# Adds add_memory / search_memory and can learn from public user messages.
+# Optional: automatic conversational memory via Hindsight. Off by default.
+# Before each allowed turn, relevant memories are injected as guarded model context.
+# After the reply, the structured exchange is appended asynchronously. Private/restricted
+# turns do neither, and memory is not exposed as model-controlled tools.
 # memory_enabled: false
 # hindsight_base_url: "http://localhost:8888"
 # hindsight_api_key_env: HINDSIGHT_API_KEY  # optional; explicit hindsight_api_key takes precedence
 # hindsight_bank_id: missbot                # defaults to normalized bot_username
 # hindsight_retain_mission: null            # optional extraction policy override
+# hindsight_observations_mission: null       # optional observation-consolidation policy
 # hindsight_recall_budget: mid              # low, mid, or high
 # hindsight_recall_max_tokens: 4096
-# memory_search_limit: 5
-# memory_ingest_notes: true
-# memory_trusted_user_ids: []                # stable Misskey ids or namespaced ACP identities
-# max_fact_length: 500                       # longer explicit memories are rejected
+# hindsight_recall_query_max_chars: 800
 
 # The bot's reply is the model's plain text output. Mentions are added
 # automatically by code, so the prompt must NOT emit @handles itself.

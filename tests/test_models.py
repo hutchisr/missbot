@@ -203,6 +203,11 @@ def test_custom_openai_model_remains_compatibility_alias():
     assert CustomOpenAIModel is ModelSpec
 
 
+def test_acp_text_header_attribution_requires_explicit_trust(make_config):
+    assert make_config().acp_parse_sender_header is False
+    assert make_config(acp_parse_sender_header=True).acp_parse_sender_header is True
+
+
 def test_memory_disabled_by_default(make_config):
     cfg = make_config()
     assert cfg.memory_enabled is False
@@ -211,11 +216,10 @@ def test_memory_disabled_by_default(make_config):
     assert cfg.hindsight_api_key_env == "HINDSIGHT_API_KEY"
     assert cfg.hindsight_bank_id is None
     assert cfg.hindsight_retain_mission is None
+    assert cfg.hindsight_observations_mission is None
     assert cfg.hindsight_recall_budget == "mid"
     assert cfg.hindsight_recall_max_tokens == 4096
-    assert cfg.memory_search_limit == 5
-    assert cfg.memory_ingest_notes is True
-    assert cfg.memory_trusted_user_ids == []
+    assert cfg.hindsight_recall_query_max_chars == 800
 
 
 def test_memory_enabled_uses_default_hindsight_connection(make_config):
@@ -232,19 +236,23 @@ def test_hindsight_bank_id_must_not_be_blank(make_config):
     assert "hindsight_bank_id" in str(exc.value)
 
 
-def test_hindsight_recall_settings_are_configurable(make_config):
+def test_hindsight_lifecycle_settings_are_configurable(make_config):
     cfg = make_config(
         memory_enabled=True,
         hindsight_base_url="https://memory.example.test",
         hindsight_bank_id="shared-bank",
+        hindsight_observations_mission="Track recurring project context.",
         hindsight_recall_budget="high",
         hindsight_recall_max_tokens=2048,
+        hindsight_recall_query_max_chars=400,
     )
 
     assert str(cfg.hindsight_base_url) == "https://memory.example.test/"
     assert cfg.hindsight_bank_id == "shared-bank"
+    assert cfg.hindsight_observations_mission == "Track recurring project context."
     assert cfg.hindsight_recall_budget == "high"
     assert cfg.hindsight_recall_max_tokens == 2048
+    assert cfg.hindsight_recall_query_max_chars == 400
 
 
 def test_score_categories_default(make_config):

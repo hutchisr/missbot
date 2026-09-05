@@ -53,13 +53,8 @@ mise run deploy     # Apply K8s manifests and restart
 kubectl -n hindsight logs deployment/hindsight-api --tail=50
 curl -s https://hindsight-api.taile6e57.ts.net/health
 
-# ACP endpoint (k8s/acp.yaml: Deployment + Service + Tailscale Ingress)
-kubectl -n misskey logs deployment/missbot-acp --tail=50
-curl -s https://missbot-acp.taile6e57.ts.net/healthz            # unauthenticated probe
-curl -s https://missbot-acp.taile6e57.ts.net/acp | jq           # transport metadata
-# The WebSocket requires ACP_TOKEN (in k8s/secrets.txt, gitignored). Consumers connect via:
-#   acpremote mirror wss://missbot-acp.taile6e57.ts.net/acp/ws --bearer-token "$ACP_TOKEN"
-# Private to the tailnet by design — the agent writes memories and moves social credit.
+# ACP remains available through `python -m bot.acp`, but is intentionally not
+# included in the Kubernetes deployment.
 ```
 
 **Important:** Always use `uv run` or `.venv/bin/python` — never bare `python`.
@@ -93,9 +88,9 @@ bootstrap it once by pushing the merged `master` to `origin`.
 | File | Purpose |
 |------|---------|
 | `bot/core.py` | Frontend-neutral turn types: `AgentTurn`, `HistoryTurn`, `TurnAuthor`, `AutoPost`, `Poll`. The contract every frontend adapter builds or consumes. No platform imports |
-| `bot/bot.py` | **Misskey adapter** — WebSocket client, mention handling, context building, reply sending. Owns all Misskey-specific translation: `_note_to_turn()`, `_user_handle()`, `_image_urls_for()` (with SSRF guard), visibility→memory rules, and the note-length budget |
+| `bot/bot.py` | **Misskey adapter** — WebSocket client, mention handling, context building, reply sending. Owns all Misskey-specific translation: `_note_to_turn()`, `_user_handle()`, `_image_urls_for()` (with SSRF guard), visibility→memory-access rules, event/thread provenance, and the note-length budget |
 | `bot/acp/agent.py` | **ACP adapter** — `MissbotAgent(acp.Agent)`: `initialize` / `new_session` / `prompt` / `cancel` / `close_session` over stdio |
-| `bot/acp/identity.py` | `parse_sender()` — derives a caller identity from an ACP harness's message header, trusting only the region before the first `Content:` line and only the pubkey (never the display name) |
+| `bot/acp/identity.py` | Structurally parses optional sender pubkey plus event id/time before the first `Content:` line. It does not authenticate prompt text; attribution is disabled by default and requires an operator-trusted harness |
 | `bot/acp/session.py` | `AcpSession` + `SessionRegistry` — bounded per-session history and the in-flight task handle `session/cancel` interrupts |
 | `bot/acp/ws.py` | WebSocket transport wire-compatible with `acpremote mirror`: frame↔stream bridge, bearer auth, metadata/health routes. No acpremote dependency |
 | `bot/acp/__main__.py` | `python -m bot.acp {stdio,serve}` entry points. Routes **all** logging to stderr — stdout is the JSON-RPC channel |
@@ -103,7 +98,7 @@ bootstrap it once by pushing the merged `master` to `origin`.
 | `bot/models.py` | Pydantic models: `Config`, `Note`, `User`, `MiFile`, WS message types |
 | `bot/tools.py` | `build_tools()` factory — datetime, sandboxed pydantic-monty Python, web search, search_users/notes, social credit tools; `apply_social_credit()` helper |
 | `bot/scoring.py` | Injection-resistant message classifier: `build_scoring_spec()` turns `Config.social_credit_categories` into the constrained output type + delta map + hardened instructions; `build_scoring_prompt()` fences untrusted input |
-| `bot/memory.py` | Thin async adapter around the official `hindsight-client`; creates the shared bank, retains provenance-bearing public messages and explicit memories, and recalls raw world/experience facts |
+| `bot/memory.py` | Hindsight-native lifecycle: shared observation-enabled bank, automatic fenced recall before allowed turns, and append-only structured exchange retention afterward |
 | `bot/net.py` | `is_safe_media_url()` — SSRF guard for attacker-supplied image URLs (blocks private/reserved IPs and internal hosts); `fetch_image()` — bounded, guarded download used by `vision_image_mode: fetch` |
 | `bot/imagegen.py` | `ImageGenerator` + `GeneratedImage` — OpenAI-compatible `/images/generations` client for auto-post images. Validates by magic bytes (PNG/JPEG/GIF/WebP, SVG refused), caps the response body and decoded size, and uses a dedicated client so the Misskey token never reaches the provider |
 | `bot/mcp.py` | `build_mcp_toolsets()` + `gate_names()` — streamable-HTTP MCP servers with allow/block and gate filtering |
@@ -155,7 +150,7 @@ Optional fields:
 - `redis_url`, `redis_password`, `redis_db`: Redis for social credit system
 - `social_credit_auto_score` (default `true`): score every author's message via an isolated, tool-less classifier whose category is mapped to a fixed delta (−10…+10) in code — users can't dictate their own score (privileged users are scored too; the flag only gates the manual adjust tool)
 - `social_credit_score_cooldown` (default `10`): min seconds between automatic score changes per user (bounds farming)
-- `social_credit_ignore_threshold` (default unset/`None`): when set (and Redis configured), `Bot.on_mention` drops any author whose score is below it — the note never reaches the LLM, no reply is sent, and the author isn't scored or ingested. Authors with no score yet (`None`) are never ignored; checked via `ChatAgent.get_author_score`
+- `social_credit_ignore_threshold` (default unset/`None`): when set (and Redis configured), `Bot.on_mention` drops any author whose score is below it — the note never reaches the LLM, no reply is sent, and the author isn't scored or given memory access. Authors with no score yet (`None`) are never ignored; checked via `ChatAgent.get_author_score`
 - `score_models`: model chain for the classifier (same forms as `llm_models`); defaults to `llm_models`. Use a cheaper/smaller model — classification is a simple labeling task
 - `social_credit_categories`: list of sentiment buckets the classifier may assign, each `{name, delta, description}`. The model only picks a `name` (constrained output); code applies the matching `delta`, so configurability never lets the model choose the number. Defaults to the built-in toxic(−10)/rude(−5)/neutral(0)/good(+5)/exceptional(+10) set. Names must be unique (case-insensitive); `description` is shown to the classifier
 - `social_credit_unrestricted_user_ids`: list of user ids; when the note's author is one of these, the bot may manually adjust any user's score by any amount via `adjust_social_credit` (which is refused for everyone else)
@@ -185,38 +180,38 @@ Buzz Relay ──WS──→ buzz-acp ──stdio──→ acpremote mirror ─�
 `serve` builds **one** `ChatAgent`, `SessionRegistry`, and prompt semaphore shared by every connection, plus one `MissbotAgent` adapter *per connection* because the adapter holds the client handle used for `session/update`. The shared `acp_max_sessions` budget caps connections, sessions, and in-flight provider work across all adapters; one session cannot overlap prompts.
 
 Config fields:
-- `acp_default_identity` (default `acp`): identity used when no sender header parses. Namespaced `acp:<value>` so it can never collide with a fediverse handle
-- `acp_parse_sender_header` (default `true`): derive per-caller identity from the harness's `From:` header. Set false to key every ACP caller on `acp_default_identity`
+- `acp_default_identity` (default `acp`): identity used unless trusted textual sender-header parsing is explicitly enabled and succeeds. Namespaced `acp:<value>` so it can never collide with a fediverse handle
+- `acp_parse_sender_header` (default `false`): opt into per-caller attribution from a trusted harness's textual `From:` header. ACP does not authenticate this text, so an arbitrary client can fabricate the full header; enable only when the process/transport admits an operator-trusted harness
 - `acp_max_history_turns` (default `20`): conversation turns retained per session; ACP sessions are long-lived, so history is bounded
 - `acp_max_sessions` (default `8`): shared cap for WebSocket connections, sessions, and concurrent prompts, the ACP analogue of `max_concurrent_handlers`
 - `acp_max_prompt_chars` (default `65536`): maximum aggregate text accepted in one prompt before scoring, model, or memory work
 
-**Identity and its limits.** ACP carries no per-sender field, so attribution comes out of the prompt text. `parse_sender()` reads **only the region before the first `Content:` line** — user text lands in `Content:` and after, so a message body structurally cannot reach the parsed region — and keys on the **pubkey**, never the user-settable display name. Failure falls back to `acp_default_identity`, never to an unattributed write. Two limits are real and not papered over: a *batched* prompt concatenates several event blocks, so only the first block's header is structurally safe; and the header format is buzz-acp's internal detail that may change. `acp_parse_sender_header: false` is the kill switch.
+**Identity and event-provenance limits.** ACP carries no authenticated structured sender or event field. Text-header attribution is therefore disabled by default: any ACP client can fabricate a complete `From:` / `Event ID:` block before `Content:` and impersonate another pubkey. When an operator explicitly trusts the only admitted client/harness and enables `acp_parse_sender_header`, the parsers use only the first structurally delimited block, accept only a pubkey identity and 64-hex event id, and never use the display name as a key. The `Content:` boundary prevents body-level header injection but is not signature verification. Disabled, missing, or malformed attribution falls back to `acp_default_identity` plus a random per-prompt source id. Batched prompts still attribute only the first block, and the format is a buzz-acp implementation detail.
 
-**Differences from the Misskey path.** Replies have no character budget (`char_budget=None` — the note limit is Misskey's, not a universal one), while inbound prompts have the independent `acp_max_prompt_chars` safety limit. ACP exposes no `fs/*` or `terminal/*` client capabilities (missbot is conversational, not a coding agent), no `session/load` (history is in-process and does not survive restart), and no auth methods (over stdio the trust boundary is *who spawned the process*). Client-supplied `cwd` and `mcpServers` on `session/new` are ignored — missbot brings its own toolset from config. Social credit scoring, the ignore threshold, memory ingestion, and `NO_REPLY` all behave exactly as on the Misskey path.
+**Differences from the Misskey path.** Replies have no character budget (`char_budget=None` — the note limit is Misskey's, not a universal one), while inbound prompts have the independent `acp_max_prompt_chars` safety limit. ACP exposes no `fs/*` or `terminal/*` client capabilities (missbot is conversational, not a coding agent), no `session/load` (history is in-process and does not survive restart), and no auth methods (over stdio the trust boundary is *who spawned the process*). Client-supplied `cwd` and `mcpServers` on `session/new` are ignored — missbot brings its own toolset from config. Social credit scoring, the ignore threshold, automatic memory recall/retention, and `NO_REPLY` all behave exactly as on the Misskey path.
 
 **Unsupported methods are declined explicitly.** `acp.Agent` is a `Protocol`, so any method `MissbotAgent` doesn't override is still *inherited* as a stub with an `...` body — and the SDK's router resolves handlers with `getattr`, so those stubs get routed and return `None`, which the connection reports to the client as a **success**. `bot/acp/agent.py` therefore implements `load_session`, `list_sessions`, `set_session_mode`, `set_config_option`, `fork_session`, `resume_session`, and `ext_method` as explicit `method_not_found` (-32601) refusals; `ext_notification` logs and drops, since a notification has no response channel to refuse through. Adding a method to the ACP surface means *replacing* one of these, not adding alongside it.
 
 **stdout is the protocol channel.** `bot/acp/__main__.py` points logfire's console exporter and `logging` at stderr. Anything printed to stdout corrupts the JSON-RPC stream and breaks the connection.
 
 ### Long-term memory
-Memory is delegated to Hindsight through the official async `hindsight-client` API. `bot/memory.py:MemoryStore` creates one shared bank and uses Hindsight for extraction, deduplication, vector/graph storage, temporal retrieval, and reranking. Missbot does not access Hindsight's Postgres store directly and has no memory maintenance job. Off unless `memory_enabled: true`.
+Memory is delegated to Hindsight through the official async `hindsight-client` API. `bot/memory.py:MemoryStore` owns an automatic conversational lifecycle over one shared bank: recall before an allowed model turn, inject fenced background context, then append the completed exchange after generation. Hindsight owns extraction, deduplication, vector/keyword/graph/temporal retrieval, and observation consolidation. Missbot does not access Hindsight's Postgres store directly and has no memory maintenance job. Off unless `memory_enabled: true`.
 
 Config fields:
 - `hindsight_base_url` (default `http://localhost:8888`): Hindsight API base URL
 - `hindsight_api_key` / `hindsight_api_key_env` (default env `HINDSIGHT_API_KEY`): optional bearer credential; explicit key wins
 - `hindsight_bank_id` (default unset): shared bank id; unset normalizes `bot_username`, ensuring Misskey and ACP use the same bank
-- `hindsight_retain_mission` (default unset): optional extraction-policy override; unset uses Missbot's durable-fact and prompt-injection-resistant mission
-- `hindsight_recall_budget` (default `mid`): Hindsight recall breadth/cost, one of `low`, `mid`, or `high`
-- `hindsight_recall_max_tokens` (default `4096`): maximum recall payload
-- `memory_search_limit` (default `5`): maximum recalled facts exposed to the model
-- `memory_ingest_notes` (default `true`): auto-retain each public incoming message
-- `memory_trusted_user_ids` (default `[]`): stable platform ids whose inferred facts are exempt from the HEARSAY label. Misskey uses its user id; ACP uses its namespaced `acp:<pubkey>` identity. Handles/display names never confer trust
-- `max_fact_length` (default `500`): maximum explicit `add_memory` submission
+- `hindsight_retain_mission` (default unset): optional extraction-policy override; unset uses Missbot's durable-fact, provenance, and prompt-injection-resistant mission
+- `hindsight_observations_mission` (default unset): optional observation-consolidation mission; unset uses Missbot's public-conversation, per-author, uncertainty-preserving mission
+- `hindsight_recall_budget` (default `mid`): automatic recall breadth/cost, one of `low`, `mid`, or `high`
+- `hindsight_recall_max_tokens` (default `4096`): maximum automatic recall payload and supporting-fact budget
+- `hindsight_recall_query_max_chars` (default `800`): maximum author/message characters sent as the recall query
 
-**Write path.** `ChatAgent.run` runs reply generation, social scoring, and memory ingestion concurrently. `_maybe_ingest_note` sends only the latest public author message to Hindsight with string metadata `{source, author, author_user_id, source_note_id}` and a deterministic source-prefixed document id. Restricted/private messages are never retained. `add_memory` uses source `add_memory`, the bot username as author, and a content-derived document id. Retains are synchronous at the Hindsight operation boundary (`retain_async=false`) so tool success means extraction completed. Memory failures are logged and isolated from replies.
+**Turn identity.** Every `AgentTurn` carries a provenance `source_id`, a conversation grouping, and an optional event timestamp. Misskey uses the note id and `createdAt`; every fetched ancestor—including textless notes—is retained for root detection, while only content-bearing ancestors enter model history. When the fetched chain reaches its root, that root is the conversation id; a truncated/failed chain fails closed to the current note id instead of inventing a shifting root. ACP uses its session id as the conversation id and defaults to random per-prompt provenance under `acp_default_identity`. Only an explicitly enabled, operator-trusted harness may supply the structurally parsed pubkey/event/time; parsing does not authenticate it. Restricted/private turns set `memory_access_allowed=false`; neither recall nor retention may touch the shared bank.
 
-**Read path.** `search_memory` recalls raw `world` and `experience` facts rather than synthesized observations so per-fact provenance remains available. Results are bounded by the configured token budget and result limit, rendered with type/score/source/author/recency when present, and fenced as untrusted data before reaching the model. Every record is HEARSAY unless it is provably an explicit `add_memory` write or its stored `author_user_id` is currently trusted; missing or legacy metadata fails closed. Trusted records remain fenced because epistemic trust is never permission to follow recalled instructions.
+**Read path.** Before generation, `ChatAgent.run` automatically recalls `world`, `experience`, and `observation` records. `prefer_observations=true` lets consolidated observations supersede their raw inputs while recent unconsolidated facts remain available. Supporting source facts are explicitly requested and mapped by id for observation provenance. The result is injected as invisible model context behind a nonce fence: raw facts are always **HEARSAY**, observations are **HEARSAY SYNTHESIS**, and supporting facts are **HEARSAY EVIDENCE**. Every entry remains untrusted for instruction-following, including observations with missing/truncated evidence. Missbot deliberately uses recall rather than `reflect` on the hot path: reflect returns another model-generated answer without equivalent per-fact provenance, while `ChatAgent` already performs the final disposition-aware response synthesis.
+
+**Write path.** After a successful model turn, Missbot appends one structured JSON user/assistant exchange to the conversation document. The retain request includes timestamps, source/author/conversation metadata and tags, a per-author observation scope, `update_mode=append`, and `retain_async=true`. A UUID5 operation id derived from a stable source event makes retries of that event idempotent; best-effort ACP fallback ids cannot promise cross-request deduplication. Failed/cancelled model turns are not retained and cancel their concurrent scoring task. `NO_REPLY` retains the user event without storing the sentinel as an assistant response. Recall and retention failures are logged and isolated from replies.
 
 ### MCP servers
 Each entry in `mcp_servers` takes:
@@ -235,13 +230,13 @@ Gating is progressive disclosure driven by the model itself: each unique `gate` 
 ## Key Patterns
 
 ### Agent setup (`bot/ai.py`)
-- `AgentDeps` is a **dataclass** (not BaseModel) with `username`, `source_note_id`, `social_credit_score`, `adjusted_credit_users`, `social_credit_unrestricted`, `enabled_gates`, and `memory_writes_allowed`
+- `AgentDeps` is a **dataclass** (not BaseModel) with `username`, `social_credit_score`, `adjusted_credit_users`, `social_credit_unrestricted`, `enabled_gates`, `previous_bot_reply`, and `char_budget`
 - `adjust_social_credit` is privileged-only: it works only when `deps.social_credit_unrestricted` is set (`ChatAgent.run` sets it when the note's author id is in `social_credit_unrestricted_user_ids`); for everyone else it refuses
 - Every author's score moves via `ChatAgent._maybe_score_message` (privileged users included): a separate tool-less classifier (`bot/scoring.py`, model from `score_models` or the reply model) runs concurrently with the reply, returns one of the configured `social_credit_categories` (default toxic/rude/neutral/good/exceptional) that's mapped to its fixed delta in code, applied through `apply_social_credit` and rate-limited by a Redis `score_cooldown:<user>` key. `ChatAgent.__init__` builds a `ScoringSpec` (constrained output type + delta map + instructions) from the configured categories via `build_scoring_spec`, then wraps its Literal output in Pydantic AI `PromptedOutput`. This retains validation/retries without forcing `tool_choice=required`, which NanoGPT's DeepSeek route rejects with HTTP 503. This is the prompt-injection mitigation — the model only picks a category name, never the number
 - Agent uses `output_type=str` (plain string output, not structured)
 - Tools are built via `build_tools()` in `bot/tools.py` and passed to `Agent(..., tools=tools)`. Reply and auto agents also receive Pydantic AI Harness `CodeMode`; every eligible regular tool is callable under its normal name only inside `run_code`. A shared instruction tells models to make the `run_code` call instead of merely narrating their intent. Framework control and other code-execution tools cannot be nested by CodeMode and remain native. The social-scoring classifier remains tool-less
-- When `memory_enabled`, the bot creates one shared `MemoryStore` backed by the official Hindsight client; `build_tools()` receives it to expose `add_memory` and `search_memory`
-- `ChatAgent.run` runs three coroutines concurrently via `asyncio.gather`: the reply, `_maybe_score_message`, and `_maybe_ingest_note` (Hindsight retention when `memory_ingest_notes`). Like scoring, note ingestion swallows its own errors, so it never affects the reply
+- When `memory_enabled`, the bot creates one shared `MemoryStore` backed by the official Hindsight client. Memory is automatic, not exposed as model-controlled tools
+- `ChatAgent.run` recalls allowed Hindsight context before generation, runs social scoring alongside the model, and submits the completed exchange for asynchronous retention afterward. Memory failures never affect the reply
 - `FallbackModel` wraps multiple `llm_models` for automatic failover. Provider HTTP/API errors, transport timeouts, malformed success payloads (`UnexpectedModelBehavior`), and complete responses containing only empty text or thinking advance immediately to the next configured model. The response-level guard runs inside `FallbackModel`, before Pydantic AI can spend the agent's output-retry budget on the same actionless model. This is required for OpenAI-compatible local servers such as OMLX that may return an error-shaped JSON body with HTTP 200 and for reasoning models that stop after describing the tool call they intended to make
 - Social credit score is injected via a dynamic system prompt function
 
@@ -277,7 +272,6 @@ Eligible regular tools are exposed only through `run_code` as sandboxed async Py
 - `search_web` (async) — when `searxng_url` configured. Returns domain-prefixed snippets
 - `search_users`, `search_notes` — Misskey search APIs
 - Social credit tools (when Redis configured): `get_social_credit`, `adjust_social_credit` (privileged authors only), `get_social_credit_history`, `get_social_credit_leaderboard`. All users (privileged included) are also scored automatically by the `bot/scoring.py` classifier, separate from any tool call
-- Long-term memory tools (when `memory_enabled`): `add_memory` retains explicit durable text through Hindsight, except in private interactions, and `search_memory` recalls provenance-bearing facts fenced as untrusted data. Public user messages are retained automatically when `memory_ingest_notes=true`; private/specified messages are not. Not given to the auto-agent
 - `enable_<gate>` — one per unique `gate` value in `mcp_servers`; model calls it to unlock gated MCP tools
 - MCP tools — from each configured `mcp_servers` entry, name-prefixed per `tool_prefix`
 - `generate_image` — **auto posts only** (when `image_gen_enabled`). The model writes the image prompt and its alt text; one image per post, over-length prompt/alt refused, failure degrades to a text-only post

@@ -99,6 +99,19 @@ async def _fetch_inline(images: list[ImageUrl], *, timeout: float, max_bytes: in
     return inline
 
 
+def _conversation_id_for(note: Note, context: list[Note]) -> str:
+    """Return a stable visible Misskey thread root, excluding an appended renote.
+
+    ``max_context`` can truncate a deep chain and a parent fetch can fail. In either
+    case the oldest visible ancestor still has ``replyId`` set, so fail closed to this
+    event's id instead of assigning an unstable pseudo-root that shifts on every reply.
+    """
+    renote_id = note.renote.id if note.renote is not None else note.renoteId
+    reply_context = [candidate for candidate in context if candidate.id != renote_id]
+    root_id = reply_context[-1].id if reply_context and reply_context[-1].replyId is None else note.id
+    return f"misskey:{root_id}"
+
+
 class Bot:
     def __init__(
         self,
@@ -150,7 +163,7 @@ class Bot:
             logfire.info("Skipping note without text or supported images", note_id=note.id)
             return
         # Ignore authors below the configured social credit floor entirely: the note never
-        # reaches the LLM, no reply is sent, and the author isn't scored or ingested.
+        # reaches the LLM, no reply is sent, and the author isn't scored or given memory access.
         threshold = self._config.social_credit_ignore_threshold
         if threshold is not None:
             score = await self._agent.get_score(_user_handle(note.user))
@@ -172,8 +185,9 @@ class Bot:
                 except httpx.HTTPError:
                     logfire.exception("Error fetching context")
                     break
-                if reply.text or reply.files:
-                    context.append(reply)
+                # Keep every fetched ancestor for stable thread identity. Empty notes
+                # are filtered only while rendering model history below.
+                context.append(reply)
                 if reply.replyId:
                     reply_id = reply.replyId
                 else:
@@ -205,9 +219,9 @@ class Bot:
         """Translate a Misskey note and its reply chain into a frontend-neutral turn.
 
         Everything Misskey-specific lives here: handle formatting, attachment
-        extraction, the visibility rules that gate memory writes, privileged-author
-        lookup by user id, and the note-length budget. ``context`` is nearest-parent
-        first; ``AgentTurn.history`` is oldest-first.
+        extraction, visibility rules that gate all memory access, stable event/thread
+        identity, privileged-author lookup by user id, and the note-length budget.
+        ``context`` is nearest-parent first; ``AgentTurn.history`` is oldest-first.
         """
         author = TurnAuthor(
             handle=_user_handle(note.user),
@@ -220,6 +234,8 @@ class Bot:
 
         history: list[HistoryTurn] = []
         for c in reversed(context):
+            if not c.text and not c.files:
+                continue
             if c.userId == self.user_id:
                 # Strip the leading @mention prefix send_note prepended, so the history
                 # doesn't prime the model to re-open (and copy) its prior reply verbatim.
@@ -243,12 +259,14 @@ class Bot:
         return AgentTurn(
             text=note.text or "",
             author=author,
+            source_id=note.id,
+            conversation_id=_conversation_id_for(note, context),
+            occurred_at=note.createdAt,
+            source="misskey_note",
             images=await self._media_for(note),
             history=history,
             char_budget=max(1, self._config.max_note_length - _MENTION_HEADROOM),
-            source_id=note.id,
-            source="misskey_note",
-            memory_writes_allowed=note.visibility not in _RESTRICTED_MEMORY_VISIBILITIES,
+            memory_access_allowed=note.visibility not in _RESTRICTED_MEMORY_VISIBILITIES,
             previous_reply=previous_reply,
         )
 

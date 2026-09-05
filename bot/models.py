@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Any, Literal, Optional
 
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, WebsocketUrl, field_validator, model_validator
@@ -32,6 +33,7 @@ class Note(BaseModel):
     text: str | None = None
     userId: str
     user: User
+    createdAt: datetime | None = None
     replyId: str | None = None
     renoteId: str | None = None
     reply: Optional["Note"] = None
@@ -342,7 +344,7 @@ class Config(BaseModel):
         default=None,
         description="When set (and Redis is configured), authors whose social credit score is below "
         "this value are ignored entirely: the note is never passed to the LLM and no reply is sent "
-        "(nor are they scored or ingested). Leave unset to never ignore on score.",
+        "(nor are they scored or given memory access). Leave unset to never ignore on score.",
     )
     score_models: list[str | ModelSpec] = Field(
         default_factory=list,
@@ -449,11 +451,12 @@ class Config(BaseModel):
         "Only used by the `python -m bot.acp` frontend.",
     )
     acp_parse_sender_header: bool = Field(
-        default=True,
-        description="Parse the per-sender identity out of an ACP harness's message header "
-        "(buzz-acp emits 'From: <label> (npub: ..., hex: ...)'). Only the header region before the "
-        "first 'Content:' line is trusted, and only the pubkey is used — never the display name. "
-        "Set false to key every ACP caller on acp_default_identity instead.",
+        default=False,
+        description="Trust and parse per-sender identity from an ACP harness's textual message header "
+        "(buzz-acp emits 'From: <label> (npub: ..., hex: ...)'). Disabled by default because ACP does "
+        "not authenticate that text: a client can fabricate the entire pre-Content header. Enable only "
+        "when the process/transport admits a trusted harness, not arbitrary ACP clients. The parser uses "
+        "only the pubkey, never the display name.",
     )
     acp_max_history_turns: int = Field(
         default=20,
@@ -475,8 +478,8 @@ class Config(BaseModel):
     )
     memory_enabled: bool = Field(
         default=False,
-        description="Enable persistent long-term memory via Hindsight. Off by default. Adds the "
-        "add_memory / search_memory tools and can ingest public user messages.",
+        description="Enable Hindsight's automatic memory lifecycle: recall before each public turn, "
+        "then asynchronously retain the completed exchange.",
     )
     hindsight_base_url: AnyHttpUrl = Field(
         default=AnyHttpUrl("http://localhost:8888"),
@@ -501,35 +504,24 @@ class Config(BaseModel):
         description="Optional Hindsight retain mission controlling which durable facts are extracted. "
         "The built-in Missbot durability and prompt-injection policy is used when unset.",
     )
+    hindsight_observations_mission: str | None = Field(
+        default=None,
+        description="Optional mission for consolidating recurring public-conversation patterns into "
+        "Hindsight observations. The built-in Missbot mission is used when unset.",
+    )
     hindsight_recall_budget: Literal["low", "mid", "high"] = Field(
         default="mid",
-        description="Hindsight recall breadth/cost budget used by search_memory.",
+        description="Hindsight breadth/cost budget for automatic pre-turn recall.",
     )
     hindsight_recall_max_tokens: int = Field(
         default=4096,
         gt=0,
-        description="Maximum tokens Hindsight may return to one search_memory call.",
+        description="Maximum tokens Hindsight may return as automatic pre-turn memory context.",
     )
-    memory_search_limit: int = Field(
-        default=5,
+    hindsight_recall_query_max_chars: int = Field(
+        default=800,
         gt=0,
-        description="Maximum number of Hindsight results returned per search_memory call.",
-    )
-    max_fact_length: int = Field(
-        default=500,
-        gt=0,
-        description="Maximum character length accepted by the add_memory tool.",
-    )
-    memory_ingest_notes: bool = Field(
-        default=True,
-        description="When memory is enabled, auto-ingest each public user message through Hindsight. "
-        "Set false to keep explicit add_memory / search_memory while disabling automatic learning.",
-    )
-    memory_trusted_user_ids: list[str] = Field(
-        default_factory=list,
-        description="Stable platform user ids whose auto-ingested memories are not treated as hearsay. "
-        "Misskey uses its user id; ACP uses the namespaced acp:<pubkey> identity. Handles and display names "
-        "never confer trust.",
+        description="Maximum characters from the current author/message sent as the Hindsight recall query.",
     )
     debug: bool | None = None
 

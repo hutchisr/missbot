@@ -9,6 +9,7 @@ belongs in the frontend adapter (`bot/bot.py` for Misskey), never here.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Literal
 
 from pydantic_ai import BinaryContent, ImageUrl
@@ -23,17 +24,17 @@ class TurnAuthor:
     handle: str
     """Normalized identity key — Misskey ``alice@remote.host``, ACP ``acp:<pubkey>``.
 
-    Social credit keys and memory authorship derive from this, so an adapter must
+    Social credit and Hindsight provenance derive from this, so an adapter must
     build it from something the author cannot freely assert. Namespace non-Misskey
     identities (``acp:``) so they can never collide with a fediverse handle.
     """
     display: str | None = None
     """Handle as rendered into the prompt. Falls back to ``handle``."""
     user_id: str | None = None
-    """Stable platform identity used for provenance-based trust decisions.
+    """Stable platform identity recorded as Hindsight provenance.
 
     Misskey supplies its user id; ACP supplies its namespaced pubkey identity.
-    Display names and handles must never be substituted for this value.
+    Display names must never be substituted for this value.
     """
     privileged: bool = False
     """Author may manually adjust anyone's social credit (see `AgentDeps`)."""
@@ -67,21 +68,31 @@ class AgentTurn:
 
     text: str
     author: TurnAuthor
+    source_id: str
+    """Platform event id used for Hindsight provenance and idempotency.
+
+    Stable only when the adapter receives authenticated metadata or the operator
+    explicitly trusts its harness; otherwise use a collision-resistant best-effort id.
+    """
+    conversation_id: str
+    """Stable thread/session grouping used as the Hindsight document id.
+
+    When a frontend cannot prove a stable root, it must fail closed to an
+    event-specific id rather than silently merge unrelated or shifting groups.
+    """
+    occurred_at: datetime | None = None
+    """When the source event occurred, when the frontend exposes it."""
+    source: str = "unknown"
+    """Provenance label retained with the exchange (``misskey_note``, ``acp_prompt``)."""
     images: list[TurnImage] = field(default_factory=list)
     history: list[HistoryTurn] = field(default_factory=list)
     """Prior conversation, **oldest first**."""
     char_budget: int | None = None
     """Hard character cap for the reply, or ``None`` for no cap. Misskey passes its
     note limit less the mention prefix; frontends without a cap pass ``None``."""
-    source_id: str | None = None
-    """Platform id of the source message, recorded as memory provenance."""
-    source: str = "unknown"
-    """Provenance label retained with inferred memories (``misskey_note``,
-    ``acp_prompt``, ...). Every adapter supplies its own label so recalled facts can
-    be attributed and fenced correctly."""
-    memory_writes_allowed: bool = True
-    """False for private/restricted interactions, so their content stays out of the
-    bot-global memory namespace. The adapter owns that judgement."""
+    memory_access_allowed: bool = True
+    """False for private/restricted interactions, so neither recall nor retention can
+    cross the bot-global memory boundary. The adapter owns that judgement."""
     previous_reply: str | None = None
     """The bot's most recent reply in this conversation, for the repeat guard."""
 

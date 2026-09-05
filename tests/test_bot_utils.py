@@ -1,6 +1,7 @@
 """Tests for Bot helper methods that don't need a live WebSocket."""
 
 import asyncio
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -276,6 +277,25 @@ async def test_on_mention_processes_image_only_note(bot, make_note):
     assert image.url == "https://media.example/1.png"
     send_note_mock.assert_awaited_once_with("vision reply", in_reply_to=note)
 
+@pytest.mark.anyio
+async def test_on_mention_preserves_textless_reply_root_for_grouping(bot, make_note):
+    root = make_note(id="root", text=None)
+    parent = make_note(id="parent", text="visible parent", reply_id=root.id)
+    note = make_note(id="latest", text="current", reply_id=parent.id)
+
+    with (
+        patch.object(bot, "get_note", AsyncMock(side_effect=[parent, root])) as get_note_mock,
+        patch.object(bot._agent, "run", AsyncMock(return_value="NO_REPLY")) as run_mock,
+        patch.object(bot, "send_note", AsyncMock()) as send_note_mock,
+    ):
+        await bot.on_mention(note)
+
+    turn = _awaited_turn(run_mock)
+    assert turn.conversation_id == "misskey:root"
+    assert [(past.text, past.author) for past in turn.history] == [("visible parent", "alice")]
+    assert [awaited.args[0] for awaited in get_note_mock.await_args_list] == ["parent", "root"]
+    send_note_mock.assert_not_awaited()
+
 
 @pytest.mark.anyio
 async def test_on_mention_ignores_direct_messages(bot, make_note):
@@ -306,8 +326,8 @@ async def test_on_mention_handles_dm_when_enabled(make_config, make_note):
 
     turn = _awaited_turn(run_mock)
     assert turn.source_id == note.id
-    # Replyable, but its content must stay out of the bot-global memory namespace.
-    assert turn.memory_writes_allowed is False
+    # Replyable, but neither recall nor retention may cross the private boundary.
+    assert turn.memory_access_allowed is False
     send_note_mock.assert_awaited_once_with("dm reply", in_reply_to=note)
 
 
@@ -743,8 +763,13 @@ def test_image_urls_for_drops_ssrf_urls(make_note):
 
 
 @pytest.mark.anyio
-async def test_note_to_turn_maps_author_and_text(bot, make_note, make_user):
-    note = make_note(text="hi", user=make_user(username="alice", host="remote.host", location="Berlin"))
+async def test_note_to_turn_maps_author_event_and_conversation(bot, make_note, make_user):
+    occurred_at = datetime(2026, 9, 5, 14, 0, tzinfo=UTC)
+    note = make_note(
+        text="hi",
+        user=make_user(username="alice", host="remote.host", location="Berlin"),
+        created_at=occurred_at,
+    )
     turn = await bot._note_to_turn(note, [])
 
     assert turn.text == "hi"
@@ -754,6 +779,8 @@ async def test_note_to_turn_maps_author_and_text(bot, make_note, make_user):
     assert turn.author.location == "Berlin"
     assert turn.author.privileged is False
     assert turn.source_id == note.id
+    assert turn.conversation_id == f"misskey:{note.id}"
+    assert turn.occurred_at == occurred_at
 
 
 @pytest.mark.anyio
@@ -778,15 +805,15 @@ async def test_note_to_turn_budgets_below_note_cap(bot, make_note):
 
 @pytest.mark.parametrize("visibility", ["followers", "specified"])
 @pytest.mark.anyio
-async def test_note_to_turn_blocks_memory_writes_for_restricted_notes(bot, make_note, visibility):
+async def test_note_to_turn_blocks_memory_access_for_restricted_notes(bot, make_note, visibility):
     note = make_note(text="secret").model_copy(update={"visibility": visibility})
-    assert (await bot._note_to_turn(note, [])).memory_writes_allowed is False
+    assert (await bot._note_to_turn(note, [])).memory_access_allowed is False
 
 
 @pytest.mark.anyio
-async def test_note_to_turn_allows_memory_writes_for_public_notes(bot, make_note):
+async def test_note_to_turn_allows_memory_access_for_public_notes(bot, make_note):
     note = make_note(text="public thing").model_copy(update={"visibility": "public"})
-    assert (await bot._note_to_turn(note, [])).memory_writes_allowed is True
+    assert (await bot._note_to_turn(note, [])).memory_access_allowed is True
 
 
 @pytest.mark.anyio
@@ -801,6 +828,58 @@ async def test_note_to_turn_orders_history_oldest_first(bot, make_note, make_use
         ("user", "bob", "oldest"),
         ("user", "carol", "middle"),
     ]
+
+
+@pytest.mark.anyio
+async def test_note_to_turn_uses_oldest_reply_as_conversation_root_and_excludes_renote(bot, make_note, make_user):
+    older = make_note(id="root", text="oldest", user=make_user(username="bob"))
+    newer = make_note(id="parent", text="middle", user=make_user(username="carol"), reply_id=older.id)
+    renote = make_note(id="quoted", text="unrelated quote", user=make_user(username="dave"))
+    note = make_note(id="latest", text="reply", reply_id=newer.id).model_copy(
+        update={"renoteId": renote.id, "renote": renote}
+    )
+
+    turn = await bot._note_to_turn(note, [newer, older, renote])
+
+    assert turn.conversation_id == "misskey:root"
+
+
+@pytest.mark.anyio
+async def test_notes_in_one_complete_thread_share_group_but_keep_event_ids(bot, make_note):
+    root = make_note(id="root", text="root")
+    parent = make_note(id="parent", text="parent", reply_id=root.id)
+    first = make_note(id="first", text="first", reply_id=parent.id)
+    second = make_note(id="second", text="second", reply_id=first.id)
+
+    first_turn = await bot._note_to_turn(first, [parent, root])
+    second_turn = await bot._note_to_turn(second, [first, parent, root])
+
+    assert first_turn.conversation_id == second_turn.conversation_id == "misskey:root"
+    assert first_turn.source_id == "first"
+    assert second_turn.source_id == "second"
+
+
+@pytest.mark.anyio
+async def test_truncated_reply_chain_fails_closed_to_event_group(bot, make_note):
+    unseen_root = make_note(id="unseen-root", text="unseen")
+    oldest_visible = make_note(id="oldest-visible", text="old", reply_id=unseen_root.id)
+    parent = make_note(id="parent", text="parent", reply_id=oldest_visible.id)
+    note = make_note(id="latest", text="latest", reply_id=parent.id)
+
+    turn = await bot._note_to_turn(note, [parent, oldest_visible])
+
+    assert turn.conversation_id == "misskey:latest"
+
+
+@pytest.mark.anyio
+async def test_top_level_renote_uses_renote_event_not_quoted_note_as_group(bot, make_note):
+    quoted = make_note(id="quoted", text="quoted")
+    note = make_note(id="renote-event", text="comment").model_copy(update={"renoteId": quoted.id, "renote": quoted})
+
+    turn = await bot._note_to_turn(note, [quoted])
+
+    assert turn.source_id == "renote-event"
+    assert turn.conversation_id == "misskey:renote-event"
 
 
 @pytest.mark.anyio

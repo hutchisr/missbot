@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+from datetime import UTC, datetime
 from typing import Any, NoReturn, Self
+from uuid import uuid4
 
 import acp
 import logfire
@@ -26,7 +28,7 @@ from ..core import AgentTurn, TurnAuthor
 from ..memory import MemoryStore
 from ..models import Config
 from ..provider import PROJECT_VERSION
-from .identity import parse_sender
+from .identity import parse_event_id, parse_event_time, parse_sender
 from .session import SessionRegistry
 
 _AGENT_NAME = "missbot"
@@ -170,9 +172,12 @@ class MissbotAgent(acp.Agent):
                     default_identity=self._config.acp_default_identity,
                     enabled=self._config.acp_parse_sender_header,
                 )
+                event_id = parse_event_id(text) if self._config.acp_parse_sender_header else None
+                event_time = parse_event_time(text) if self._config.acp_parse_sender_header else None
+                source_id = f"acp:event:{event_id}" if event_id else f"acp:prompt:{uuid4()}"
 
                 # Same social credit floor as the Misskey path: a caller below it never
-                # reaches the model, is not scored, and nothing is ingested.
+                # reaches the model, is not scored, and gets no memory access.
                 threshold = self._config.social_credit_ignore_threshold
                 if threshold is not None:
                     score = await self._agent.get_score(identity.key)
@@ -188,15 +193,18 @@ class MissbotAgent(acp.Agent):
 
                 turn = AgentTurn(
                     text=text,
-                    # parse_sender keys on the harness-supplied pubkey and namespaces it
-                    # as acp:<key>, making it stable enough for provenance trust checks.
+                    # Text-header attribution is disabled by default. Enabling it is an
+                    # operator assertion that this ACP client is a trusted harness; the
+                    # parser provides structural separation but no authentication.
                     author=TurnAuthor(handle=identity.key, display=identity.label, user_id=identity.key),
+                    source_id=source_id,
+                    conversation_id=f"acp:{session_id}",
+                    occurred_at=event_time or datetime.now(UTC),
+                    source="acp_prompt",
                     history=list(session.history),
                     # The reply has no Misskey note budget; the input still has a
                     # separate safety limit before provider and memory calls.
                     char_budget=None,
-                    source_id=f"acp:{session_id}",
-                    source="acp_prompt",
                     previous_reply=session.previous_reply(),
                 )
                 reply = await self._agent.run(turn)

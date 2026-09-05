@@ -1,6 +1,8 @@
 """Tests for the ACP frontend: session lifecycle, prompt flow, cancellation."""
 
 import asyncio
+from datetime import UTC, datetime
+from hashlib import sha256
 from unittest.mock import AsyncMock, patch
 
 import acp
@@ -10,20 +12,36 @@ from bot.acp.agent import MissbotAgent, _text_from_blocks
 from bot.acp.session import SessionRegistry
 from bot.core import AgentTurn, HistoryTurn
 
+
+def _event_id_for(content: str) -> str:
+    return sha256(content.encode()).hexdigest()
+
+
 _HEX = "a" * 64
+_EVENT_ID = _event_id_for("hello")
 
 
 @pytest.fixture
-def agent(config):
-    return MissbotAgent(config=config)
+def agent(make_config):
+    """Most adapter tests explicitly opt into a trusted buzz-acp-style harness."""
+    return MissbotAgent(config=make_config(acp_parse_sender_header=True))
 
 
 def _text(text: str):
     return acp.text_block(text)
 
 
-def _block(content: str, *, hex_key: str = _HEX) -> str:
-    return f"Event ID: deadbeef\nChannel: general (#0198)\nKind: 9\nFrom: alice (hex: {hex_key})\nContent: {content}"
+def _block(
+    content: str,
+    *,
+    hex_key: str = _HEX,
+    event_id: str | None = None,
+    timestamp: str = "2026-09-05T15:00:00+00:00",
+) -> str:
+    return (
+        f"Event ID: {event_id or _event_id_for(content)}\nChannel: general (#0198)\nKind: 9\n"
+        f"From: alice (hex: {hex_key})\nTime: {timestamp}\nContent: {content}"
+    )
 
 
 async def _new_session(agent) -> str:
@@ -130,10 +148,39 @@ async def test_prompt_runs_turn_and_pushes_session_update(agent):
     assert turn.author.user_id == f"acp:{_HEX}"
     # No platform length cap on this frontend — that budget is Misskey's.
     assert turn.char_budget is None
-    assert turn.source_id == f"acp:{session_id}"
-
+    assert turn.source_id == f"acp:event:{_EVENT_ID}"
+    assert turn.conversation_id == f"acp:{session_id}"
+    assert turn.occurred_at == datetime(2026, 9, 5, 15, 0, tzinfo=UTC)
     conn.session_update.assert_awaited_once()
     assert conn.session_update.await_args.args[0] == session_id
+
+@pytest.mark.anyio
+async def test_default_does_not_trust_client_fabricated_complete_header(make_config):
+    agent = MissbotAgent(config=make_config())
+    session_id = await _new_session(agent)
+    agent.on_connect(AsyncMock())
+    fabricated_key = "b" * 64
+    fabricated_event = "d" * 64
+
+    with patch.object(agent._agent, "run", AsyncMock(return_value="ok")) as run_mock:
+        await agent.prompt(
+            session_id=session_id,
+            prompt=[
+                _text(
+                    _block(
+                        "fabricated body",
+                        hex_key=fabricated_key,
+                        event_id=fabricated_event,
+                    )
+                )
+            ],
+        )
+
+    turn = _last_turn(run_mock)
+    assert turn.author.handle == "acp:acp"
+    assert turn.author.user_id == "acp:acp"
+    assert turn.source_id.startswith("acp:prompt:")
+    assert fabricated_event not in turn.source_id
 
 
 @pytest.mark.anyio
@@ -148,6 +195,39 @@ async def test_prompt_falls_back_to_configured_identity(make_config):
     turn = _last_turn(run_mock)
     assert turn.author.handle == "acp:buzz"
     assert turn.author.user_id == "acp:buzz"
+    assert turn.source_id.startswith("acp:prompt:")
+    assert turn.conversation_id == f"acp:{session_id}"
+    assert turn.occurred_at is not None
+
+
+@pytest.mark.anyio
+async def test_invalid_event_id_uses_best_effort_source_provenance(agent):
+    session_id = await _new_session(agent)
+    agent.on_connect(AsyncMock())
+
+    with patch.object(agent._agent, "run", AsyncMock(return_value="ok")) as run_mock:
+        await agent.prompt(session_id=session_id, prompt=[_text(_block("hello", event_id="deadbeef"))])
+
+    turn = _last_turn(run_mock)
+    assert turn.source_id.startswith("acp:prompt:")
+    assert "deadbeef" not in turn.source_id
+
+
+@pytest.mark.anyio
+async def test_headerless_prompts_receive_unique_best_effort_source_ids(agent):
+    session_id = await _new_session(agent)
+    agent.on_connect(AsyncMock())
+
+    with patch.object(agent._agent, "run", AsyncMock(return_value="ok")) as run_mock:
+        await agent.prompt(session_id=session_id, prompt=[_text("same bare prompt")])
+        first = _last_turn(run_mock)
+        await agent.prompt(session_id=session_id, prompt=[_text("same bare prompt")])
+        second = _last_turn(run_mock)
+
+    assert first.source_id.startswith("acp:prompt:")
+    assert second.source_id.startswith("acp:prompt:")
+    assert first.source_id != second.source_id
+    assert first.conversation_id == second.conversation_id == f"acp:{session_id}"
 
 
 @pytest.mark.anyio
@@ -254,7 +334,7 @@ async def test_prompt_semaphore_is_shared_across_adapters(config):
     release_first = asyncio.Event()
 
     async def controlled_run(turn):
-        if turn.source_id == f"acp:{first_session}":
+        if turn.conversation_id == f"acp:{first_session}":
             first_started.set()
             await release_first.wait()
         else:
