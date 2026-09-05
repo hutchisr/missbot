@@ -538,10 +538,10 @@ class Config(BaseModel):
         description="Author-scoped observations required before creating a user profile mental model.",
     )
     hindsight_user_profile_max_tokens: int = Field(
-        default=768,
+        default=384,
         ge=256,
         le=8192,
-        description="Maximum generated tokens in each user profile mental model.",
+        description="Maximum generated tokens in each compact user profile mental model.",
     )
     hindsight_user_profile_refresh_cron: str = Field(
         default="0 4 * * *",

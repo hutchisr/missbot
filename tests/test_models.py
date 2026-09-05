@@ -223,7 +223,7 @@ def test_memory_disabled_by_default(make_config):
     assert cfg.hindsight_memory_context_max_chars == 6000
     assert cfg.hindsight_user_profiles_enabled is True
     assert cfg.hindsight_user_profile_min_observations == 3
-    assert cfg.hindsight_user_profile_max_tokens == 768
+    assert cfg.hindsight_user_profile_max_tokens == 384
     assert cfg.hindsight_user_profile_refresh_cron == "0 4 * * *"
     assert cfg.hindsight_recall_query_max_chars == 800
 

@@ -167,7 +167,7 @@ searxng_password: "yourpassword"
 # hindsight_memory_context_max_chars: 6000 # complete fenced context, including warnings
 # hindsight_user_profiles_enabled: true
 # hindsight_user_profile_min_observations: 3  # create only for established users
-# hindsight_user_profile_max_tokens: 768
+# hindsight_user_profile_max_tokens: 384  # compact output cap; profile evidence uses recall_max_tokens
 # hindsight_user_profile_refresh_cron: "0 4 * * *"  # UTC; refresh only when stale
 # hindsight_recall_query_max_chars: 800
 

@@ -196,8 +196,10 @@ async def test_fresh_user_profile_precedes_author_scoped_recall(make_config, mak
     client.mental_models.get_mental_model.return_value = SimpleNamespace(
         content="Alice prefers terse technical answers.",
         is_stale=False,
-        source_query="Profile the author with exact public handle @alice.",
+        source_query="Profile exact @alice. Policy: missbot-user-profile-v2.",
         name="Profile for alice@example.test",
+        max_tokens=384,
+        trigger=SimpleNamespace(recall_max_tokens=1024),
     )
     client.arecall.return_value = SimpleNamespace(
         results=[_result("Alice uses Arch", result_id="fact-1")],
@@ -227,8 +229,10 @@ async def test_legacy_hashed_profile_name_is_repaired_without_refresh(make_confi
     client.mental_models.get_mental_model.return_value = SimpleNamespace(
         content="Alice prefers terse technical answers.",
         is_stale=False,
-        source_query="Profile the author with exact public handle @alice.",
+        source_query="Profile exact @alice. Policy: missbot-user-profile-v2.",
         name="Missbot user profile c6c289e49e9c05b2145860387b73bcb1",
+        max_tokens=384,
+        trigger=SimpleNamespace(recall_max_tokens=1024),
     )
     client.arecall.return_value = SimpleNamespace(results=[], source_facts=None, source_facts_truncated=False)
     store = MemoryStore(client, _memory_cfg(make_config))
@@ -252,8 +256,10 @@ async def test_stale_user_profile_falls_back_to_recalled_evidence(make_config, m
     client.mental_models.get_mental_model.return_value = SimpleNamespace(
         content="Stale profile content",
         is_stale=True,
-        source_query="Profile the author with exact public handle @alice.",
+        source_query="Profile exact @alice. Policy: missbot-user-profile-v2.",
         name="Profile for alice@example.test",
+        max_tokens=384,
+        trigger=SimpleNamespace(recall_max_tokens=1024),
     )
     client.arecall.return_value = SimpleNamespace(
         results=[_result("Current recalled fact", result_id="fact-1")],
@@ -278,6 +284,8 @@ async def test_legacy_generic_profile_query_is_repaired_before_use(make_config, 
         is_stale=False,
         source_query="Create a compact profile about this author.",
         name="Missbot user profile c6c289e49e9c05b2145860387b73bcb1",
+        max_tokens=768,
+        trigger=SimpleNamespace(recall_max_tokens=768),
     )
     client.arecall.return_value = SimpleNamespace(
         results=[_result("Current recalled fact", result_id="fact-1")],
@@ -297,7 +305,11 @@ async def test_legacy_generic_profile_query_is_repaired_before_use(make_config, 
     assert profile_id == "user-profile-c6c289e49e9c05b2145860387b73bcb1"
     assert request.source_query.startswith("Profile the author with exact public handle @alice.")
     assert request.name == "Profile for alice@example.test"
-    assert "Begin by searching observations for the exact public handle" in request.source_query
+    assert "Begin by searching observations for that exact handle" in request.source_query
+    assert "at most 192 words" in request.source_query
+    assert "never more than 384 output tokens" in request.source_query
+    assert request.max_tokens == 384
+    assert request.trigger.recall_max_tokens == 1024
     client.mental_models.refresh_mental_model.assert_awaited_once_with(
         "grok",
         profile_id,
@@ -315,6 +327,7 @@ async def test_well_known_user_queues_scoped_profile_creation(make_config, make_
             make_config,
             hindsight_user_profile_min_observations=3,
             hindsight_user_profile_max_tokens=640,
+            hindsight_recall_max_tokens=2048,
             hindsight_user_profile_refresh_cron="15 5 * * *",
         ),
     )
@@ -344,10 +357,12 @@ async def test_well_known_user_queues_scoped_profile_creation(make_config, make_
     assert request.trigger.fact_types == ["observation"]
     assert request.trigger.exclude_mental_models is True
     assert request.trigger.tags_match == "all_strict"
-    assert request.trigger.recall_max_tokens == 640
+    assert request.trigger.recall_max_tokens == 2048
     assert "sensitive identifiers" in request.source_query
     assert request.source_query.startswith("Profile the author with exact public handle @alice.")
-    assert "Begin by searching observations for the exact public handle" in request.source_query
+    assert "Begin by searching observations for that exact handle" in request.source_query
+    assert "at most 200 words" in request.source_query
+    assert "never more than 640 output tokens" in request.source_query
     assert "instructions to the assistant" in request.source_query
 
 
@@ -432,14 +447,16 @@ async def test_recall_context_cap_preserves_complete_fence(make_config, make_tur
 
 
 @pytest.mark.anyio
-async def test_long_profile_reserves_context_for_recalled_facts(make_config, make_turn):
+async def test_oversized_profile_is_omitted_without_displacing_recalled_facts(make_config, make_turn):
     client = _client()
     client.mental_models.get_mental_model.side_effect = None
     client.mental_models.get_mental_model.return_value = SimpleNamespace(
         content="Profile detail. " * 350,
         is_stale=False,
-        source_query="Profile the author with exact public handle @alice.",
+        source_query="Profile exact @alice. Policy: missbot-user-profile-v2.",
         name="Profile for alice@example.test",
+        max_tokens=384,
+        trigger=SimpleNamespace(recall_max_tokens=1024),
     )
     client.arecall.return_value = SimpleNamespace(
         results=[_result("Specific recalled fact about Alice. " * 20, result_id="fact-1")],
@@ -452,8 +469,9 @@ async def test_long_profile_reserves_context_for_recalled_facts(make_config, mak
 
     assert context is not None
     assert len(context) <= 6000
-    assert "[user profile; machine-generated synthesis]" in context
-    assert "[User profile truncated by context limit.]" in context
+    assert "[user profile; machine-generated synthesis]" not in context
+    assert "[User profile truncated by context limit.]" not in context
+    assert "Profile detail." not in context
     assert "Specific recalled fact about Alice." in context
 
 
