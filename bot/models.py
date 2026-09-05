@@ -514,9 +514,39 @@ class Config(BaseModel):
         description="Hindsight breadth/cost budget for automatic pre-turn recall.",
     )
     hindsight_recall_max_tokens: int = Field(
-        default=4096,
+        default=1024,
         gt=0,
-        description="Maximum tokens Hindsight may return as automatic pre-turn memory context.",
+        description="Maximum tokens Hindsight may return in primary automatic recall results.",
+    )
+    hindsight_recall_source_facts_max_tokens: int = Field(
+        default=256,
+        gt=0,
+        description="Separate token budget for supporting facts returned with recalled observations.",
+    )
+    hindsight_memory_context_max_chars: int = Field(
+        default=6000,
+        ge=512,
+        description="Hard character cap on the complete fenced memory context injected before a model turn.",
+    )
+    hindsight_user_profiles_enabled: bool = Field(
+        default=True,
+        description="Create and use compact per-user Hindsight mental models for established users.",
+    )
+    hindsight_user_profile_min_observations: int = Field(
+        default=3,
+        gt=0,
+        description="Author-scoped observations required before creating a user profile mental model.",
+    )
+    hindsight_user_profile_max_tokens: int = Field(
+        default=768,
+        ge=256,
+        le=8192,
+        description="Maximum generated tokens in each user profile mental model.",
+    )
+    hindsight_user_profile_refresh_cron: str = Field(
+        default="0 4 * * *",
+        min_length=1,
+        description="UTC cron schedule for refreshing stale user profile mental models.",
     )
     hindsight_recall_query_max_chars: int = Field(
         default=800,

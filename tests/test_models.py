@@ -218,7 +218,13 @@ def test_memory_disabled_by_default(make_config):
     assert cfg.hindsight_retain_mission is None
     assert cfg.hindsight_observations_mission is None
     assert cfg.hindsight_recall_budget == "mid"
-    assert cfg.hindsight_recall_max_tokens == 4096
+    assert cfg.hindsight_recall_max_tokens == 1024
+    assert cfg.hindsight_recall_source_facts_max_tokens == 256
+    assert cfg.hindsight_memory_context_max_chars == 6000
+    assert cfg.hindsight_user_profiles_enabled is True
+    assert cfg.hindsight_user_profile_min_observations == 3
+    assert cfg.hindsight_user_profile_max_tokens == 768
+    assert cfg.hindsight_user_profile_refresh_cron == "0 4 * * *"
     assert cfg.hindsight_recall_query_max_chars == 800
 
 
@@ -244,6 +250,12 @@ def test_hindsight_lifecycle_settings_are_configurable(make_config):
         hindsight_observations_mission="Track recurring project context.",
         hindsight_recall_budget="high",
         hindsight_recall_max_tokens=2048,
+        hindsight_recall_source_facts_max_tokens=128,
+        hindsight_memory_context_max_chars=3000,
+        hindsight_user_profiles_enabled=False,
+        hindsight_user_profile_min_observations=5,
+        hindsight_user_profile_max_tokens=512,
+        hindsight_user_profile_refresh_cron="15 5 * * *",
         hindsight_recall_query_max_chars=400,
     )
 
@@ -252,6 +264,12 @@ def test_hindsight_lifecycle_settings_are_configurable(make_config):
     assert cfg.hindsight_observations_mission == "Track recurring project context."
     assert cfg.hindsight_recall_budget == "high"
     assert cfg.hindsight_recall_max_tokens == 2048
+    assert cfg.hindsight_recall_source_facts_max_tokens == 128
+    assert cfg.hindsight_memory_context_max_chars == 3000
+    assert cfg.hindsight_user_profiles_enabled is False
+    assert cfg.hindsight_user_profile_min_observations == 5
+    assert cfg.hindsight_user_profile_max_tokens == 512
+    assert cfg.hindsight_user_profile_refresh_cron == "15 5 * * *"
     assert cfg.hindsight_recall_query_max_chars == 400
 
 

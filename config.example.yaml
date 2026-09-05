@@ -162,7 +162,13 @@ searxng_password: "yourpassword"
 # hindsight_retain_mission: null            # optional extraction policy override
 # hindsight_observations_mission: null       # optional observation-consolidation policy
 # hindsight_recall_budget: mid              # low, mid, or high
-# hindsight_recall_max_tokens: 4096
+# hindsight_recall_max_tokens: 1024        # primary recall results
+# hindsight_recall_source_facts_max_tokens: 256  # supporting evidence for observations
+# hindsight_memory_context_max_chars: 6000 # complete fenced context, including warnings
+# hindsight_user_profiles_enabled: true
+# hindsight_user_profile_min_observations: 3  # create only for established users
+# hindsight_user_profile_max_tokens: 768
+# hindsight_user_profile_refresh_cron: "0 4 * * *"  # UTC; refresh only when stale
 # hindsight_recall_query_max_chars: 800
 
 # The bot's reply is the model's plain text output. Mentions are added

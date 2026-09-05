@@ -14,7 +14,6 @@ from redis.asyncio import Redis
 from .models import Config
 
 
-
 def _domain_of(url: str) -> str | None:
     """Extract a normalized hostname from a URL, for use as a web source name.
 

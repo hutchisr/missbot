@@ -59,9 +59,9 @@ backends is the same bot, not a copy of it.
 - Optional Redis-backed social credit with history and leaderboard tools,
   configurable categories, cooldowns, and an isolated classifier that maps
   constrained labels to code-owned score changes.
-- Optional Hindsight long-term memory with automatic pre-turn recall,
-  post-turn structured retention, observation consolidation, provenance, and
-  one shared public-conversation bank.
+- Optional Hindsight long-term memory with automatic author-scoped pre-turn
+  recall, lazy mental-model profiles for established users, post-turn structured
+  retention, observation consolidation, provenance, and one shared bank.
 
 ### Safeguards and operations
 
