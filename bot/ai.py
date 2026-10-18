@@ -674,6 +674,7 @@ class ChatAgent:
 
         self._agent: Agent[AgentDeps, str] = Agent(
             model,
+            name="reply",
             output_type=str,
             deps_type=AgentDeps,
             instructions=[
@@ -718,6 +719,7 @@ class ChatAgent:
                 auto_instructions.append(_AUTO_IMAGE_INSTRUCTION)
             self._auto_agent = Agent(
                 auto_model,
+                name="autonomous_post",
                 output_type=str,
                 deps_type=AutoDeps,
                 instructions=auto_instructions,
@@ -754,6 +756,7 @@ class ChatAgent:
                 output_type = PromptedOutput(output_type)
             self._score_agent = Agent(  # type: ignore[reportCallIssue, reportAttributeAccessIssue]
                 self._score_model,
+                name="social_credit",
                 output_type=output_type,
                 instructions=[self._score_spec.instructions],
                 retries=2,

@@ -57,3 +57,4 @@ metadata:
   namespace: misskey
 spec:
   type: ExternalName
+  externalName: rachels-mac-mini.taile6e57.ts.net

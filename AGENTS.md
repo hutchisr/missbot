@@ -57,6 +57,8 @@ curl -s https://hindsight-api.taile6e57.ts.net/health
 # included in the Kubernetes deployment.
 ```
 
+Dependency baseline: `hindsight-client>=1.0.0,<2.0.0` permits updates within the Hindsight 1.x client series; runtime and development dependencies are locked in `uv.lock`. Refresh with `uv lock --upgrade` and `uv sync`, then run the verification commands below. The current Google GenAI dependency requires `tenacity<9.2.0` and `websockets<17.0`, so the lock retains 9.1.4 and 16.1.1 respectively rather than overriding upstream compatibility constraints.
+
 **Important:** Always use `uv run` or `.venv/bin/python` — never bare `python`.
 
 ## GitHub Mirror
@@ -238,6 +240,7 @@ Gating is progressive disclosure driven by the model itself: each unique `gate` 
 ## Key Patterns
 
 ### Agent setup (`bot/ai.py`)
+- Explicit Pydantic AI agent names identify components in Logfire spans and `gen_ai.agent.name`: `reply` (shared by Misskey and ACP), `autonomous_post`, and `social_credit`. Names remain stable across model fallback and provider changes.
 - `AgentDeps` is a **dataclass** (not BaseModel) with `username`, `social_credit_score`, `adjusted_credit_users`, `social_credit_unrestricted`, `enabled_gates`, `previous_bot_reply`, and `char_budget`
 - `adjust_social_credit` is privileged-only: it works only when `deps.social_credit_unrestricted` is set (`ChatAgent.run` sets it when the note's author id is in `social_credit_unrestricted_user_ids`); for everyone else it refuses
 - Every author's score moves via `ChatAgent._maybe_score_message` (privileged users included): a separate tool-less classifier (`bot/scoring.py`, model from `score_models` or the reply model) runs concurrently with the reply, returns one of the configured `social_credit_categories` (default toxic/rude/neutral/good/exceptional) that's mapped to its fixed delta in code, applied through `apply_social_credit` and rate-limited by a Redis `score_cooldown:<user>` key. `ChatAgent.__init__` builds a `ScoringSpec` (constrained output type + delta map + instructions) from the configured categories via `build_scoring_spec`. Chat-only chains wrap its Literal output in Pydantic AI `PromptedOutput`, retaining validation/retries without forcing `tool_choice=required`, which NanoGPT's DeepSeek route rejects with HTTP 503. Chains containing a decision model use the Literal directly because decision models reject text output; Pydantic AI translates it into a choice question. The model only picks a category name, never the number.
