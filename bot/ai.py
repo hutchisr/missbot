@@ -20,14 +20,20 @@ from pydantic_ai.messages import (
     ThinkingPart,
     UserPromptPart,
 )
-from pydantic_ai.models import Model, ModelRequestContext, ModelRequestParameters, StreamedResponse
+from pydantic_ai.models import Model, ModelRequestContext, ModelRequestParameters, StreamedResponse, infer_model
 from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.fallback import FallbackModel, FallbackOn
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
+from pydantic_ai.models.openai_decisions import OpenAIDecisionsModel
 from pydantic_ai.models.openrouter import OpenRouterModelSettings
+from pydantic_ai.models.system_one import SystemOneModel
+from pydantic_ai.models.typesafe import TypeSafeModel
 from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.providers.openai_decisions import OpenAIDecisionsProvider
+from pydantic_ai.providers.system_one import SystemOneProvider
+from pydantic_ai.providers.typesafe import TypeSafeProvider
 from pydantic_ai.settings import ModelSettings, merge_model_settings
 from pydantic_ai.usage import RequestUsage
 from pydantic_ai_harness import CodeMode
@@ -189,7 +195,7 @@ def _resolve_model_spec(spec: str | ModelSpec) -> str | Model:
     Strings and ModelSpec entries without an explicit endpoint or API type pass
     through for Pydantic AI to parse as `provider:model`. A base URL alone keeps
     the historical OpenAI Chat Completions behavior; `api_type` can explicitly
-    select Chat Completions, Responses, or Anthropic Messages instead.
+    select a chat, response, or decision API.
     """
     if isinstance(spec, str):
         return spec
@@ -203,6 +209,24 @@ def _resolve_model_spec(spec: str | ModelSpec) -> str | Model:
     base_url = str(spec.base_url) if spec.base_url is not None else None
     api_type = spec.api_type or "openai-chat"
     model_settings = ModelSettings(extra_body=spec.extra_body) if spec.extra_body else None
+    if api_type == "typesafe":
+        return TypeSafeModel(
+            spec.model,
+            provider=TypeSafeProvider(base_url=base_url, api_key=api_key),
+            settings=model_settings,
+        )
+    if api_type == "system-one":
+        return SystemOneModel(
+            spec.model,
+            provider=SystemOneProvider(base_url=base_url, api_key=api_key),
+            settings=model_settings,
+        )
+    if api_type == "openai-decisions":
+        return OpenAIDecisionsModel(
+            spec.model,
+            provider=OpenAIDecisionsProvider(base_url=base_url, api_key=api_key),
+            settings=model_settings,
+        )
     if api_type == "anthropic":
         return AnthropicModel(
             spec.model,
@@ -717,11 +741,20 @@ class ChatAgent:
             # Categories, deltas, and instructions are derived from config here, so the
             # operator owns the buckets while code still owns the numbers.
             self._score_spec = build_scoring_spec(config.social_credit_categories)
-            # PromptedOutput preserves Pydantic validation against the Literal category names
-            # without requiring tool_choice=required, which some OpenAI-compatible routes reject.
+            assert self._score_model is not None
+            score_models = (
+                self._score_model.models
+                if isinstance(self._score_model, FallbackModel)
+                else (infer_model(cast(Any, self._score_model)),)
+            )
+            # Decision models require structured output, not prompted JSON text.
+            # Chat-only chains keep PromptedOutput for providers that reject forced tools.
+            output_type = self._score_spec.output_type
+            if all(m.profile.get("supports_text_output", True) for m in score_models):
+                output_type = PromptedOutput(output_type)
             self._score_agent = Agent(  # type: ignore[reportCallIssue, reportAttributeAccessIssue]
                 self._score_model,
-                output_type=PromptedOutput(self._score_spec.output_type),  # type: ignore[reportArgumentType]
+                output_type=output_type,
                 instructions=[self._score_spec.instructions],
                 retries=2,
             )

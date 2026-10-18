@@ -66,6 +66,26 @@ searxng_password: "yourpassword"
 # than the reply model(s). Same forms as llm_models; defaults to llm_models.
 # score_models:
 #   - "openrouter:meta-llama/llama-3.1-8b-instruct"
+# Or use Jev through OpenRouter's System One API (not chat completions):
+# score_models:
+#   - model: typesafe/jev-1.14
+#     api_type: typesafe
+#     base_url: https://openrouter.ai/api  # SDK appends /v1/systemone
+#     api_key_env: OPENROUTER_API_KEY
+# Generic System One endpoint, e.g. Ollama with a decision model pulled locally:
+# score_models:
+#   - model: nimble
+#     api_type: system-one
+#     base_url: http://localhost:11434  # /v1/systemone; no key needed locally
+#     vision: false
+# OpenAI Decisions (uses OPENAI_API_KEY and the standard OpenAI endpoint):
+# score_models:
+#   - model: gpt-6-luna
+#     api_type: openai-decisions
+#     # base_url: https://decisions.example/v1  # optional compatible endpoint
+#     # api_key_env: DECISIONS_API_KEY
+# Provider strings also work with their provider environment variables:
+# "typesafe:jev-latest", "system-one:nimble", "openai-decisions:gpt-6-luna".
 # Sentiment buckets the classifier may assign. The model only picks a category
 # `name` (constrained output); code applies the matching `delta`, so users can
 # never dictate the number. Defaults to the set below if omitted. Names must be

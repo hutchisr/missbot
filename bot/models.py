@@ -82,7 +82,7 @@ class MiWebsocketMessage(BaseModel):
     body: MiWebsocketMessageBody | None = None
 
 
-ModelAPIType = Literal["openai-chat", "openai-responses", "anthropic"]
+ModelAPIType = Literal["openai-chat", "openai-responses", "anthropic", "typesafe", "system-one", "openai-decisions"]
 
 
 class ModelSpec(BaseModel):
@@ -103,7 +103,7 @@ class ModelSpec(BaseModel):
     )
     base_url: AnyHttpUrl | None = Field(
         default=None,
-        description="Optional API base URL. Supports OpenAI Chat Completions, OpenAI Responses, and Anthropic APIs.",
+        description="Optional API base URL for OpenAI (including Decisions), Anthropic, or System One APIs.",
     )
     api_key: str | None = Field(
         default=None, description="API key to send to the endpoint. Use api_key_env to load from env instead."

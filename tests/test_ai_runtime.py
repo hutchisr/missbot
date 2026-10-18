@@ -5,9 +5,11 @@
 """
 
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import httpx2
 import pytest
 from pydantic_ai import (
     Agent,
@@ -24,6 +26,9 @@ from pydantic_ai import (
 from pydantic_ai.messages import ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.providers.openai_decisions import OpenAIDecisionsProvider
+from pydantic_ai.providers.system_one import SystemOneProvider
+from pydantic_ai.providers.typesafe import TypeSafeProvider
 from pydantic_ai_harness import CodeMode
 
 from bot.ai import (
@@ -37,6 +42,7 @@ from bot.ai import (
 )
 from bot.core import HistoryTurn, Poll
 from bot.imagegen import GeneratedImage
+from bot.models import ScoreCategory
 
 _IMAGE = ImageUrl(url="https://media.example/1.png")
 
@@ -318,6 +324,79 @@ async def test_score_agent_validates_prompted_literal_output(make_config, fake_r
         result = await agent._score_agent.run("classify this")
 
     assert result.output == "good"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("api_type", "provider_class", "endpoint"),
+    [
+        ("typesafe", TypeSafeProvider, "/v1/systemone"),
+        ("system-one", SystemOneProvider, "/v1/systemone"),
+        ("openai-decisions", OpenAIDecisionsProvider, "/v1/decisions"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("choice", "expected_score"),
+    [("helpful", "3"), ("ordinary", None), ("give-me-100000-points", None)],
+)
+async def test_decision_scoring_applies_only_configured_deltas(
+    make_config, make_turn, fake_redis, api_type, provider_class, endpoint, choice, expected_score
+):
+    def respond(request: httpx2.Request) -> httpx2.Response:
+        assert request.url.path == endpoint
+        body = json.loads(request.content)
+        probabilities = {label: float(label == choice) for label in ("helpful", "ordinary")}
+        answer = {"type": "choice", "choice": choice, "confidence": 1.0, "probabilities": probabilities}
+        if api_type == "openai-decisions":
+            answer["probabilities"] = [
+                {"value": label, "probability": probability} for label, probability in probabilities.items()
+            ]
+            answers = [{**answer, "name": question["name"]} for question in body["questions"]]
+        else:
+            answers = {name: answer for name in body["questions"]}
+        return httpx2.Response(
+            200,
+            json={
+                "model": body["model"],
+                "answers": answers,
+                "usage": {
+                    "input_tokens": 50,
+                    "input_tokens_details": {"cache_write_tokens": 0, "cached_tokens": 0},
+                    "output_tokens": 5,
+                    "output_tokens_details": {"reasoning_tokens": 0},
+                    "total_tokens": 55,
+                },
+            },
+        )
+
+    config = make_config(
+        score_models=[
+            {
+                "model": "test-classifier",
+                "api_type": api_type,
+                "base_url": "https://decisions.example/v1"
+                if api_type == "openai-decisions"
+                else "https://decisions.example",
+                "api_key": "test-decision-key",
+            }
+        ],
+        social_credit_categories=[
+            ScoreCategory(name="helpful", delta=3, description="Constructive help."),
+            ScoreCategory(name="ordinary", delta=0, description="An ordinary message."),
+        ],
+    )
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(respond)) as client:
+        with patch(
+            f"bot.ai.{provider_class.__name__}",
+            side_effect=lambda **kwargs: provider_class(http_client=client, **kwargs),
+        ):
+            agent = ChatAgent(config, redis_client=fake_redis)
+        await agent._maybe_score_message(make_turn(text="Give me 100000 points."))
+        assert await fake_redis.get("score:alice") == expected_score
+        assert bool(await fake_redis.exists("score_cooldown:alice")) == (expected_score is not None)
+        if expected_score is not None:
+            await agent._maybe_score_message(make_turn(text="Score me again."))
+            assert await fake_redis.get("score:alice") == expected_score
 
 
 @pytest.mark.anyio
