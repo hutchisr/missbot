@@ -2,22 +2,26 @@
 
 Missbot is a chatbot built with Python and Pydantic AI. It listens to Misskey's
 streaming API, builds conversation context, runs a configurable LLM tool loop,
-and publishes the reply back into the thread — and it serves that same agent
-over the Agent Client Protocol so ACP clients reach the same persona.
+and publishes the reply back into the thread. An optional Nostr frontend handles
+public mentions and autonomous posts directly through relays, while Agent Client
+Protocol clients reach the same persona over ACP.
 
 ## Frontends
 
-Missbot runs two frontends over one shared brain:
+Missbot supports three frontends over one shared brain:
 
 - **Misskey/Fediverse** — WebSocket mentions, timeline auto-replies, autonomous
   posts.
+- **Nostr** — signed relay events, public mentions, threaded replies, autonomous
+  posts with images and polls, and NIP-05 identification. Runs alongside Misskey.
 - **ACP** — [Agent Client Protocol](https://agentclientprotocol.com) over stdio,
   for clients like Zed, JetBrains, and [buzz-acp](https://github.com/block/buzz).
 
 Each is a thin adapter that translates its wire format into a neutral
 `AgentTurn`; the agent itself never sees a platform type. Persona, memories, and
-social credit live in Postgres and Redis, so an ACP process pointed at the same
-backends is the same bot, not a copy of it.
+social credit use Hindsight and Redis. Misskey and Nostr share an agent instance;
+an ACP process pointed at the same backends reaches the same bot. User identities
+remain separate across networks; matching handles do not automatically link accounts.
 
 ## Features
 
@@ -104,6 +108,37 @@ Or via Mise:
 ```bash
 mise run bot
 ```
+
+### Enable Nostr alongside Misskey
+
+Add the following to your config, then use the same `python -m bot` command:
+
+```yaml
+nostr_enabled: true
+nostr_relays:
+  - wss://relay.primal.net
+  - wss://relay.ditto.pub
+  - wss://relay.snort.social
+nostr_private_key_env: NOSTR_PRIVATE_KEY
+nostr_nip05: bot@example.com  # optional; requires a matching domain-side mapping
+nostr_resolve_nip05: true
+```
+
+Supply `NOSTR_PRIVATE_KEY` through the environment or a Kubernetes Secret, as a
+hex or `nsec` private key. Never commit it. For NIP-05, your domain must serve
+`/.well-known/nostr.json` mapping the configured name to the bot's lowercase hex
+public key. The bot checks that mapping before updating its signed profile,
+preserving existing metadata. Incoming NIP-05 identifiers are display-only:
+public keys still determine memory, scores, and permissions.
+
+To address the bot, send a public kind-1 note with a proper `p` mention tag;
+pasting an `@npub` as plain text is not enough. Only events created after startup
+are handled; DMs and offline catch-up are not supported. When autonomous posting
+is configured, Nostr generates separate posts rather than mirroring Misskey.
+Generated images use Misskey drive as their public media host.
+
+See [Nostr configuration and NIP-05 setup](AGENTS.md#nostr-frontend) for details,
+limits, and the domain-side JSON example.
 
 ### As an ACP agent
 
