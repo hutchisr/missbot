@@ -559,6 +559,36 @@ async def test_run_cancels_handlers_before_agent_context_exits(bot):
 
 
 @pytest.mark.anyio
+async def test_run_stops_nostr_before_shared_agent_exits(make_config, monkeypatch):
+    bot = Bot(config=make_config(nostr_enabled=True, nostr_relays=["wss://relay.example"]))
+    monkeypatch.setenv("NOSTR_PRIVATE_KEY", "01" * 32)
+    started = asyncio.Event()
+    events: list[str] = []
+
+    class TrackingAgent:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            events.append("agent-exited")
+
+    async def nostr_run():
+        try:
+            started.set()
+            await asyncio.Event().wait()
+        finally:
+            events.append("nostr-stopped")
+
+    bot._agent = TrackingAgent()  # type: ignore[assignment]
+    with (
+        patch("bot.nostr.NostrBot.run", side_effect=nostr_run),
+        patch.object(bot, "_run_loop", side_effect=started.wait),
+    ):
+        await bot.run()
+    assert events == ["nostr-stopped", "agent-exited"]
+
+
+@pytest.mark.anyio
 async def test_send_note_raises_on_oversized_output(bot, make_note):
     """Over-cap output is refused, not truncated — the model ignored its length budget."""
     note = make_note()

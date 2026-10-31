@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import random
 import re
 import time
@@ -561,14 +562,41 @@ class Bot:
             except Exception:
                 logfire.exception("Error during autonomous post")
 
+    async def _upload_nostr_image(self, image: GeneratedImage) -> str | None:
+        """Reuse Misskey drive as the public media host for Nostr attachments."""
+        file_id = await self._upload_image(image)
+        if file_id is None:
+            return None
+        response = await api_client.post(f"{self.url}api/drive/files/show", json={"fileId": file_id})
+        response.raise_for_status()
+        payload = response.json()
+        url = payload.get("url") if isinstance(payload, dict) else None
+        return url if isinstance(url, str) and is_safe_media_url(url) else None
+
     async def run(self):
+        nostr_task: asyncio.Task[None] | None = None
+        nostr = None
+        if self._config.nostr_enabled:
+            from .nostr import NostrBot
+            from .nostr_transport import NostrTransport
+
+            key = os.environ.get(self._config.nostr_private_key_env, "").strip()
+            if not key:
+                raise ValueError(f"Set {self._config.nostr_private_key_env} to the Nostr signing key")
+            transport = NostrTransport(key, [str(relay) for relay in self._config.nostr_relays])
+            nostr = NostrBot(self._config, self._agent, transport, self._upload_nostr_image)
         if self._redis:
             await self._load_last_auto_reply_time()
 
         async with self._agent:
+            if nostr is not None:
+                nostr_task = asyncio.create_task(nostr.run())
+                nostr_task.add_done_callback(self._task_done_callback)
             try:
                 await self._run_loop()
             finally:
+                if nostr_task is not None:
+                    await self._cancel_and_wait(nostr_task)
                 # Handler tasks use the agent, Redis, and memory store. Stop them
                 # before ChatAgent.__aexit__ closes those shared resources.
                 await self._cancel_background_tasks()

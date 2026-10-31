@@ -3,6 +3,8 @@ from typing import Any, Literal, Optional
 
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, WebsocketUrl, field_validator, model_validator
 
+from .nip05 import normalize_identifier
+
 _ALLOW_EXTRA = ConfigDict(extra="allow")
 
 
@@ -198,6 +200,14 @@ class Config(BaseModel):
     ws_url: WebsocketUrl = Field(description="ws_url")
     token: str = Field(description="token")
     channel: str | None = None
+    nostr_enabled: bool = Field(default=False, description="Run the public Nostr frontend alongside Misskey.")
+    nostr_relays: list[WebsocketUrl] = Field(default_factory=list, max_length=16)
+    nostr_private_key_env: str = Field(default="NOSTR_PRIVATE_KEY", min_length=1)
+    nostr_max_event_chars: int = Field(default=65536, gt=0, le=262144)
+    nostr_nip05: str | None = Field(
+        default=None, description="Bot NIP-05 identifier published after domain validation."
+    )
+    nostr_resolve_nip05: bool = Field(default=True, description="Identify incoming Nostr authors for display only.")
     llm_models: list[str | ModelSpec] = Field(
         description="LLM models. Strings use pydantic-ai 'provider:model' format "
         "(e.g. 'openrouter:anthropic/claude-3.5-sonnet'). Dicts add metadata or "
@@ -554,6 +564,22 @@ class Config(BaseModel):
         description="Maximum characters from the current author/message sent as the Hindsight recall query.",
     )
     debug: bool | None = None
+
+    @field_validator("nostr_nip05")
+    @classmethod
+    def normalize_nostr_nip05(cls, value: str | None) -> str | None:
+        return normalize_identifier(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def check_nostr_config(self) -> "Config":
+        if self.nostr_enabled and not self.nostr_relays:
+            raise ValueError("nostr_relays is required when nostr_enabled is true")
+        if not self.nostr_private_key_env.strip():
+            raise ValueError("nostr_private_key_env must not be blank")
+        for relay in self.nostr_relays:
+            if relay.username or relay.password or relay.fragment:
+                raise ValueError("nostr_relays must not contain credentials or fragments")
+        return self
 
     @model_validator(mode="after")
     def check_auto_post_config(self) -> "Config":

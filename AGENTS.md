@@ -2,12 +2,67 @@
 
 <!-- This file is the project doc; CLAUDE.md is just `@AGENTS.md`. Edit AGENTS.md, not CLAUDE.md. -->
 
-Pydantic AI chat agent with LLM fallback, an optional Redis-backed social credit system, and optional Hindsight long-term memory. It serves **two frontends over one shared brain**:
+Pydantic AI chat agent with LLM fallback, an optional Redis-backed social credit system, and optional Hindsight long-term memory. It serves **three frontends over one shared brain**:
 
 - **Misskey/Fediverse** (`bot/bot.py`) — WebSocket streaming, mentions, timeline auto-replies, autonomous posts
+- **Nostr** (`bot/nostr.py`) — opt-in direct relay connection alongside Misskey, public mentions, threaded replies, and autonomous posts
 - **ACP** (`bot/acp/`) — Agent Client Protocol over stdio, so ACP clients (Zed, JetBrains, [buzz-acp](https://github.com/block/buzz)) reach the same persona
 
-Both are thin adapters translating their wire format into the neutral `AgentTurn` in `bot/core.py`; `ChatAgent` never sees a platform type. Persona and memories live in Hindsight while scores live in Redis, so separate Misskey and ACP processes pointed at the same backends are genuinely the same bot rather than copies.
+These are thin adapters translating their wire format into the neutral `AgentTurn` in `bot/core.py`; `ChatAgent` never sees a platform type. Misskey and Nostr share one agent instance and backend clients. Persona and memories live in Hindsight while scores live in Redis, so separate ACP processes pointed at the same backends reach the same bot rather than a copy.
+
+## Nostr frontend
+
+Enable direct Nostr publishing and public mention replies in the same `python -m bot` process:
+
+```yaml
+nostr_enabled: true
+nostr_relays:
+  - wss://relay.damus.io
+  - wss://nos.lol
+nostr_private_key_env: NOSTR_PRIVATE_KEY
+nostr_max_event_chars: 65536
+```
+
+Supply `NOSTR_PRIVATE_KEY` through the process environment (hex or `nsec`); never commit it. In Kubernetes, add that key to the existing `missbot-secrets` Secret without replacing its other credentials. The existing deployment's `envFrom` exposes it. Deploy the updated image, update `missbot-config`, and restart the deployment. Missing/invalid keys fail startup; disabled Nostr never reads the key. Use public writable relays; relay acceptance policies can reject posts. No live Nostr configuration is enabled by default.
+
+`bot/nostr_transport.py` uses `nostr-sdk` for signing, signature verification, relay reconnection, and protocol IO. It subscribes to kind-1 events tagging the bot's public key from process startup onward, excludes self-posts and invalid/far-future events, and requires at least one positive relay acknowledgement for publication. It bounds relay input to 512 KiB/event, 256 tags and 128 queued notifications, publication to 15 seconds, and ancestor fetches to 5 seconds. The adapter limits concurrent handlers with `max_concurrent_handlers` independently of Misskey, and remembers 1024 completed event ids plus pending events to avoid duplicate replies. There is no durable inbox/outbox or offline catch-up across restarts; overload drops events.
+
+Public authors are identified by verified `nostr:<hex-pubkey>` identities for social scores and author-scoped memory, never by display names or Misskey ids. The shared score-ignore threshold and `NO_REPLY` behavior apply. NIP-10 ancestors provide bounded conversation history (`max_context`); only a fully fetched, consistent ancestry establishes a shared memory conversation root. Replies carry root/reply event tags and mention only the incoming author. NIP-92 image metadata uses the existing SSRF guard and `vision_image_mode`, capped at four images per event. DMs, encrypted events, timeline auto-replies, general profile editing, and poll voting are not supported. NIP-05 profile identification is supported below. Nostr has no authenticated equivalent of Misskey's `isBot`, so `ignore_bots` does not apply.
+
+When `auto_post_interval` is configured, Nostr generates its own autonomous posts on a separate timer using the shared auto agent, prompt, generation limits, and recent-post history; it does not mirror Misskey posts or replies. Generated images use Misskey drive as the public media host and include NIP-92 metadata; upload failure refuses that Nostr post rather than dropping its attachment. Polls publish as NIP-88 kind-1068 events (client support varies). Relay failures are isolated from Misskey. Shutdown cancels and drains both frontends before closing the shared agent, HTTP client, Redis, and memory.
+
+### NIP-05 identification
+
+Both the bot's own identifier and incoming authors' identifiers are supported:
+
+```yaml
+nostr_nip05: missbot@example.com  # optional; unset leaves the bot's profile untouched
+nostr_resolve_nip05: true        # default; false disables incoming identifier lookups
+```
+
+The domain owner must serve `https://example.com/.well-known/nostr.json?name=missbot`, without redirects, with `Access-Control-Allow-Origin: *`. A static JSON file works (the web server may ignore the query string):
+
+```json
+{
+  "names": {
+    "missbot": "<bot's 64-character lowercase hex public key>"
+  }
+}
+```
+
+Use the public key corresponding to `NOSTR_PRIVATE_KEY`, **not** an `npub` and never the private key. With the key already in the local environment, derive it without exposing the secret:
+
+```bash
+uv run python -c 'import os; from nostr_sdk import Keys; print(Keys.parse(os.environ["NOSTR_PRIVATE_KEY"]).public_key().to_hex())'
+```
+
+Use `_@example.com` and a `"_"` mapping for a domain-only identifier. The local part permits only lowercase `a-z0-9-_.`; domains normalize to lowercase IDNA. The bot does not host this endpoint or configure DNS/your web server.
+
+At startup, `nostr_nip05` is published only after the HTTPS mapping matches the bot's key. The bot fetches signed kind-0 metadata from every configured relay, selects the newest event (lowest event id breaks timestamp ties), preserves its JSON fields and tags, and changes only `nip05`. A confirmed absent profile is created with `name: bot_username`. Unchanged identifiers do not cause another publication. Updates use a strictly newer timestamp, subject to the existing future-event limit. Incomplete/offline/malformed relay reads fail closed instead of replacing unseen metadata. Identification/publication failures are logged without preventing normal replies; restart after fixing domain or relay configuration to retry. Use one profile writer: simultaneous changes by another client cannot be atomically merged across Nostr relays.
+
+Incoming authors' signed kind-0 `nip05` claims are checked against their HTTPS domain mapping. A match adds `identifier (nostr:<pubkey>)` to the current author's display; mismatches and failures retain the public-key display. Public keys still determine scores, memory, permissions, and reply tags. Successful and failed lookups are cached for five minutes, bounded to 1024 authors; identifiers are not proof of personal trust and never grant privileges.
+
+`bot/nip05.py` makes credential-free HTTPS requests with a five-second total deadline and a 64-KiB response cap. It rejects redirects, compressed responses, private/internal hosts and any private DNS answer, and pins the public connection address while retaining the original TLS hostname and Host header. Profile reads have a separate five-second deadline, including their serialization lock, and require end-of-stored-events confirmation from **all** configured relays. A failed relay can therefore temporarily suppress identification/profile updates, but not ordinary conversation.
 
 ## Commands
 

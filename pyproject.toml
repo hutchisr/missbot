@@ -10,6 +10,7 @@ dependencies = [
   "hindsight-client>=1.0.0,<2.0.0",
   "httpx>=0.28.1",
   "logfire[httpx,redis]>=5.2.0",
+  "nostr-sdk>=0.45.1,<0.46",
   "pydantic-ai[typesafe]>=2.57.0",
   "pydantic-ai-harness[codemode]>=0.57.0",
   "pyyaml>=6.0.3",

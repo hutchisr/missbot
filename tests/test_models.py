@@ -20,6 +20,26 @@ def test_config_missing_required_field():
         Config(domain="example.test")  # type: ignore[call-arg]  # ty: ignore[missing-argument]
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"nostr_enabled": True},
+        {"nostr_relays": ["https://relay.example"]},
+        {"nostr_relays": ["wss://user:password@relay.example"]},
+        {"nostr_relays": ["wss://relay.example/#fragment"]},
+        {"nostr_private_key_env": " "},
+        {"nostr_max_event_chars": 0},
+        {"nostr_nip05": "Alice@example.com"},
+        {"nostr_nip05": "alice@localhost"},
+        {"nostr_nip05": "alice@example.com/path"},
+        {"nostr_nip05": "alice@example.com:443"},
+    ],
+)
+def test_config_rejects_invalid_nostr_settings(make_config, overrides):
+    with pytest.raises(ValidationError):
+        make_config(**overrides)
+
+
 def test_config_max_tokens_must_be_positive(make_config):
     with pytest.raises(ValidationError):
         make_config(max_tokens=0)

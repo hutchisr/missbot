@@ -80,13 +80,17 @@ async def main_async(config: Config) -> None:
     def shutdown_handler():
         logfire.info("Shutting down")
         bot.shutdown()
-        loop.create_task(api_client.close())
-        if redis_client:
-            loop.create_task(redis_client.aclose())
-        if memory:
-            loop.create_task(memory.close())
 
     loop.add_signal_handler(signal.SIGTERM, shutdown_handler)
     loop.add_signal_handler(signal.SIGINT, shutdown_handler)
 
-    await bot.run()
+    try:
+        await bot.run()
+    finally:
+        loop.remove_signal_handler(signal.SIGTERM)
+        loop.remove_signal_handler(signal.SIGINT)
+        await api_client.close()
+        if redis_client:
+            await redis_client.aclose()
+        if memory:
+            await memory.close()
