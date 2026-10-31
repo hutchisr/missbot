@@ -45,9 +45,20 @@ docker build -t missbot . && docker run -v /path/to/config.yaml:/config.yaml mis
 
 # Kubernetes
 mise run build      # Build and push Docker image
-mise run deploy     # Apply K8s manifests and restart
-# k8s/config.yaml and k8s/secrets.txt are ignored local inputs; Kustomize emits
-# both as Secrets (the runtime config contains the Misskey token and provider credentials).
+mise run deploy     # Apply manifests, restart, and wait; uses the current kubectl context
+kubectl --context admin@fortuna apply -k k8s --server-side  # Apply without restart/build
+# Fortuna's missbot Helm release has been removed; k8s/ is the deployment source.
+# Recreate keeps one bot instance during updates. Provision vultr-cr-credentials
+# in misskey for private image pulls; existing runtime/config secrets are retained.
+# First-time bootstrap only (namespace misskey must already exist):
+kubectl -n misskey create secret generic missbot-secrets --from-env-file=k8s/secrets.txt
+kubectl -n misskey create service externalname rachels-mac-mini \
+  --external-name=rachels-mac-mini.taile6e57.ts.net
+# Then apply k8s normally. The operator replaces externalName with its proxy target.
+# Routine manifests omit externalName and do not generate missbot-secrets.
+# Rotate existing credentials separately; never force-apply stale secrets.txt.
+# k8s/config.yaml remains an ignored local input, generated as missbot-config.
+# Keep its connection settings and embedded credentials current before applying.
 # Hindsight runs in the `hindsight` namespace. Missbot reaches it through
 # http://hindsight-api.hindsight.svc.cluster.local:8888.
 kubectl -n hindsight logs deployment/hindsight-api --tail=50
@@ -99,7 +110,7 @@ bootstrap it once by pushing the merged `master` to `origin`.
 | `bot/ai.py` | `ChatAgent` class — Pydantic AI agent with `FallbackModel`, vision support. Consumes `AgentTurn`; the reply length cap is per-run (`AgentDeps.char_budget`), not baked into the agent |
 | `bot/models.py` | Pydantic models: `Config`, `Note`, `User`, `MiFile`, WS message types |
 | `bot/tools.py` | `build_tools()` factory — datetime, sandboxed pydantic-monty Python, web search, search_users/notes, social credit tools; `apply_social_credit()` helper |
-| `bot/scoring.py` | Injection-resistant message classifier: `build_scoring_spec()` turns `Config.social_credit_categories` into the constrained output type + delta map + hardened instructions; `build_scoring_prompt()` fences untrusted input |
+| `bot/scoring.py` | Injection-resistant message classifier: `build_scoring_spec()` builds the constrained category type, fixed delta map, and concise instructions; `build_scoring_prompt()` serializes separate `target` and reference-only `context` fields as JSON |
 | `bot/memory.py` | Hindsight-native lifecycle: shared observation-enabled bank, automatic fenced recall before allowed turns, and append-only structured exchange retention afterward |
 | `bot/net.py` | `is_safe_media_url()` — SSRF guard for attacker-supplied image URLs (blocks private/reserved IPs and internal hosts); `fetch_image()` — bounded, guarded download used by `vision_image_mode: fetch` |
 | `bot/imagegen.py` | `ImageGenerator` + `GeneratedImage` — OpenAI-compatible `/images/generations` client for auto-post images. Validates by magic bytes (PNG/JPEG/GIF/WebP, SVG refused), caps the response body and decoded size, and uses a dedicated client so the Misskey token never reaches the provider |
@@ -244,6 +255,7 @@ Gating is progressive disclosure driven by the model itself: each unique `gate` 
 - `AgentDeps` is a **dataclass** (not BaseModel) with `username`, `social_credit_score`, `adjusted_credit_users`, `social_credit_unrestricted`, `enabled_gates`, `previous_bot_reply`, and `char_budget`
 - `adjust_social_credit` is privileged-only: it works only when `deps.social_credit_unrestricted` is set (`ChatAgent.run` sets it when the note's author id is in `social_credit_unrestricted_user_ids`); for everyone else it refuses
 - Every author's score moves via `ChatAgent._maybe_score_message` (privileged users included): a separate tool-less classifier (`bot/scoring.py`, model from `score_models` or the reply model) runs concurrently with the reply, returns one of the configured `social_credit_categories` (default toxic/rude/neutral/good/exceptional) that's mapped to its fixed delta in code, applied through `apply_social_credit` and rate-limited by a Redis `score_cooldown:<user>` key. `ChatAgent.__init__` builds a `ScoringSpec` (constrained output type + delta map + instructions) from the configured categories via `build_scoring_spec`. Chat-only chains wrap its Literal output in Pydantic AI `PromptedOutput`, retaining validation/retries without forcing `tool_choice=required`, which NanoGPT's DeepSeek route rejects with HTTP 503. Chains containing a decision model use the Literal directly because decision models reject text output; Pydantic AI translates it into a choice question. The model only picks a category name, never the number.
+- Scoring instructions ask only about the target's observable tone and quality, list category descriptions, and give one untrusted-input warning. The run input is JSON data (`target` plus chronological `context`), without repeated instructions or nonce fences. The same input works with decision APIs and chat classifiers; structured output constrains category names but does not make classification immune to prompt injection.
 - Agent uses `output_type=str` (plain string output, not structured)
 - Tools are built via `build_tools()` in `bot/tools.py` and passed to `Agent(..., tools=tools)`. Reply and auto agents also receive Pydantic AI Harness `CodeMode`; every eligible regular tool is callable under its normal name only inside `run_code`. A shared instruction tells models to make the `run_code` call instead of merely narrating their intent. Framework control and other code-execution tools cannot be nested by CodeMode and remain native. The social-scoring classifier remains tool-less
 - When `memory_enabled`, the bot creates one shared `MemoryStore` backed by the official Hindsight client. Memory is automatic, not exposed as model-controlled tools

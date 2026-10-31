@@ -13,10 +13,3 @@ secretGenerator:
   options:
     labels:
       app.kubernetes.io/name: missbot
-- name: missbot-secrets
-  namespace: misskey
-  envs:
-  - secrets.txt
-  options:
-    labels:
-      app.kubernetes.io/name: missbot

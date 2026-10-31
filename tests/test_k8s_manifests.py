@@ -12,6 +12,7 @@ def test_runtime_config_is_generated_and_mounted_as_a_secret():
     assert "configMapGenerator" not in kustomization
 
     generated_secrets = {entry["name"]: entry for entry in kustomization["secretGenerator"]}
+    assert set(generated_secrets) == {"missbot-config"}  # Routine apply must not overwrite live credentials.
     assert generated_secrets["missbot-config"]["files"] == ["config.yaml=config.yaml"]
 
     resources = list(yaml.safe_load_all((ROOT / "k8s" / "base.yaml").read_text()))
@@ -19,5 +20,3 @@ def test_runtime_config_is_generated_and_mounted_as_a_secret():
     volumes = {volume["name"]: volume for volume in deployment["spec"]["template"]["spec"]["volumes"]}
     assert volumes["config-volume"]["secret"]["secretName"] == "missbot-config"
     assert "configMap" not in volumes["config-volume"]
-
-
