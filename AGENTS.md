@@ -2,11 +2,12 @@
 
 <!-- This file is the project doc; CLAUDE.md is just `@AGENTS.md`. Edit AGENTS.md, not CLAUDE.md. -->
 
-Pydantic AI chat agent with LLM fallback, an optional Redis-backed social credit system, and optional Hindsight long-term memory. It serves **three frontends over one shared brain**:
+Pydantic AI chat agent with LLM fallback, an optional Redis-backed social credit system, and optional Hindsight long-term memory. It serves **four frontends over one shared brain**:
 
 - **Misskey/Fediverse** (`bot/bot.py`) — WebSocket streaming, mentions, timeline auto-replies, autonomous posts
 - **Nostr** (`bot/nostr.py`) — opt-in direct relay connection alongside Misskey, public mentions, threaded replies, and autonomous posts
-- **ACP** (`bot/acp/`) — Agent Client Protocol over stdio, so ACP clients (Zed, JetBrains, [Buzz](https://github.com/block/buzz-app) via `integrations/buzz`) reach the same persona
+- **ACP** (`bot/acp/`) — Agent Client Protocol over stdio or authenticated WebSocket for clients such as Zed and JetBrains
+- **Hosted Buzz** (`bot/buzz/`, `integrations/buzz`) — server-owned relay agent and lifecycle plugin; conversation execution continues without a desktop
 
 These are thin adapters translating their wire format into the neutral `AgentTurn` in `bot/core.py`; `ChatAgent` never sees a platform type. Misskey and Nostr share one agent instance and backend clients. Persona and memories live in Hindsight while scores live in Redis, so separate ACP processes pointed at the same backends reach the same bot rather than a copy.
 
@@ -76,10 +77,11 @@ uv run python -m bot -c config.local.yaml   # or: mise run bot
 # Run (ACP frontend — stdio JSON-RPC; clients that spawn subprocesses use this)
 uv run python -m bot.acp stdio -c config.local.yaml
 
-# Run (remote ACP frontend; Buzz connects directly, stdio clients may use acpremote)
+# Run (remote ACP frontend, independent of the hosted Buzz service)
 uv run python -m bot.acp serve -c config.local.yaml --host 0.0.0.0 --port 8080 --token-env ACP_TOKEN
-# Buzz: enter wss://<host>/acp/ws and the token in the Missbot agent's Settings.
-# Provide TLS at the reverse proxy; no local launcher or bridge is needed in Buzz.
+# Run hosted Buzz with persistent state, management token, and the existing Nostr key:
+uv run python -m bot.buzz -c config.local.yaml --state /data/buzz.sqlite3 \
+  --host 0.0.0.0 --port 8080 --community wss://shrimp.communities.buzz.xyz
 
 
 # Test
@@ -100,7 +102,7 @@ docker build -t missbot . && docker run -v /path/to/config.yaml:/config.yaml mis
 
 # Kubernetes
 mise run build      # Build and push Docker image
-mise run deploy     # Apply manifests, restart both missbot and missbot-acp, and wait
+mise run deploy     # Apply manifests, restart missbot, missbot-acp and missbot-buzz, and wait
 kubectl --context admin@fortuna apply -k k8s --server-side  # Apply without restart/build
 # Fortuna's missbot Helm release has been removed; k8s/ is the deployment source.
 # Recreate keeps one bot instance during updates. Provision vultr-cr-credentials
@@ -128,9 +130,12 @@ curl --fail https://missbot-acp.taile6e57.ts.net/healthz
 # Copy the access token directly to the macOS clipboard, without displaying it:
 kubectl --context admin@fortuna -n misskey get secret missbot-acp-auth \
   -o jsonpath='{.data.ACP_TOKEN}' | base64 --decode | pbcopy
+# Hosted Buzz management uses a DIFFERENT token:
+kubectl --context admin@fortuna -n misskey get secret missbot-buzz-auth \
+  -o jsonpath='{.data.BUZZ_TOKEN}' | base64 --decode | pbcopy
 ```
 
-`k8s/acp.yaml` deploys a separate single-replica `missbot-acp` Deployment, ClusterIP Service, and Tailscale Ingress. Its endpoint is `wss://missbot-acp.taile6e57.ts.net/acp/ws`, accessible only through the tailnet. It runs the shared image with `python -m bot.acp serve`, uses the existing `missbot-config` and `missbot-secrets` backends, and requires `ACP_TOKEN` from the separately provisioned `missbot-acp-auth` Secret. Recreate preserves the single-process session boundary; startup/readiness/liveness probes use `/healthz`. Browser clients must still provide the token after TLS; tailnet access alone grants no ACP access. Routine apply never generates or rotates either credential Secret. For an ACP-only rollout, build the image, apply `k8s/acp.yaml`, and restart `deployment/missbot-acp` if it already exists; a full `mise run deploy` restarts both frontends. The shared production config's sender-header attribution remains opt-in; deployment does not change it.
+`k8s/acp.yaml` deploys a separate single-replica `missbot-acp` Deployment, ClusterIP Service, and Tailscale Ingress at `wss://missbot-acp.taile6e57.ts.net/acp/ws`. It runs `python -m bot.acp serve`, uses existing backend/config Secrets, and requires `ACP_TOKEN` from `missbot-acp-auth`. It remains available for ACP consumers but is no longer the Buzz plugin's endpoint. The ignored local manifest `k8s/buzz.local.yaml` deploys `missbot-buzz` at `wss://missbot-buzz.taile6e57.ts.net/buzz/ws`, with its own `missbot-buzz-auth` Secret (`BUZZ_TOKEN`) and a 2-GiB `proxmox-retain` PVC for SQLite state. Kustomize requires this local file; a fresh checkout must supply its own copy before deployment. Both services are private to the tailnet and still require application authentication. Routine Kustomize apply does not generate/rotate authentication or runtime credential Secrets. A full `mise run deploy` restarts all three workloads; applying one workload manifest and restarting only it leaves the others undisturbed.
 
 Dependency baseline: `hindsight-client>=1.0.0,<2.0.0` permits updates within the Hindsight 1.x client series; runtime and development dependencies are locked in `uv.lock`. Refresh with `uv lock --upgrade` and `uv sync`, then run the verification commands below. The current Google GenAI dependency requires `tenacity<9.2.0` and `websockets<17.0`, so the lock retains 9.1.4 and 16.1.1 respectively rather than overriding upstream compatibility constraints.
 
@@ -171,6 +176,8 @@ bootstrap it once by pushing the merged `master` to `origin`.
 | `bot/acp/session.py` | `AcpSession` + `SessionRegistry` — bounded per-session history and the in-flight task handle `session/cancel` interrupts |
 | `bot/acp/ws.py` | WebSocket transport wire-compatible with `acpremote mirror`: frame↔stream bridge, bearer auth, metadata/health routes. No acpremote dependency |
 | `bot/acp/__main__.py` | `python -m bot.acp {stdio,serve}` entry points. Routes **all** logging to stderr — stdout is the JSON-RPC channel |
+| `bot/buzz/` | Hosted Buzz backend: authenticated management API, verified owner authorization, direct community relay IO, durable inbox/outbox and private conversation history |
+| `integrations/buzz/` | Native-styled Buzz `AgentType.remote` management plugin; no desktop message runner, signer, or local process dependency |
 | `bot/ai.py` | `ChatAgent` class — Pydantic AI agent with `FallbackModel`, vision support. Consumes `AgentTurn`; the reply length cap is per-run (`AgentDeps.char_budget`), not baked into the agent |
 | `bot/models.py` | Pydantic models: `Config`, `Note`, `User`, `MiFile`, WS message types |
 | `bot/tools.py` | `build_tools()` factory — datetime, sandboxed pydantic-monty Python, web search, search_users/notes, social credit tools; `apply_social_credit()` helper |
@@ -244,29 +251,37 @@ Optional fields:
 - `acp_*`: ACP frontend settings (see below); ignored by `python -m bot`
 - `channel`, `debug`
 
+### Hosted Buzz frontend
+
+`python -m bot.buzz` owns Grok's Buzz relay connections and runs independently of every desktop. It reuses the configured `nostr_private_key_env` Secret key (normally `NOSTR_PRIVATE_KEY`) rather than generating or exporting a new identity. Management requires `BUZZ_TOKEN`; `--community` is a required repeatable allowlist of community origins, and `--state` selects the persistent SQLite file. Fortuna currently permits Shrimp and Feedback. The plugin endpoint is `wss://missbot-buzz.taile6e57.ts.net/buzz/ws`, not the ACP endpoint.
+
+`integrations/buzz` registers `AgentType.remote` with `provision`, `activate`, `profile`, `remove`, and `interrupt`; it has no `run()` callback. Provision returns the existing bot public key idempotently. Activation verifies the owner-signed NIP-OA digest `nostr:agent-auth:<bot-pubkey>:` using the SDK's Schnorr verification, requires empty/unrestricted conditions, and binds a community to that owner. Buzz supplies this authorization during hosted creation; a desktop agent is not silently migrated. Removing Buzz access stops its runner and clears private inbox/history, never the shared Nostr key. The owner binding survives removal. Profile writes preserve unknown JSON fields, picture and NIP-05, set `bot: true`, and use NIP-98-signed HTTP `POST /events` plus `x-auth-tag`, requiring a positive receipt for the exact signed event ID. They read both the community and configured public Nostr sources, skip unchanged profiles, and publish only to the Buzz community. Foreign `imeta` tags are omitted because Buzz requires community-local `/media/` paths; valid local media tags from an existing Buzz profile are retained. Unknown non-media tags remain intact.
+
+Management uses `missbot.buzz.v1`, a bounded first-frame token exchange, then JSON-RPC lifecycle calls. Closing the management connection does not stop activated runners. The plugin has no host process/file permissions and persists only device-local management URL/token settings under `missbot.hosted.v1`; these are unencrypted local application data, never shared agent config. Old ACP credentials are not imported into hosted settings. Reuse the host's `buzz-*` CSS roles, `data-buzz-ui`, and native state/size attributes rather than private React module imports or custom control CSS.
+
+The backend uses NIP-98 relay discovery, the NIP-11 `self` authority, NIP-42 authentication, and NIP-OA tags on signed events. Only verified kind-9 input is admitted. Fresh relay-signed channel metadata and rosters determine membership, DM/mention admission, and thread scope; fetched roots must belong to the same channel. Replies stay at channel level for DMs/Solo chats, otherwise in the validated thread. Author IDs are `buzz:<pubkey>`, never display names. Every Buzz turn sets `memory_access_allowed=false`; model calls, configured tools, scoring and telemetry still apply. `NO_REPLY` remains silent.
+
+Live kind-9 subscriptions must be scoped to verified member channels with `#h`. An unscoped query may return historical messages but is not a substitute for Buzz's live channel routes. `BuzzRelay` discovers signed kind-39002 rosters, follows relay-signed kind-44100/44101 notices addressed to the bot, and reconciles membership every 60 seconds. It installs/removes bounded channel filters (at most 128 channels), waits for live EOSE before declaring readiness, and rejects out-of-scope channel events. Membership refresh and socket reading have separate tasks so discovery does not block event delivery.
+
+SQLite stores owner authorizations, active communities, bounded private history, inbox deduplication, and signed outbox events—not the private key. Startup restores active connections and queued work without a desktop. Each community has a serial worker, 128 pending events, 2048 completed deduplication records, and 128 histories bounded by `acp_max_history_turns`; input uses `acp_max_prompt_chars` and generation has a five-minute deadline. Ingress/replay queries are bounded and overload drops input. An observed uncertain publication error is not automatically retried; crash recovery can resend the identical persisted signed event ID, never regenerate a reply already signed. Unconfirmed replies are not recorded as delivered. Back up the retained state PVC and runtime Secret separately. Attachments, Attention, autonomous publishing and protected-agent execution are not implemented in this text frontend.
+
 ### ACP frontend
 `python -m bot.acp` serves the same agent over the [Agent Client Protocol](https://agentclientprotocol.com) in two modes:
 
 - **`stdio`** — JSON-RPC on stdin/stdout, for clients that spawn agents as subprocesses (Zed, JetBrains).
-- **`serve`** — the same agent over WebSocket. The Buzz plugin connects directly with browser-compatible first-frame authentication. Clients requiring stdio can still bridge via [acpremote](https://github.com/vcoderun/acpkit): `acpremote mirror ws://host:8080/acp/ws`.
+- **`serve`** — the same agent over WebSocket with browser-compatible first-frame authentication. Clients requiring stdio can bridge via [acpremote](https://github.com/vcoderun/acpkit): `acpremote mirror ws://host:8080/acp/ws`.
 
 ```
-Buzz app → Missbot harness plugin → authenticated WebSocket → remote python -m bot.acp serve
+ACP client → authenticated WebSocket → python -m bot.acp serve
 ```
 
 `bot/acp/ws.py` implements acpremote's server contract directly rather than depending on the package — acpremote pins `websockets<16.0`, and adding it would downgrade the library the Misskey streaming client runs on. The contract: **one WebSocket text frame carries exactly one ACP JSON-RPC message** with no trailing newline (the SDK's `Connection` is newline-delimited, so the bridge strips it on send and re-adds it on receive), binary frames are an error, optional `Authorization: Bearer <token>`, plus `GET <mount>` metadata and `GET /healthz`. Routes default to `/acp`, `/acp/ws`, `/healthz` so `acpremote mirror` needs no extra flags. A configured token is stripped once and must remain nonempty; whitespace-only values fail startup instead of disabling authentication. Outbound frames and their queue are bounded, and clients exceeding the backlog are closed.
 
 `serve` builds **one** `ChatAgent`, `SessionRegistry`, and prompt semaphore shared by every connection, plus one `MissbotAgent` adapter *per connection* because the adapter holds the client handle used for `session/update`. The shared `acp_max_sessions` budget caps connections, sessions, and in-flight provider work across all adapters; one session cannot overlap prompts.
 
-`integrations/buzz/manifest.json` and `plugin.js` form a ready-to-install, dependency-free `block/buzz-app` harness that connects directly to a remote ACP server. Setup is in [README.md](README.md#in-buzz-blockbuzz-app). The plugin has no host process/file permissions and no launcher, installer, local config, checkout, uv, or acpremote dependency. Buzz retains signing keys and publishes replies. The agent creation form and Settings tab accept an endpoint and token, then **Connect** verifies authentication and private-session support. Settings are device-local `sessionStorage`, not shared agent configuration; re-enter them when the Buzz session ends. Remote endpoints require `wss://`; `ws://` is allowed only on loopback. Credentials, query parameters and fragments in URLs are rejected.
+Browser ACP clients negotiate `missbot.acp.v1`, then send `{"type":"authenticate","token":"..."}` as their first WebSocket text frame. The server requires a configured bearer token, compares it in constant time, and responds `{"type":"authenticated"}` before accepting ACP JSON-RPC. Authentication has a five-second deadline and a 4096-character frame cap. Unauthenticated connections consume bounded connection slots; no ACP adapter is created before success. Tokens never enter URLs, subprotocol names, or the SDK input stream. Authorization-header clients remain supported.
 
-The connection form reuses Buzz's shipped `buzz-content-header`, `buzz-settings-group`, `buzz-field`, `buzz-input`, and `buzz-button` CSS roles with `data-buzz-ui` and the built-in size/state attributes. External plugins cannot import Buzz's private React components. Keep colors, typography, focus, disabled/loading states, and spacing in the host design system instead of introducing inline control styling or a separate stylesheet. Token help is associated with its masked input through `aria-describedby`; connection and token-storage behavior are unchanged by presentation.
-
-Browser clients negotiate `missbot.acp.v1`, then send `{"type":"authenticate","token":"..."}` as their first WebSocket text frame. The server requires a configured bearer token, compares it in constant time, and responds `{"type":"authenticated"}` before accepting ACP JSON-RPC. Authentication has a five-second deadline and a 4096-character frame cap. Unauthenticated connections consume the existing bounded connection slots, and no ACP adapter is instantiated before success. Tokens are never sent in URLs, subprotocol names, or the SDK input stream. Existing Authorization-header clients remain supported. Updating only the plugin is insufficient: the remote server must support both browser authentication and private sessions.
-
-The plugin retains eight LRU conversation connections, serializes a bounded twenty-turn queue, and uses five-minute turn deadlines. Cancellation, failure, eviction, agent removal, or unload closes the associated connection; history is not persistent. Sessions are isolated by community/agent, channel, and thread, with channel-level replies for DMs/Solo chats. No automatic publication retries are made after uncertain relay acceptance. A bounded in-memory set suppresses the latest 1024 completed event/agent pairs. Attachments, Attention, autonomous posts, restoration, and protected-agent execution are unsupported. Run `node --test integrations/buzz/plugin.test.mjs` after plugin changes.
-
-**Private ACP sessions.** `session/new` accepts `_meta: {"missbot": {"private": true}}` and acknowledges the effective boolean in the response's same metadata field. The session fixes `AgentTurn.memory_access_allowed=false` for every turn; prompt metadata cannot relax it. Invalid private flags are rejected before session allocation. Without the flag, existing ACP behavior is unchanged. The Buzz plugin requires a positive acknowledgement before sending any conversation text, including public-looking community messages: it cannot assume community content is public enough for shared Hindsight recall/retention. This restriction does not disable model calls, configured tools, social scores, or telemetry.
+**Private ACP sessions.** `session/new` accepts `_meta: {"missbot": {"private": true}}` and acknowledges the effective boolean. The session fixes `AgentTurn.memory_access_allowed=false` for every turn; prompt metadata cannot relax it. Invalid flags are rejected before allocation. Without the flag, existing ACP behavior is unchanged. Hosted Buzz applies its privacy rule directly rather than through ACP.
 
 Config fields:
 - `acp_default_identity` (default `acp`): identity used unless trusted textual sender-header parsing is explicitly enabled and succeeds. Namespaced `acp:<value>` so it can never collide with a fediverse handle
@@ -275,7 +290,7 @@ Config fields:
 - `acp_max_sessions` (default `8`): shared cap for WebSocket connections, sessions, and concurrent prompts, the ACP analogue of `max_concurrent_handlers`
 - `acp_max_prompt_chars` (default `65536`): maximum aggregate text accepted in one prompt before scoring, model, or memory work
 
-**Identity and event-provenance limits.** ACP carries no authenticated structured sender or event field. Text-header attribution is therefore disabled by default: any ACP client can fabricate a complete `From:` / `Event ID:` block before `Content:` and impersonate another pubkey. When an operator explicitly trusts the only admitted client/harness and enables `acp_parse_sender_header`, the parsers use only the first structurally delimited block, accept only a pubkey identity and 64-hex event id, and never use the display name as a key. The `Content:` boundary prevents body-level header injection but is not signature verification. Disabled, missing, or malformed attribution falls back to `acp_default_identity` plus a random per-prompt source id. Batched prompts still attribute only the first block. The Missbot Buzz plugin constructs this header explicitly; arbitrary upstream harness prompts are not automatically trusted.
+**Identity and event-provenance limits.** ACP has no authenticated structured sender field. Its optional `From:` / `Event ID:` parsing is structural, not signature verification, and must only be enabled for trusted harnesses. It uses pubkeys and valid 64-hex event IDs before the first `Content:` boundary; missing/malformed fields fall back to the configured ACP identity and random per-prompt provenance. Hosted Buzz does not use this parser: it verifies signed relay events directly.
 
 **Differences from the Misskey path.** Replies have no character budget (`char_budget=None` — the note limit is Misskey's, not a universal one), while inbound prompts have the independent `acp_max_prompt_chars` safety limit. ACP exposes no `fs/*` or `terminal/*` client capabilities (missbot is conversational, not a coding agent), no `session/load` (history is in-process and does not survive restart), and no auth methods (over stdio the trust boundary is *who spawned the process*). Client-supplied `cwd` and `mcpServers` on `session/new` are ignored — missbot brings its own toolset from config. Social credit scoring, the ignore threshold, automatic memory recall/retention, and `NO_REPLY` all behave exactly as on the Misskey path.
 

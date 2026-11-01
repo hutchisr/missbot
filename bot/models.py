@@ -463,7 +463,7 @@ class Config(BaseModel):
     acp_parse_sender_header: bool = Field(
         default=False,
         description="Trust and parse per-sender identity from an ACP harness's textual message header "
-        "(the Missbot Buzz plugin emits 'From: (hex: ...)'). Disabled by default because ACP does "
+        "(for example 'From: (hex: ...)'). Disabled by default because ACP does "
         "not authenticate that text: a client can fabricate the entire pre-Content header. Enable only "
         "when the process/transport admits a trusted harness, not arbitrary ACP clients. The parser uses "
         "only the pubkey, never the display name.",

@@ -1,6 +1,6 @@
 """Serve the ACP agent over WebSocket, wire-compatible with `acpremote mirror`.
 
-The Buzz plugin connects directly with the ``missbot.acp.v1`` subprotocol and a
+Browser ACP clients connect with the ``missbot.acp.v1`` subprotocol and a
 bounded first-frame token exchange. The token never enters the ACP SDK stream.
 Clients requiring stdio can use ``acpremote mirror ws://host/acp/ws`` instead.
 

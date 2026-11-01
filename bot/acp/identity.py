@@ -1,7 +1,7 @@
 """Parse optional identity and event metadata from an ACP harness's text header.
 
-ACP has no structured sender or source-event fields. The Missbot Buzz plugin
-renders an event into prompt text before the user-controlled ``Content:``::
+ACP has no structured sender or source-event fields. A trusted harness may
+render an event into prompt text before the user-controlled ``Content:``::
 
     Event ID: <64 hex>
     From: (hex: <64 hex>)

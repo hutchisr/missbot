@@ -2,6 +2,6 @@
   "id": "missbot.acp",
   "name": "Missbot",
   "apiVersion": 1,
-  "description": "Connect directly to a remote Missbot ACP server. No local runtime or installer.",
-  "discovery": { "category": "agents", "tags": ["chat", "acp"] }
+  "description": "Hosted Missbot using Grok's existing Nostr identity. Runs while Buzz is closed; removal only deactivates Buzz.",
+  "discovery": { "category": "agents", "tags": ["chat", "hosted", "nostr"] }
 }

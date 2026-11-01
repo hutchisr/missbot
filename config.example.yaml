@@ -164,14 +164,14 @@ searxng_password: "yourpassword"
 # Optional: ACP frontend (`python -m bot.acp`). Ignored by the Misskey entry point.
 # ACP carries no authenticated sender field. Header parsing is disabled by default:
 # an arbitrary ACP client can fabricate a complete pre-Content header. Enable it
-# only when the process/transport admits a trusted harness such as the Missbot
-# buzz-app plugin; structural parsing alone does not verify signatures or identities.
+# only when the process/transport admits an operator-trusted harness;
+# structural parsing alone does not verify signatures or identities.
 # acp_default_identity: acp      # namespaced as acp:<value>; never collides with a handle
 # acp_parse_sender_header: false # true only for an operator-trusted ACP harness
 # acp_max_history_turns: 20     # per-session history bound (sessions are long-lived)
 # acp_max_sessions: 8           # concurrent session cap
-# The buzz-app plugin always requests private sessions: shared Hindsight recall and
-# retention stay off for Buzz conversations, regardless of memory_enabled below.
+# Hosted Buzz is a separate server-owned frontend (`python -m bot.buzz`).
+# Its verified relay conversations always disable shared Hindsight recall/retention.
 
 # Optional: automatic conversational memory via Hindsight. Off by default.
 # Before each allowed turn, relevant memories are injected as guarded model context.

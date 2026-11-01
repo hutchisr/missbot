@@ -4,6 +4,7 @@ kind: Kustomization
 resources:
 - base.yaml
 - acp.yaml
+- buzz.local.yaml
 generatorOptions:
   disableNameSuffixHash: true
 secretGenerator:
