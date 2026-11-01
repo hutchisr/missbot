@@ -1,10 +1,8 @@
 """Serve the ACP agent over WebSocket, wire-compatible with `acpremote mirror`.
 
-ACP's own HTTP transport is still a draft RFD and the Python SDK ships stdio only, so
-remote clients reach a hosted agent through a bridge. [acpremote](https://github.com/vcoderun/acpkit)
-is that bridge: on the consumer side, ``acpremote mirror ws://host/acp/ws`` turns a
-remote WebSocket endpoint back into a local stdio ACP command — exactly what
-``BUZZ_ACP_AGENT_COMMAND`` (or a Zed agent server entry) needs.
+The Buzz plugin connects directly with the ``missbot.acp.v1`` subprotocol and a
+bounded first-frame token exchange. The token never enters the ACP SDK stream.
+Clients requiring stdio can use ``acpremote mirror ws://host/acp/ws`` instead.
 
 This module implements the *server* half of that contract directly, so missbot has no
 acpremote dependency — which also keeps `websockets` at the version the Misskey client
@@ -17,6 +15,8 @@ The contract, taken from acpremote's ``stream.py``/``client.py``:
   streams, so the bridge here strips the newline on send and re-adds it on receive.
 - **Binary frames are an error.**
 - Optional bearer auth: ``Authorization: Bearer <token>``.
+- Browser subprotocol: first send ``{"type":"authenticate","token":"..."}``, then
+  wait for ``{"type":"authenticated"}`` before ACP. Requires a configured token.
 - ``GET <mount>`` returns transport metadata; ``GET /healthz`` is a health probe.
   A client treats a non-200 metadata response as "no metadata" rather than failing,
   but serving it advertises auth mode and message limits.
@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ from typing import Any, NoReturn
 import logfire
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
+from websockets.typing import Subprotocol
 
 from ..provider import PROJECT_VERSION
 
@@ -48,6 +50,9 @@ DEFAULT_MAX_QUEUE = 32
 DEFAULT_OUTPUT_MAX_SIZE = 1024 * 1024
 DEFAULT_OUTPUT_MAX_QUEUE = 8
 DEFAULT_MAX_CONNECTIONS = 8
+BROWSER_SUBPROTOCOL = Subprotocol("missbot.acp.v1")
+_AUTH_TIMEOUT = 5
+_AUTH_MAX_CHARS = 4096
 
 # Transport contract version we implement (acpremote's TransportMetadata).
 _TRANSPORT_KIND = "websocket"
@@ -107,6 +112,28 @@ def is_authorized(headers: Any, token: str | None) -> bool:
     if not normalized:
         return False
     return headers.get("Authorization") == f"Bearer {normalized}"
+
+
+async def _authenticate_browser(websocket: ServerConnection, token: str | None) -> bool:
+    """Authenticate before creating an ACP adapter; tokens never enter the SDK stream."""
+    try:
+        async with asyncio.timeout(_AUTH_TIMEOUT):
+            frame = await websocket.recv()
+        if isinstance(frame, str) and len(frame) <= _AUTH_MAX_CHARS:
+            message = json.loads(frame)
+            if (
+                token is not None
+                and isinstance(message, dict)
+                and message.get("type") == "authenticate"
+                and isinstance(message.get("token"), str)
+                and secrets.compare_digest(message["token"].encode(), token.encode())
+            ):
+                await websocket.send('{"type":"authenticated"}')
+                return True
+    except (TimeoutError, ValueError, ConnectionClosed):
+        pass
+    await websocket.close(code=1008, reason="ACP authentication required")
+    return False
 
 
 class _FrameWriterTransport(asyncio.Transport):
@@ -325,7 +352,7 @@ async def serve_acp_websocket(
     connection_limiter = _ConnectionLimiter(max_connections)
 
     def process_request(connection: ServerConnection, request: Any):
-        """Answer the HTTP routes; bearer auth gates the WebSocket upgrade only.
+        """Answer HTTP routes; browser auth is deferred to the first frame.
 
         Health and metadata stay open, matching acpremote's server. That is not an
         oversight there: `auth_required` in the metadata body is how a client
@@ -343,6 +370,13 @@ async def serve_acp_websocket(
             response.headers["Content-Type"] = "application/json"
             return response
         if path == paths.websocket_path:
+            protocols = [
+                value.strip()
+                for header in request.headers.get_all("Sec-WebSocket-Protocol")
+                for value in header.split(",")
+            ]
+            if BROWSER_SUBPROTOCOL in protocols and bearer_token is not None:
+                return None  # browser credentials arrive in a bounded first frame
             if is_authorized(request.headers, bearer_token):
                 return None  # continue with the WebSocket handshake
             logfire.warning("ACP WebSocket upgrade rejected (bad bearer token)", peer=str(connection.remote_address))
@@ -358,6 +392,10 @@ async def serve_acp_websocket(
 
         logfire.info("ACP WebSocket connected", peer=str(peer))
         try:
+            if websocket.subprotocol == BROWSER_SUBPROTOCOL and not await _authenticate_browser(
+                websocket, bearer_token
+            ):
+                return
             reader, writer, pump, transport = open_stream_bridge(websocket)
             agent = agent_factory()
             async with agent:
@@ -384,6 +422,8 @@ async def serve_acp_websocket(
         host,
         port,
         process_request=process_request,
+        subprotocols=[BROWSER_SUBPROTOCOL],
+        select_subprotocol=lambda _connection, offered: BROWSER_SUBPROTOCOL if BROWSER_SUBPROTOCOL in offered else None,
         max_size=DEFAULT_MAX_SIZE,
         max_queue=DEFAULT_MAX_QUEUE,
     ):

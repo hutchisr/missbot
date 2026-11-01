@@ -6,12 +6,20 @@ the stream, so the round-trip is pinned here.
 """
 
 import asyncio
+import json
+from contextlib import asynccontextmanager, suppress
 
 import click
 import pytest
+from websockets.asyncio.client import connect
+from websockets.asyncio.server import serve
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 
+from bot.acp import ws as ws_module
 from bot.acp.__main__ import _bearer_token_from_env
+from bot.acp.agent import MissbotAgent
 from bot.acp.ws import (
+    BROWSER_SUBPROTOCOL,
     DEFAULT_HEALTH_PATH,
     DEFAULT_OUTPUT_MAX_QUEUE,
     DEFAULT_OUTPUT_MAX_SIZE,
@@ -20,6 +28,7 @@ from bot.acp.ws import (
     build_metadata,
     is_authorized,
     open_stream_bridge,
+    serve_acp_websocket,
 )
 
 
@@ -310,3 +319,70 @@ async def test_writer_drain_waits_for_backlog_capacity():
     finally:
         pump.cancel()
         await transport.aclose()
+
+
+@pytest.mark.anyio
+async def test_browser_authentication_gates_real_acp_and_preserves_bearer_clients(config, monkeypatch):
+    ready = asyncio.Event()
+    port = 0
+    created = []
+
+    @asynccontextmanager
+    async def capture_server(*args, **kwargs):
+        nonlocal port
+        async with serve(*args, **kwargs) as server:
+            port = server.sockets[0].getsockname()[1]
+            ready.set()
+            yield server
+
+    def factory():
+        agent = MissbotAgent(config)
+        created.append(agent)
+        return agent
+
+    monkeypatch.setattr(ws_module, "serve", capture_server)
+    monkeypatch.setattr(ws_module, "_AUTH_TIMEOUT", 0.1)
+    task = asyncio.create_task(serve_acp_websocket(factory, host="127.0.0.1", port=0, bearer_token="secret"))
+    try:
+        await asyncio.wait_for(ready.wait(), 5)
+        url = f"ws://127.0.0.1:{port}/acp/ws"
+        with pytest.raises(InvalidStatus) as error:
+            async with connect(url):
+                pass
+        assert error.value.response.status_code == 401
+        initialize = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": 1}})
+        for invalid in ('{"type":"authenticate","token":"wrong"}', initialize, b"binary", "x" * 4097, None):
+            async with connect(url, subprotocols=[BROWSER_SUBPROTOCOL]) as socket:
+                if invalid is not None:
+                    await socket.send(invalid)
+                with pytest.raises(ConnectionClosed):
+                    await asyncio.wait_for(socket.recv(), 2)
+                assert socket.close_code == 1008
+            assert created == []  # no backend adapter exists before authentication
+
+        async with connect(url, subprotocols=[BROWSER_SUBPROTOCOL]) as socket:
+            await socket.send('{"type":"authenticate","token":"secret"}')
+            assert json.loads(await socket.recv()) == {"type": "authenticated"}
+            await socket.send(initialize)
+            assert json.loads(await socket.recv())["result"]["protocolVersion"] == 1
+            await socket.send(
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "session/new",
+                        "params": {"cwd": "/", "mcpServers": [], "_meta": {"missbot": {"private": True}}},
+                    }
+                )
+            )
+            assert json.loads(await socket.recv())["result"]["_meta"]["missbot"]["private"] is True
+
+        async with connect(url, additional_headers={"Authorization": "Bearer secret"}) as socket:
+            assert socket.subprotocol is None
+            await socket.send(initialize)
+            assert json.loads(await socket.recv())["result"]["protocolVersion"] == 1
+        assert len(created) == 2
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task

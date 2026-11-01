@@ -1,0 +1,7 @@
+{
+  "id": "missbot.acp",
+  "name": "Missbot",
+  "apiVersion": 1,
+  "description": "Connect directly to a remote Missbot ACP server. No local runtime or installer.",
+  "discovery": { "category": "agents", "tags": ["chat", "acp"] }
+}

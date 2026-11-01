@@ -24,7 +24,7 @@ def _block(
     sender: str = f"alice (npub: {_NPUB}, hex: {_HEX})",
     event_id: str = _EVENT_ID,
 ) -> str:
-    """A buzz-acp style event block with user text in the Content field."""
+    """A trusted ACP event block with user text in the Content field."""
     return (
         f"Event ID: {event_id}\n"
         "Channel: general (#0198)\n"

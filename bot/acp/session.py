@@ -22,6 +22,8 @@ class AcpSession:
 
     id: str
     max_history_turns: int
+    memory_access_allowed: bool = True
+    """False for private ACP sessions; immutable for the session's lifetime."""
     history: deque[HistoryTurn] = field(default_factory=deque)
     task: asyncio.Task | None = None
     """The in-flight prompt task, so ``session/cancel`` can interrupt this turn."""

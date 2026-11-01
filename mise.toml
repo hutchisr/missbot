@@ -16,8 +16,9 @@ docker buildx build --pull --push \
 wait_for = ["build"]
 run = """
 kubectl apply -k k8s --server-side && \
-kubectl -n misskey rollout restart deployment missbot && \
-kubectl -n misskey rollout status deployment missbot --timeout=300s
+kubectl -n misskey rollout restart deployment missbot missbot-acp && \
+kubectl -n misskey rollout status deployment missbot --timeout=300s && \
+kubectl -n misskey rollout status deployment missbot-acp --timeout=300s
 """
 
 [tasks.update]

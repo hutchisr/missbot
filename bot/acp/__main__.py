@@ -8,7 +8,7 @@ Two modes:
   ``acpremote mirror``. Deploy this and let remote consumers connect:
 
   ```
-  Buzz Relay ──WS──→ buzz-acp ──stdio──→ acpremote mirror ──WS──→ [here]
+  Buzz app → Missbot plugin → authenticated WebSocket → [here]
   ```
 
 **stdout is the protocol channel in stdio mode.** A single stray print or log line

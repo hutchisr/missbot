@@ -15,7 +15,8 @@ Missbot supports three frontends over one shared brain:
 - **Nostr** — signed relay events, public mentions, threaded replies, autonomous
   posts with images and polls, and NIP-05 identification. Runs alongside Misskey.
 - **ACP** — [Agent Client Protocol](https://agentclientprotocol.com) over stdio,
-  for clients like Zed, JetBrains, and [buzz-acp](https://github.com/block/buzz).
+  for clients like Zed, JetBrains, and [Buzz](https://github.com/block/buzz-app)
+  through the installable Missbot plugin below.
 
 Each is a thin adapter that translates its wire format into a neutral
 `AgentTurn`; the agent itself never sees a platform type. Persona, memories, and
@@ -157,8 +158,7 @@ uv run python -m bot.acp serve -c config.local.yaml \
 ```
 
 Remote clients bridge back to stdio ACP with
-[acpremote](https://github.com/vcoderun/acpkit), which is what a consumer such
-as buzz-acp is configured with:
+[acpremote](https://github.com/vcoderun/acpkit):
 
 ```bash
 acpremote mirror ws://your-host:8080/acp/ws --bearer-token "$ACP_TOKEN"
@@ -167,6 +167,80 @@ acpremote mirror ws://your-host:8080/acp/ws --bearer-token "$ACP_TOKEN"
 The endpoint serves `/acp/ws` for the socket, `/acp` for transport metadata, and
 `/healthz` as a probe. Because stdout carries the protocol, both modes send all
 logging to stderr.
+
+### In Buzz (`block/buzz-app`)
+
+The plugin in [`integrations/buzz`](integrations/buzz) connects **directly to a
+remote Missbot ACP server**. Buzz needs only the plugin, the server's WebSocket
+URL, and its access token—no local Python, `uv`, checkout, config file,
+`missbot-acp` launcher, or `acpremote` installation.
+
+1. On the **remote server**, run the updated ACP service using its own config
+   and provider credentials:
+
+   ```bash
+   uv run python -m bot.acp serve -c config.local.yaml \
+       --host 0.0.0.0 --port 8080 --token-env ACP_TOKEN
+   ```
+
+   Supply a nonempty `ACP_TOKEN` through the server's secret environment.
+   Expose it through TLS as `wss://your-host/acp/ws`; the reverse proxy must
+   forward WebSocket upgrades and subprotocol negotiation. `serve` does not
+   terminate TLS itself. The plugin permits unencrypted `ws://` only on
+   loopback for development testing; packaged Buzz's content policy requires
+   `wss://`. The Fortuna deployment below already provides private TLS at
+   `wss://missbot-acp.taile6e57.ts.net/acp/ws`.
+2. In Buzz, open **Settings → Plugins → Manage plugins**, install/enable the
+   `integrations/buzz` from a folder or Buzz's repository importer, or
+   **Update/Reload** an existing installation. A repository import needs no
+   local checkout or build.
+   The new manifest requests **no host process or file permissions**.
+3. Create an agent with **Harness → Missbot**, or open an existing Missbot
+   agent's **Settings**. Under **Remote Missbot**, enter the **WebSocket
+   endpoint** and **Access token**, then click **Connect**. It verifies
+   authentication and private-session support before saving the settings.
+   Add the agent to a conversation and mention it or send a one-to-one DM.
+4. For per-author scores, enable `acp_parse_sender_header` on the **server**
+   only when its ACP endpoint admits trusted clients. Otherwise callers share
+   `acp_default_identity`. The plugin constructs the existing event header from
+   Buzz's verified event, using public keys rather than display names.
+
+Connection settings apply to this device's Missbot agents and live in browser
+`sessionStorage`, never shared agent configuration. Re-enter them when the Buzz
+session ends. Tokens are sent in an authenticated first-frame exchange, not URL
+parameters or subprotocol strings. Remote URLs must not contain credentials,
+queries, or fragments. Upgrade the remote server with this plugin; older servers
+cannot perform its browser authentication handshake.
+
+Any launcher created for the earlier local integration is no longer used.
+The plugin neither executes it nor installs anything when enabled.
+
+Buzz keeps its signing keys and handles reply publication. Missbot supplies text
+through ACP, using its operator-configured tools; the plugin exposes no client
+filesystem, terminal, or MCP tools. Channel replies stay in their thread; DMs and
+Solo chats reply at channel level. Refusals, cancelled/incomplete replies, and
+`NO_REPLY` are not published. Stop closes the connection, cancelling the remote
+turn and discarding that conversation's in-memory history.
+
+**Privacy:** every Buzz session requests `_meta: {"missbot": {"private": true}}`
+on `session/new` and requires the same acknowledgement before sending content.
+Upgrade the ACP server along with the plugin. Private sessions never recall or
+retain shared Hindsight memories, even when memory is enabled for other
+frontends. Persona, model-provider processing, configured tools, social scoring,
+and operator telemetry still apply; this is not an offline or logging-free mode.
+
+The plugin keeps at most eight conversation connections, evicting the least
+recently used when needed. Conversations are isolated by community/agent,
+channel, and thread. A bounded queue serializes up to twenty turns with a
+five-minute run deadline. Restart, eviction, removal, or plugin unload loses
+that conversation history. Publication is never retried automatically after an
+uncertain relay acknowledgement; duplicate suppression remembers the latest
+1024 completed event/agent pairs only while the plugin is loaded.
+Attachments, Attention/watches, autonomous posts, session restoration, and
+Buzz protected-agent policies are not supported by this conversational harness.
+
+Plugin regression checks: `node --test integrations/buzz/plugin.test.mjs`
+using Node.js 22.19 or newer.
 
 ## Development
 
@@ -182,10 +256,19 @@ network calls.
 
 ## Kubernetes
 
-Copy the runtime configuration to `k8s/config.yaml` and put environment-style
-provider secrets in `k8s/secrets.txt`; both files are ignored by Git. Kustomize
-generates Kubernetes Secrets for them, including the config file because it
-contains the Misskey token and may contain database credentials.
+Copy runtime configuration to `k8s/config.yaml`; it is ignored by Git and
+generated as the `missbot-config` Secret because it can contain credentials.
+Provision `missbot-secrets` separately for provider credentials. Routine apply
+does not recreate it from the ignored local `k8s/secrets.txt`.
+
+ACP also requires the separate `missbot-acp-auth` Secret. For first-time
+bootstrap only (this refuses to overwrite an existing Secret):
+
+```bash
+openssl rand -hex 32 | tr -d '\n' | \
+  kubectl --context admin@fortuna -n misskey create secret generic missbot-acp-auth \
+    --from-file=ACP_TOKEN=/dev/stdin
+```
 
 ```bash
 cp config.example.yaml k8s/config.yaml
@@ -194,8 +277,25 @@ mise run deploy
 ```
 
 `mise run build` builds and pushes the image. `mise run deploy` applies the
-Kustomize manifests and restarts the deployment. The runtime configuration in
-`k8s/config.yaml` points Missbot at the in-cluster Hindsight API service.
+Kustomize manifests, restarts both `missbot` and `missbot-acp`, and waits for
+readiness. Both use the existing production config and backend credentials;
+neither credential Secret is generated or rotated by routine apply.
+
+The ACP service is available on the tailnet at
+**`wss://missbot-acp.taile6e57.ts.net/acp/ws`**. The Tailscale Ingress supplies TLS;
+the application additionally requires its token. On macOS, copy that token
+directly to the clipboard without displaying it:
+
+```bash
+kubectl --context admin@fortuna -n misskey get secret missbot-acp-auth \
+  -o jsonpath='{.data.ACP_TOKEN}' | base64 --decode | pbcopy
+```
+
+Paste it into the Buzz plugin's **Access token** field. For an ACP-only update,
+build the image, apply `k8s/acp.yaml`, then restart and wait for
+`deployment/missbot-acp`; the social bot need not restart. The shared production
+config still controls models, tools, scores, and optional sender-header
+attribution. Buzz's private sessions never access the shared Hindsight bank.
 
 ## Project Layout
 

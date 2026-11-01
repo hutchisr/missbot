@@ -7,6 +7,9 @@ from unittest.mock import AsyncMock, patch
 
 import acp
 import pytest
+from acp.agent.router import build_agent_router
+from pydantic_ai.messages import ModelResponse, TextPart
+from pydantic_ai.models.function import FunctionModel
 
 from bot.acp.agent import MissbotAgent, _text_from_blocks
 from bot.acp.session import SessionRegistry
@@ -129,6 +132,54 @@ async def test_prompt_on_unknown_session_is_invalid_params(agent):
 
 
 # --- prompt flow ------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_private_session_never_recalls_or_retains_even_if_prompt_relaxes_it(make_config):
+    memory = AsyncMock()
+    memory.recall_for_turn.return_value = None
+    adapter = MissbotAgent(config=make_config(memory_enabled=True), memory=memory)
+    router = build_agent_router(adapter)
+    opened = await router(
+        "session/new",
+        {"cwd": "/", "mcpServers": [], "_meta": {"missbot": {"private": True}}},
+        False,
+    )
+    assert isinstance(opened, acp.NewSessionResponse)
+    assert opened.field_meta is not None
+    assert opened.field_meta["missbot"]["private"] is True
+    adapter.on_connect(AsyncMock())
+    replies = iter(("private reply", "A different continuation", "An ordinary public answer"))
+    model = FunctionModel(lambda messages, info: ModelResponse(parts=[TextPart(next(replies))]))
+    with adapter._agent._agent.override(model=model):
+        for content in ("private conversation", "still private"):
+            result = await router(
+                "session/prompt",
+                {
+                    "sessionId": opened.session_id,
+                    "prompt": [{"type": "text", "text": content}],
+                    "_meta": {"missbot": {"private": False}},
+                },
+                False,
+            )
+            assert isinstance(result, acp.PromptResponse)
+            assert result.stop_reason == "end_turn"
+        memory.recall_for_turn.assert_not_awaited()
+        memory.retain_turn.assert_not_awaited()
+        public = await adapter.new_session(cwd="/")
+        await adapter.prompt(public.session_id, [_text("ordinary ACP still uses memory")])
+    memory.recall_for_turn.assert_awaited_once()
+    memory.retain_turn.assert_awaited_once()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("metadata", [None, "private", {"private": "true"}, {"private": 1}])
+async def test_invalid_private_session_metadata_does_not_allocate_session(agent, metadata):
+    router = build_agent_router(agent)
+    with pytest.raises(acp.RequestError) as error:
+        await router("session/new", {"cwd": "/", "mcpServers": [], "_meta": {"missbot": metadata}}, False)
+    assert error.value.code == -32602
+    assert len(agent._sessions) == 0
+
 
 
 @pytest.mark.anyio

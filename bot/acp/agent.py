@@ -126,14 +126,22 @@ class MissbotAgent(acp.Agent):
         directory, so accepting client-supplied MCP servers would only widen its
         attack surface for no gain.
         """
+        # A client may only restrict memory access, never override server policy.
+        metadata = kwargs.get("missbot", {})
+        if not isinstance(metadata, dict) or not isinstance(metadata.get("private", False), bool):
+            raise acp.RequestError.invalid_params(data={"reason": "missbot.private must be a boolean"})
         if self._sessions.at_capacity:
             raise acp.RequestError.internal_error(
                 data={"reason": f"session limit reached ({self._config.acp_max_sessions})"}
             )
         session = self._sessions.create()
+        session.memory_access_allowed = not metadata.get("private", False)
         self._session_ids.add(session.id)
         logfire.info("ACP session created", session_id=session.id, live_sessions=len(self._sessions))
-        return acp.NewSessionResponse(session_id=session.id)
+        return acp.NewSessionResponse(
+            session_id=session.id,
+            field_meta={"missbot": {"private": not session.memory_access_allowed}},
+        )
 
     async def prompt(
         self,
@@ -205,6 +213,7 @@ class MissbotAgent(acp.Agent):
                     # The reply has no Misskey note budget; the input still has a
                     # separate safety limit before provider and memory calls.
                     char_budget=None,
+                    memory_access_allowed=session.memory_access_allowed,
                     previous_reply=session.previous_reply(),
                 )
                 reply = await self._agent.run(turn)

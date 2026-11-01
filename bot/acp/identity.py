@@ -1,10 +1,10 @@
 """Parse optional identity and event metadata from an ACP harness's text header.
 
-ACP has no structured sender or source-event fields. Harnesses such as buzz-acp
-render a Nostr event into prompt text before the user-controlled ``Content:``::
+ACP has no structured sender or source-event fields. The Missbot Buzz plugin
+renders an event into prompt text before the user-controlled ``Content:``::
 
     Event ID: <64 hex>
-    From: alice (npub: npub1..., hex: <64 hex>)
+    From: (hex: <64 hex>)
     Time: 2026-07-24T12:00:00+00:00
     Content: <the user's message>
 
@@ -17,8 +17,8 @@ when the operator trusts the client/harness which constructs prompts.
 When explicitly enabled, the parser uses only a syntactically valid pubkey as the
 identity key, never the display label, and accepts only a 64-hex Nostr event id as
 source provenance. Malformed fields fail closed to adapter fallbacks. A batched
-prompt still attributes only its first structurally delimited event block; the
-format remains a buzz-acp implementation detail which may change.
+prompt still attributes only its first structurally delimited event block. Other
+trusted harnesses may include a display label and npub in the sender line.
 """
 
 from __future__ import annotations
