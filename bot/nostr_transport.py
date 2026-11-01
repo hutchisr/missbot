@@ -85,7 +85,7 @@ class NostrTransport:
             await client.connect()
             mention_filter = (
                 Filter()
-                .kind(Kind(1))
+                .kinds([Kind(1), Kind(1111)])
                 .pubkey(self._keys.public_key())
                 .since(Timestamp.from_secs(started_at))
                 .limit(MAX_NOTIFICATIONS)
@@ -100,7 +100,7 @@ class NostrTransport:
                 event = self._verified_event(notification.event)
                 if event is None or event["pubkey"] == self.public_key:
                     continue
-                if event["kind"] != 1 or event["created_at"] < started_at:
+                if event["kind"] not in (1, 1111) or event["created_at"] < started_at:
                     continue
                 if not any(tag[:2] == ["p", self.public_key] for tag in event["tags"]):
                     continue
@@ -167,13 +167,15 @@ class NostrTransport:
             async with asyncio.timeout(FETCH_TIMEOUT_SECONDS):
                 client = await self._connected_client()
                 events = await client.fetch_events(
-                    ReqTarget.auto([Filter().id(EventId.parse(event_id)).kind(Kind(1)).limit(1)]),
+                    ReqTarget.auto(
+                        [Filter().id(EventId.parse(event_id)).kinds([Kind(1), Kind(1111), Kind(1068)]).limit(1)]
+                    ),
                     timeout=timedelta(seconds=FETCH_TIMEOUT_SECONDS - 1),
                     max_events=1,
                 )
                 for event in events:
                     verified = self._verified_event(event)
-                    if verified is not None and verified["id"] == event_id and verified["kind"] == 1:
+                    if verified is not None and verified["id"] == event_id and verified["kind"] in (1, 1111, 1068):
                         return verified
         except Exception:
             logfire.warning("Could not fetch Nostr thread ancestor")

@@ -406,3 +406,70 @@ async def test_nip05_can_create_confirmed_absent_profile(frontend):
     args, kwargs = transport.publish.await_args
     assert json.loads(args[0]) == {"name": bot._config.bot_username, "nip05": "bot@example.com"}
     assert kwargs["kind"] == 0
+
+
+def comment(*, parent=PARENT_ID, parent_kind=1, root=ROOT_ID, root_kind=1, root_author=AUTHOR_KEY, parent_author=BOT_KEY):
+    return event(kind=1111, tags=[
+        ["E", root, "", root_author], ["K", str(root_kind)], ["P", root_author],
+        ["e", parent, "", parent_author], ["k", str(parent_kind)], ["p", parent_author],
+    ])
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("parent_kind,root_kind,max_context", [(1, 1, 3), (1111, 1, 3), (1111, 1, 1), (1068, 1068, 3)])
+async def test_nip22_replies_preserve_verified_scope_and_current_parent(frontend, parent_kind, root_kind, max_context):
+    bot, agent, transport, _ = frontend(max_context=max_context)
+    root = event(ROOT_ID, kind=root_kind, tags=[])
+    if parent_kind == 1111:
+        parent = comment(parent=ROOT_ID, parent_author=AUTHOR_KEY)
+        parent.update(id=PARENT_ID, pubkey=BOT_KEY, content="prior comment")
+    elif parent_kind == 1068:
+        root["pubkey"] = BOT_KEY
+        parent = root
+    else:
+        parent = event(PARENT_ID, pubkey=BOT_KEY, tags=[["e", ROOT_ID, "", "root"]])
+    events = {ROOT_ID: root, parent["id"]: parent}
+    transport.fetch_event.side_effect = lambda key: events.get(key)
+    incoming = comment(parent=parent["id"], parent_kind=parent_kind, root_kind=root_kind, root_author=root["pubkey"])
+    incoming["tags"].append(["p", "c" * 64])
+    await bot.on_event(incoming)
+    await drain(bot)
+    turn = agent.run.await_args.args[0]
+    assert turn.source == "nostr_comment"
+    assert turn.author.handle == f"nostr:{AUTHOR_KEY}"
+    assert turn.conversation_id == f"nostr:{EVENT_ID if max_context == 1 else ROOT_ID}"
+    transport.publish.assert_awaited_once_with("reply", [
+        ["E", ROOT_ID, "", root["pubkey"]], ["K", str(root_kind)], ["P", root["pubkey"]],
+        ["e", EVENT_ID, "", AUTHOR_KEY], ["k", "1111"], ["p", AUTHOR_KEY],
+    ], kind=1111)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("failure", ["root-author", "parent-author", "parent-kind", "missing-root", "duplicate-root", "private-root", "conflicting-parent"])
+async def test_invalid_nip22_scope_never_reaches_model_or_publication(frontend, failure):
+    bot, agent, transport, _ = frontend()
+    root = event(ROOT_ID, tags=[])
+    parent = event(PARENT_ID, pubkey=BOT_KEY, tags=[["e", ROOT_ID, "", "root"]])
+    incoming = comment()
+    if failure == "root-author":
+        root["pubkey"] = "c" * 64
+    elif failure == "parent-author":
+        parent["pubkey"] = "c" * 64
+    elif failure == "parent-kind":
+        parent["kind"] = 4
+    elif failure == "missing-root":
+        root = None
+    elif failure == "duplicate-root":
+        incoming["tags"].append(["E", "f" * 64])
+    elif failure == "private-root":
+        incoming["tags"][1] = ["K", "4"]
+    else:
+        parent = comment(root="f" * 64, parent=ROOT_ID, parent_author=AUTHOR_KEY)
+        parent.update(id=PARENT_ID, pubkey=BOT_KEY)
+        incoming["tags"][4] = ["k", "1111"]
+    events = {ROOT_ID: root, PARENT_ID: parent}
+    transport.fetch_event.side_effect = lambda key: events.get(key)
+    await bot.on_event(incoming)
+    await drain(bot)
+    agent.run.assert_not_awaited()
+    transport.publish.assert_not_awaited()

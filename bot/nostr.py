@@ -9,6 +9,7 @@ import re
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
@@ -30,8 +31,52 @@ _RECENT_EVENT_LIMIT = 1024
 _EVENT_ID = re.compile(r"[0-9a-f]{64}")
 
 
+@dataclass(frozen=True)
+class _CommentRefs:
+    root: str
+    root_kind: int
+    root_author: str
+    parent: str
+    parent_kind: int
+    parent_author: str | None
+
+
+def _comment_refs(event: dict[str, Any]) -> _CommentRefs | None:
+    """Accept unambiguous NIP-22 scopes on public notes/polls, not private or external scopes."""
+    fields = {}
+    for name in ("E", "K", "P", "e", "k"):
+        matches = [tag for tag in event["tags"] if tag and tag[0] == name]
+        if len(matches) != 1 or len(matches[0]) < 2:
+            return None
+        fields[name] = matches[0]
+    if any(tag and tag[0] in ("A", "I", "a", "i") for tag in event["tags"]):
+        return None
+    if (
+        not all(_EVENT_ID.fullmatch(fields[name][1]) for name in ("E", "P", "e"))
+        or fields["K"][1] not in ("1", "1068")
+        or fields["k"][1] not in ("1", "1111", "1068")
+    ):
+        return None
+    root_author = fields["P"][1]
+    root_hint = fields["E"][3] if len(fields["E"]) > 3 else ""
+    parent_author = fields["e"][3] if len(fields["e"]) > 3 else ""
+    if (root_hint and root_hint != root_author) or (parent_author and not _EVENT_ID.fullmatch(parent_author)):
+        return None
+    return _CommentRefs(
+        fields["E"][1],
+        int(fields["K"][1]),
+        root_author,
+        fields["e"][1],
+        int(fields["k"][1]),
+        parent_author or None,
+    )
+
+
 def _thread_refs(event: dict[str, Any]) -> tuple[str | None, str | None, bool]:
     """Read NIP-10 marked tags, or legacy first-root/last-parent positional tags."""
+    if event["kind"] == 1111:
+        comment = _comment_refs(event)
+        return (comment.parent, comment.root, True) if comment else (None, None, False)
     roots: set[str] = set()
     replies: set[str] = set()
     positional: list[str] = []
@@ -80,11 +125,12 @@ class NostrBot:
     async def on_event(self, event: dict[str, Any]) -> None:
         """Admit only addressed public notes; reserve deduplication before yielding."""
         if (
-            event["kind"] != 1
+            event["kind"] not in (1, 1111)
             or event["pubkey"] == self._transport.public_key
             or len(event["content"]) > self._config.nostr_max_event_chars
             or not any(tag[:2] == ["p", self._transport.public_key] for tag in event["tags"])
             or (not event["content"].strip() and not self._image_urls(event))
+            or (event["kind"] == 1111 and _comment_refs(event) is None)
         ):
             return
         event_id = event["id"]
@@ -111,6 +157,42 @@ class NostrBot:
             if not event["content"].strip() and not current_images:
                 return
             history, root = await self._context(event)
+            comment = _comment_refs(event) if event["kind"] == 1111 else None
+            scope = None
+            if comment:
+                scope = root if root["id"] == comment.root else await self._transport.fetch_event(comment.root)
+                if (
+                    scope is None
+                    or scope["id"] != comment.root
+                    or scope["kind"] != comment.root_kind
+                    or scope["pubkey"] != comment.root_author
+                ):
+                    logfire.warning("Cannot verify Nostr comment scope", event_id=event["id"])
+                    return
+                parent = next((item for item in history if item["id"] == comment.parent), None)
+                if parent is None:
+                    parent = (
+                        scope if comment.parent == comment.root else await self._transport.fetch_event(comment.parent)
+                    )
+                if (
+                    parent is None
+                    or parent["id"] != comment.parent
+                    or parent["kind"] != comment.parent_kind
+                    or (comment.parent_author is not None and parent["pubkey"] != comment.parent_author)
+                    or not any(tag[:2] == ["p", parent["pubkey"]] for tag in event["tags"])
+                ):
+                    logfire.warning("Cannot verify Nostr comment parent", event_id=event["id"])
+                    return
+                for ancestor in history or [parent]:
+                    if ancestor["kind"] == 1111:
+                        refs = _comment_refs(ancestor)
+                        if refs is None or (refs.root, refs.root_kind, refs.root_author) != (
+                            comment.root,
+                            comment.root_kind,
+                            comment.root_author,
+                        ):
+                            logfire.warning("Conflicting Nostr comment scope", event_id=event["id"])
+                            return
             rendered: list[HistoryTurn] = []
             for past in reversed(history):
                 images = await self._media_for(past)
@@ -131,7 +213,7 @@ class NostrBot:
                 source_id=f"nostr:{event['id']}",
                 conversation_id=f"nostr:{root['id']}",
                 occurred_at=datetime.fromtimestamp(event["created_at"], tz=UTC),
-                source="nostr_note",
+                source="nostr_comment" if comment else "nostr_note",
                 images=current_images,
                 history=rendered,
                 char_budget=self._config.nostr_max_event_chars,
@@ -149,6 +231,18 @@ class NostrBot:
                 return
             if len(result) > self._config.nostr_max_event_chars:
                 raise ValueError("Nostr reply exceeds the configured content limit")
+            if comment:
+                assert scope is not None
+                tags = [
+                    ["E", scope["id"], "", scope["pubkey"]],
+                    ["K", str(scope["kind"])],
+                    ["P", scope["pubkey"]],
+                    ["e", event["id"], "", event["pubkey"]],
+                    ["k", "1111"],
+                    ["p", event["pubkey"]],
+                ]
+                await self._transport.publish(result, tags, kind=1111)
+                return
             tags = [["e", root["id"], "", "root", root["pubkey"]]]
             if root["id"] != event["id"]:
                 tags.append(["e", event["id"], "", "reply", event["pubkey"]])
@@ -220,15 +314,23 @@ class NostrBot:
         history: list[dict[str, Any]] = []
         seen = {event["id"]}
         claimed_roots: set[str] = set()
+        claimed_scopes: set[tuple[str, int, str]] = set()
         current = event
         while True:
+            comment = _comment_refs(current) if current["kind"] == 1111 else None
+            if comment:
+                claimed_scopes.add((comment.root, comment.root_kind, comment.root_author))
             parent_id, claimed_root, valid = _thread_refs(current)
             if not valid:
                 return history, event
             if claimed_root:
                 claimed_roots.add(claimed_root)
             if parent_id is None:
-                return history, current if not claimed_roots or claimed_roots == {current["id"]} else event
+                root_matches = not claimed_roots or claimed_roots == {current["id"]}
+                scope_matches = not claimed_scopes or claimed_scopes == {
+                    (current["id"], current["kind"], current["pubkey"])
+                }
+                return history, current if root_matches and scope_matches else event
             if len(history) >= self._config.max_context or parent_id in seen:
                 return history, event
             try:
@@ -239,8 +341,13 @@ class NostrBot:
             if (
                 parent is None
                 or parent["id"] != parent_id
-                or parent["kind"] != 1
+                or parent["kind"] != (comment.parent_kind if comment else 1)
                 or len(parent["content"]) > self._config.nostr_max_event_chars
+            ):
+                return history, event
+            if comment and (
+                (comment.parent_author is not None and parent["pubkey"] != comment.parent_author)
+                or not any(tag[:2] == ["p", parent["pubkey"]] for tag in current["tags"])
             ):
                 return history, event
             seen.add(parent_id)

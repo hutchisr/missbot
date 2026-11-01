@@ -133,10 +133,13 @@ public key. The bot checks that mapping before updating its signed profile,
 preserving existing metadata. Incoming NIP-05 identifiers are display-only:
 public keys still determine memory, scores, and permissions.
 
-To address the bot, send a public kind-1 note with a proper `p` mention tag;
-pasting an `@npub` as plain text is not enough. Only events created after startup
-are handled; DMs and offline catch-up are not supported. When autonomous posting
-is configured, Nostr generates separate posts rather than mirroring Misskey.
+To address the bot, send a public kind-1 note or NIP-22 comment (kind 1111) with
+a proper `p` mention tag; pasting an `@npub` as plain text is not enough.
+Replies to notes, nested comments, and poll comments are supported. NIP-22
+comments must reference verifiable public notes or polls, and receive replies
+in the same comment format. Only events created after startup are handled;
+DMs and offline catch-up are not supported. When autonomous posting is
+configured, Nostr generates separate posts rather than mirroring Misskey.
 Generated images use Misskey drive as their public media host.
 
 See [Nostr configuration and NIP-05 setup](AGENTS.md#nostr-frontend) for details,

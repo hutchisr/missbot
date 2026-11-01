@@ -51,22 +51,37 @@ def test_real_relay_mentions_publish_fetch_and_cancellation():
         public_key = bot_keys.public_key().to_hex()
         mentions = [["p", public_key]]
         ancestor = signed_event(author, "root", created_at=int(time.time()) - 600)
+        comment_root = signed_event(bot_keys, "comment root")
+        comment_tags = [
+            ["E", comment_root.id().to_hex(), "", public_key],
+            ["K", "1"],
+            ["P", public_key],
+            ["e", comment_root.id().to_hex(), "", public_key],
+            ["k", "1"],
+            ["p", public_key],
+        ]
+        comment: Event | None = None
+        poll = signed_event(bot_keys, "poll question", kind=1068)
         received = asyncio.Queue()
         published = asyncio.Queue()
         disconnected = asyncio.Event()
 
         async def relay(websocket):
+            nonlocal comment
             try:
                 async for raw in websocket:
                     message = json.loads(raw)
                     if message[0] == "REQ":
                         subscription, request = message[1:3]
                         if subscription == MENTIONS_SUBSCRIPTION:
-                            assert request["kinds"] == [1]
+                            assert request["kinds"] == [1, 1111]
                             assert request["#p"] == [public_key]
                             assert abs(request["since"] - time.time()) < 5
                             assert request["limit"] <= 128
                             valid = signed_event(author, tags=mentions, created_at=request["since"])
+                            comment = signed_event(
+                                author, "NIP-22 reply", comment_tags, created_at=request["since"], kind=1111
+                            )
                             tampered = json.loads(valid.as_json())
                             tampered["sig"] = "00" * 64
                             await websocket.send(json.dumps(["EVENT", subscription, tampered]))
@@ -80,9 +95,12 @@ def test_real_relay_mentions_publish_fetch_and_cancellation():
                                 await websocket.send(json.dumps(["EVENT", subscription, json.loads(invalid.as_json())]))
                             for _ in range(2):
                                 await websocket.send(json.dumps(["EVENT", subscription, json.loads(valid.as_json())]))
+                            await websocket.send(json.dumps(["EVENT", subscription, json.loads(comment.as_json())]))
                         else:
-                            assert request["ids"] == [ancestor.id().to_hex()]
-                            await websocket.send(json.dumps(["EVENT", subscription, json.loads(ancestor.as_json())]))
+                            assert comment is not None
+                            ancestors = {item.id().to_hex(): item for item in (ancestor, comment, poll)}
+                            found = ancestors[request["ids"][0]]
+                            await websocket.send(json.dumps(["EVENT", subscription, json.loads(found.as_json())]))
                         await websocket.send(json.dumps(["EOSE", subscription]))
                     elif message[0] == "EVENT":
                         event = message[1]
@@ -100,6 +118,9 @@ def test_real_relay_mentions_publish_fetch_and_cancellation():
                 incoming = await asyncio.wait_for(received.get(), 10)
                 assert incoming["content"] == "hello"
                 assert incoming["pubkey"] == author.public_key().to_hex()
+                incoming_comment = await asyncio.wait_for(received.get(), 5)
+                assert comment is not None
+                assert incoming_comment["kind"] == 1111 and incoming_comment["id"] == comment.id().to_hex()
                 result = await transport.publish("reply", [["p", incoming["pubkey"]]])
                 outgoing = await asyncio.wait_for(published.get(), 5)
                 assert result == outgoing["id"]
@@ -112,6 +133,8 @@ def test_real_relay_mentions_publish_fetch_and_cancellation():
                 assert profile["kind"] == 0
                 assert profile["created_at"] == created_at
                 assert await transport.fetch_event(ancestor.id().to_hex()) == json.loads(ancestor.as_json())
+                assert await transport.fetch_event(comment.id().to_hex()) == json.loads(comment.as_json())
+                assert await transport.fetch_event(poll.id().to_hex()) == json.loads(poll.as_json())
                 assert await transport.fetch_event("not-an-id") is None
                 # Completing a round trip gives duplicate notifications time to drain.
                 assert received.empty()
