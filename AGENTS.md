@@ -382,3 +382,5 @@ After making changes, always:
 3. Run `uv run basedpyright` — the tree is at zero errors, so any output is yours
 4. Run the tests: `OPENROUTER_API_KEY=sk-dummy uv run pytest -q` (the dummy key is required for collection — see Commands)
 5. Fix any issues before considering the task complete
+
+- For repository collaboration, use ngit and follow `.agents/skills/ngit/SKILL.md`.
