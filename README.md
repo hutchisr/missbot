@@ -212,6 +212,17 @@ Use `wss://`; unencrypted loopback is for development only. Tokens travel in the
 first frame, never URLs. The plugin exposes provision, activation, profile,
 removal, and interruption operations—not a desktop message runner.
 
+Incoming Buzz messages identify the sender to the model by their quoted display
+name and explicit `@npub…` mention target, with guidance to use the name only
+without `@`, using the sender's signed community profile (`display_name`, then
+`name`). Names are quoted, control-character filtered, and capped at 128
+characters; they are display data, not authorization. Missing, malformed, or
+unavailable profiles fall back to the `npub`. Lookups have a five-second deadline;
+names and misses are cached for five minutes, bounded to 1024 users per community.
+Scores, permissions, and stored identity retain their existing
+`buzz:<hex-pubkey>` keys. Private Buzz conversations still do not read or write
+shared Hindsight memory.
+
 Removing the hosted entry deactivates Buzz and clears its private conversation
 state, **not Grok's shared Nostr key**. Ownership remains bound to the verified
 owner. Profile changes preserve other metadata, including NIP-05 and the existing

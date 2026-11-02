@@ -252,3 +252,59 @@ async def test_runner_continues_without_management_and_does_not_retry_uncertain_
     finally:
         await runner.close()
         store.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("profile,expected_name", [
+    ('{"display_name":"Rachel","name":"rachel"}', "Rachel"),
+    ('{"display_name":" ","name":"rachel"}', "rachel"),
+    ("{invalid", None),
+    ("[]", None),
+    (None, None),
+    ("offline", None),
+])
+async def test_buzz_name_is_display_only_and_lookup_failures_preserve_reply(
+    make_config, tmp_path, profile, expected_name
+):
+    bot, owner, author = Keys.generate(), Keys.generate(), Keys.generate()
+    key = author.public_key().to_hex()
+    auth = proof(owner, bot.public_key().to_hex())
+    store = BuzzStore(str(tmp_path / "names.db"))
+    store.provision(COMMUNITY, "Grok", None)
+    store.activate(COMMUNITY, owner.public_key().to_hex(), auth)
+    relay = RelayFixture(bot, COMMUNITY, auth)
+    relay.events = [
+        signed(relay.authority, 39000, "", [["d", "chat"], ["t", "dm"]]),
+        signed(relay.authority, 39002, "", [["d", "chat"], ["p", bot.public_key().to_hex()], ["p", key]]),
+        signed(owner, 0, '{"display_name":"Wrong person"}', []),
+    ]
+    if profile is not None and profile != "offline":
+        relay.events.append(signed(author, 0, profile, []))
+    original_query = relay.query
+
+    async def query(filters):
+        if profile == "offline" and filters[0]["kinds"] == [0]:
+            raise RuntimeError("Profile unavailable")
+        return await original_query(filters)
+
+    relay.query = query
+    agent = AsyncMock()
+    agent.run.return_value = "A private reply"
+    runner = BuzzRunner(make_config(), agent, store, relay, COMMUNITY)
+    try:
+        await runner.on_event(signed(author, 9, "Hello", [["h", "chat"]]))
+        await runner.process(store.next_event(COMMUNITY))
+        turn = agent.run.await_args.args[0]
+        npub = author.public_key().to_bech32()
+        assert turn.author.display == (
+            f'"{expected_name}" (mention: @{npub}; use the name only without @)' if expected_name else npub
+        )
+        assert turn.author.handle == turn.author.user_id == f"buzz:{key}"
+        assert not turn.author.privileged and not turn.memory_access_allowed
+        assert relay.sent[0]["content"] == "A private reply"
+        # A cached name or miss must keep replies independent of subsequent profile outages.
+        relay.query = AsyncMock(side_effect=RuntimeError("Relay offline"))
+        assert await runner._display_for(key) == turn.author.display
+        relay.query.assert_not_awaited()
+    finally:
+        store.close()

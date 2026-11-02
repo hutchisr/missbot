@@ -40,6 +40,7 @@ async def test_hosted_replies_after_management_disconnect_and_state_restart(make
     metadata = [
         sign(authority, 39000, "", [["d", "chat"], ["t", "dm"], ["private"]]),
         sign(authority, 39002, "", [["d", "chat"], ["p", pubkey], ["p", owner_key]]),
+        sign(owner, 0, json.dumps({"name": "rachel", "display_name": "Rachel"}), []),
     ]
 
     async def relay_request(socket, request):
@@ -66,7 +67,9 @@ async def test_hosted_replies_after_management_disconnect_and_state_restart(make
                         subscribed.set()
                     else:
                         for event in metadata:
-                            if event["kind"] in filters[0].get("kinds", []):
+                            if event["kind"] in filters[0].get("kinds", []) and (
+                                "authors" not in filters[0] or event["pubkey"] in filters[0]["authors"]
+                            ):
                                 await socket.send(json.dumps(["EVENT", subscription, event]))
                     await socket.send(json.dumps(["EOSE", subscription]))
                 elif message[0] == "EVENT":
@@ -126,6 +129,7 @@ async def test_hosted_replies_after_management_disconnect_and_state_restart(make
             if isinstance(part, UserPromptPart)
         ]
         history_sizes.append(len(turns))
+        assert f'"Rachel" (mention: @{owner.public_key().to_bech32()}; use the name only without @)' in str(turns[-1].content)
         text = (
             "Reply with no desktop client" if len(history_sizes) == 1 else "Recovered the earlier private conversation"
         )

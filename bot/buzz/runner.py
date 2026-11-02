@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import logfire
+from nostr_sdk import PublicKey
 
 from ..ai import ChatAgent
 from ..core import AgentTurn, TurnAuthor
@@ -32,6 +33,7 @@ class BuzzRunner:
         self.channel: str | None = None
         self.conversation: str | None = None
         self.stopping = False
+        self._displays: dict[str, tuple[float, str]] = {}
 
     def start(self) -> None:
         record = self.store.community(self.community)
@@ -86,6 +88,36 @@ class BuzzRunner:
             finally:
                 self.turn = None
                 self.channel = self.conversation = None
+
+    async def _display_for(self, public_key: str) -> str:
+        cached = self._displays.get(public_key)
+        if cached is not None and cached[0] > time.monotonic():
+            return cached[1]
+        npub = PublicKey.parse(public_key).to_bech32()
+        display = npub
+        try:
+            async with asyncio.timeout(5):
+                profiles = await self.relay.query([{"kinds": [0], "authors": [public_key], "limit": 8}])
+            profiles = [item for item in profiles if item["kind"] == 0 and item["pubkey"] == public_key]
+            if profiles:
+                latest = min(profiles, key=lambda item: (-item["created_at"], item["id"]))
+                metadata = json.loads(latest["content"])
+                if isinstance(metadata, dict):
+                    for field in ("display_name", "name"):
+                        value = metadata.get(field)
+                        if not isinstance(value, str):
+                            continue
+                        name = " ".join("".join(c for c in value if c.isprintable() or c.isspace()).split())[:128]
+                        if name:
+                            display = f"{json.dumps(name, ensure_ascii=False)} (mention: @{npub}; use the name only without @)"
+                            break
+        except Exception:
+            logfire.debug("Buzz profile lookup failed; using public key")
+        # Cache misses too; names never determine identity or authorization.
+        if public_key not in self._displays and len(self._displays) >= 1024:
+            del self._displays[next(iter(self._displays))]
+        self._displays[public_key] = (time.monotonic() + 300, display)
+        return display
 
     async def process(self, row: dict[str, Any]) -> None:
         event = json.loads(row["event"])
@@ -149,7 +181,7 @@ class BuzzRunner:
         history = self.store.history(self.community, conversation)
         turn = AgentTurn(
             text=event["content"],
-            author=TurnAuthor(handle=author, user_id=author),
+            author=TurnAuthor(handle=author, user_id=author, display=await self._display_for(event["pubkey"])),
             source_id=f"buzz:{event['id']}",
             conversation_id=f"buzz:{self.community}:{conversation}",
             occurred_at=datetime.fromtimestamp(event["created_at"], tz=UTC),
